@@ -1,0 +1,15 @@
+{
+  "FileVersion": 3,
+  "Version": 1,
+  "VersionName": "0.1.0",
+  "FriendlyName": "Probe",
+  "Description": "Editor QA workspace and asset-based test authoring for Unreal Engine.",
+  "Category": "Testing",
+  "CreatedBy": "Mippi",
+  "CanContainContent": true,
+  "IsBetaVersion": true,
+  "Installed": false,
+  "Modules": [
+    { "Name": "ProbeEditor", "Type": "Editor", "LoadingPhase": "Default" }
+  ]
+}
