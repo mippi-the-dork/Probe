@@ -1,147 +1,91 @@
-# Probe 0.5.0
+# Probe 0.10.0
 
-Probe is a Windows-focused, Unreal Engine 5.8.3 **Editor-only** QA test authoring and execution plugin. It provides reusable **Probe Test** Data Assets with a native-style dockable Editor, contextual Content Browser commands, read-only Editor assertions, structured results, a selectable/copyable log, and JSON export.
+Probe is an **Unreal Engine 5.8.3 Editor-only QA plugin** for creating, executing, and organizing QA checks against plugins, Editor UI registrations, assets, actor state, reflection, and properties. Probe also supports its first safe action steps on temporary UObject fixtures. This source package targets Windows 64-bit; no engine source modifications.
 
-## Compatibility & installation
+## Install
 
-- Unreal Engine **5.8.3**, Editor only, source distribution. No Engine source modifications.
-- Close the Editor, replace `<Project>/Plugins/Probe` with the supplied `Probe` folder, and build your project Editor target.
-- Open **Tools > Testing > Probe**, or double-click any Probe Test in the Content Browser.
-- Existing assets retain their `UProbeTestAsset` type, test IDs, fields, and original 11 enum values. New enum entries are appended to keep the original numeric assignments stable.
+Copy `Probe/` into `<Project>/Plugins/`, generate project files if needed, build the Editor target, then open **Tools > Testing > Probe**. Double-click any Probe Test asset to open it in Probe; double-click a Probe Pack asset to open **Probe Packs**.
 
-## New in 0.5.0
+## What's new in 0.10.0
 
-- **30 new read-only assertions**, now **41 total**. They cover the kind of data often exposed by Editor plugins: plugin/module health, registered ToolMenus, open tabs, console variables, asset lifecycle and registry tags, class interfaces and reflected functions, actor hierarchy/components, selection, and object values.
-- One shared `ProbeAssertionCatalog.h` supplies the display names, descriptions, expected inputs, and **eight categories**, used by **Add Step** and **Change Assertion**. Templates are categorized the same way.
-- **11 additional test templates**, plus the original ten configured templates and Blank. Templates create normal editable Probe Test Data Assets, not hard-coded scripts.
-- Conditional input fields. For example, Editor Tab Open asks for a tab ID, Asset Registry Tag Equals asks for the asset path, tag name, and expected value; Actor Has Component asks for a World Outliner label and component class.
-- Internal Unreal Automation tests: `Probe.Catalog.AllAssertionsRegistered` and `Probe.Runner.EditorPluginAssertions`.
+- **159 built-in step types** across **nine categories**, with **25 more read-only assertions** for plugin descriptors, reflection, asset registry, actor labels/folders and selection. Probe includes **120 templates**, including 25 new configurable contract starters. Temporary UObject fixture actions from 0.9 remain available. Test Actions are synchronous and operate only on temporary objects; they do not create actors or manipulate loaded levels.
+- **Probe Packs redesigned:** asset identity and native Slate icons based on the supplied Probe Pack SVG; a resizable bulk Add Tests dialog, selectable test rows with run ordering, search, removal, creation of new tests, and Content Browser drag and drop. A per-session Last Result column provides immediate run feedback.
+- **Reference validation** in **Probe Packs**, with separate **Validate Pack** and project-wide **Validate All** buttons. This audits Pack references, repeated references within a Pack, duplicate stable Test IDs, and positive asset assertions that reference missing assets. An **Asset Does Not Exist** assertion is intentionally excluded from the missing-reference check.
+- Each Pack member displays **Valid**, **Redirector**, or **Missing / Invalid**. **Replace...** picks an existing Probe Test to substitute in that slot; the trash action only removes the Pack entry. Both require **Save Pack** to persist and support Undo/Redo.
+- Running a Pack checks its references against the Asset Registry before attempting loads. Missing paths now report a test error without calling the package loader, reducing stale-reference Output Log warnings from deleted tests.
+- **Temporary fixtures** can be created, mutated, compared, and released. Probe automatically releases remaining fixtures at the end of every run, including if an assertion fails. Fixture IDs are scoped to a single test run.
+- Existing Probe Test Assets, Packs, assertion IDs, reports, icons, and navigation remain compatible; no migration is necessary.
 
-## Authoring workflow
+## Reference validation and recovery
 
-1. Open Probe. Use **New Test** or the categorized **Templates** menu.
-2. Choose **Add Step > Category > Assertion**, or use the assertion picker on an existing step.
-3. Set only the fields that appear for that assertion. Hover over menu entries for descriptions; fill in any required paths, names, counts, or comparison values.
-4. Save Test Asset. **Run Selected**, **Run All**, or run tests from the Content Browser right-click menu.
-5. Review Results Explorer/diagnostics, Copy Results/Copy Diagnostic, or Export JSON to `<Project>/Saved/Probe/Reports/`.
+1. Open **Probe > Manage Packs** (or double-click a Probe Pack).
+2. Click **Validate All** to inspect all Packs, or **Validate Pack** to inspect only the selected Pack. The report lists Packs checked, issues, duplicate Test IDs, and any missing positive asset assertion targets.
+3. For a missing or moved Pack member, choose **Replace...** and search for its new location. If it was deliberately deleted, remove that Pack entry.
+4. Save the Pack, validate again, and run it.
+5. If duplicate stable Test IDs are reported, inspect the named assets. Resolve by deliberately assigning a new unique ID in a future dedicated repair workflow or recreating the duplicated test through Probe's duplication action. Reference validation itself never silently changes test IDs.
 
-**Assertion outcomes:** Incorrect or unmet actual state returns Failed. Missing required configuration or unsupported value types return Error. Disabled Test Assets return Skipped. Probe stops on the first non-passing step per test, so later steps do not execute.
+This validation is read-only until you explicitly replace or remove a member. It does not run fix-up redirectors on the project or attempt to load nonexistent test packages. The project-wide audit may load **existing** Test/Pack assets to read their IDs and contents.
 
-## Assertion reference (41)
+## Transient fixture action workflow
 
-Most paths require an exact Unreal object or class path, e.g. `/Game/ProbeTests/Probe_Smoke.Probe_Smoke` or `/Script/Engine.Actor`. For actor tests, `Target` usually refers to the **World Outliner actor label**, not the UObject path. Actor-label matching is case-sensitive.
+The **Test Actions** category includes:
 
-### Plugins & Modules
+| Step | Inputs | Purpose |
+|---|---|---|
+| Create Temporary Object | Object Class; New Fixture ID | Make an isolated transient non-Actor UObject |
+| Set Temporary Object Property | Fixture ID; Property Name; New Value | Set bool, numeric, FString, or FName properties |
+| Temporary Object Property Equals | Fixture ID; Property Name; Expected Value | Check the result of a preceding action |
+| Temporary Object Property Does Not Equal | Fixture ID; Property Name; Expected Value | Check a negative expectation |
+| Temporary Object Exists | Fixture ID | Check the fixture is still available |
+| Destroy Temporary Object | Fixture ID | Release the fixture explicitly |
 
-| Assertion | What it checks |
+Start with **Templates > Test Actions > Temporary Boolean Mutation**, which creates a transient Probe Test object, sets its `bEnabled` value to `False`, checks that value, and destroys the fixture. The **Temporary Object Lifecycle** and **Temporary String Mutation** templates are also runnable immediately without configuration.
+
+Fixtures are **not** actors and do not appear in the World Outliner. These first actions establish isolated setup / act / assert / cleanup for UObject behavior. Automated editor clicks, Outliner interactions, and transaction-driven world changes are **not yet supported** and are planned for a later stage.
+
+## A test workflow
+
+1. Choose **New Test** or **Templates > category > starter**.
+2. Choose an assertion using **Add Step > category**. Browse for classes, plugins, actors, modules and tabs where possible, and use **Use Selected Asset** for Content Browser assets.
+3. Configure expected values and conditions. Invalid or empty required fields are marked within the step.
+4. For template-derived tests, **uncheck Needs Configuration** when the test is ready for automated execution; it does not guarantee that the expected assertion will pass.
+5. **Save**, then use **Run Selected**, **Run All**, or **Run Pack**. Use Results Explorer / Log for diagnostics and JSON Export for reports.
+
+### Why templates may fail after configuration
+
+Templates are examples, **not automatic fixtures**. Assertions about selected actors, exact asset counts, actor tags, redirectors, PIE, and plugin versions must be tailored to your project and current Editor state. A real Failed result means Probe executed the assertion and found a mismatch. An Error means Probe couldn't evaluate it; a Skipped result means the test was disabled or still needs configuration.
+
+To triage multiple old example assets, multi-select them in the Content Browser and choose **Probe > Mark Needs Configuration**, then save. This explicitly holds them out of automated runs while you review their setup.
+
+Existing 0.7.0 and older tests are intentionally not silently rewritten. If you previously created an example test with an invalid expectation, edit that asset (or mark it Needs Configuration while you work on it). For example, 0.7.0's Plugin Version template expected `0.6.0`, and its Tool Menu Section starter used the **visible label** `Testing` instead of the **internal section ID** `ProbeTools`.
+
+## Probe Packs: from zero to runnable
+
+1. In Probe, choose **Manage Packs**, or double-click an existing **Probe Pack** asset in the Content Browser.
+2. Select **New Pack**, choose the destination folder and name, and edit its Description in the Pack header.
+3. Click **+ Add Tests...** to open the large searchable, resizable multi-select dialog. Check as many existing Probe Test assets as you want and click **Add Selected**. Already-added assets do not appear again.
+4. Alternatively, drag Probe Test assets from the Content Browser onto the Pack workspace. Use **New Test** in the Pack workspace to create a new Probe Test asset next to your Pack and add it automatically.
+5. Each row displays the Test name, Content Browser path, readiness, reference health, and last-run result. Click the Test name to edit it in Probe. Use the arrow buttons to change run order. Search to filter the current Pack list.
+6. Check multiple rows to use **Run Selected** or **Remove Selected**. Removing entries never deletes the source Test Assets.
+7. **Save** (or Ctrl+S) the Pack. Use **Run Pack** for its full test list in order, or **Run Selected** for checked rows. Both results appear in Probe's Results Explorer.
+8. Use **Validate Pack** for local diagnostics and **Validate All** for project-wide reference issues and duplicate stable test IDs. Expand **Reference Diagnostics** to read or copy the report. Missing references may be replaced in place.
+
+The Pack asset type is shown publicly as **Probe Pack** with its dedicated icon. The underlying `UProbeTestPack` class remains unchanged to preserve serialized content and references. The Last Result column is session-only and clears when the Editor restarts; it is not saved to asset data.
+
+### New assertion coverage in 0.10.0
+
+| Category | New assertions |
 |---|---|
-| Plugin Is Enabled | Confirm a named plugin is enabled. |
-| Plugin Is Installed | Check that a plugin is discoverable, regardless of enabled state. |
-| Plugin Is Disabled | Check that an installed plugin is explicitly disabled. |
-| Module Is Loaded | Check whether an Unreal module is loaded. |
+| Plugins & Modules | Plugin Version Contains; Plugin Friendly Name Contains; Plugin Has No Content; Loaded Module Count Exactly |
+| Assets | Asset Count Direct At Least/Exactly; Asset Package Path Equals; Asset Class Name Equals |
+| Classes & Reflection | Property Is Array, Object Reference, Struct, Enum, Name, String or Text; Function Is Const, Public or Deprecated; Class Has Metadata |
+| Actors & World | Actor Label Count At Most; Actor Count With Tag At Most; Actor Folder Count Exactly/At Most |
+| Selection | Selected Actor Is Temporarily Hidden; Selected Actor Is Not Temporarily Hidden |
 
-### Editor UI
+The 25 matching templates appear in categorized menus and start in **Needs Configuration**. Set meaningful values for the project and clear that state only when ready to execute. The direct-folder asset count checks are non-recursive; earlier folder count checks remain recursive.
 
-| Assertion | What it checks |
-|---|---|
-| Editor Tab Is Open | Check whether a tab with this internal tab ID is open. |
-| Tool Menu Is Registered | Check whether a named ToolMenus menu is registered. |
+## Developer and distribution notes
 
-### Editor State
+Read [Docs/EXTENDING_PROBE.md](Docs/EXTENDING_PROBE.md) for test provider modules, assertion and template registration, and optional companion plugin packaging. `Tools/ValidateProbeCatalog.py` is a source-only developer check; normal users do not need to run it. Probe now supports **limited transient UObject test actions**. It does not yet perform Editor clicks, actor creation, or Undo/Redo sequences; those will require an Editor interaction layer and more extensive isolation.
 
-| Assertion | What it checks |
-|---|---|
-| Editor World Exists | Check that the level Editor world is available. |
-| Console Variable Exists | Check an engine console variable is registered. |
-| Console Variable Equals | Compare a console variable with its current string value. |
-
-### Assets
-
-| Assertion | What it checks |
-|---|---|
-| Asset Exists | Find an asset by its object path. |
-| Asset Is Class | Verify an asset is an instance of a class. |
-| Asset Count In Folder At Least | Count assets under a /Game or plugin content folder, recursively. |
-| Asset Has Unsaved Changes | Check an asset package is dirty (loads asset if necessary). |
-| Asset Has No Unsaved Changes | Check an asset package is clean (loads asset if necessary). |
-| Asset Is Loaded | Check whether an asset object is already in memory without loading it. |
-| Asset Registry Tag Equals | Read a searchable asset registry tag without loading the asset. |
-
-### Classes & Reflection
-
-| Assertion | What it checks |
-|---|---|
-| Class Exists | Resolve a class by Unreal class path or name. |
-| Class Derives From Class | Verify inheritance between two classes. |
-| Class Implements Interface | Check a class implements a UInterface. |
-| Class Has Property | Check a reflected property exists on a class. |
-| Class Has Function | Check a reflected UFUNCTION exists on a class. |
-
-### Actors & World
-
-| Assertion | What it checks |
-|---|---|
-| Actor Count At Least | Count level actors (at least). |
-| Actor Class Count At Least | Count actors derived from a class (at least). |
-| Actor With Tag Exists | Find a level actor with a tag. |
-| Actor With Label Exists | Find an actor by its exact Outliner label. |
-| Actor With Label Does Not Exist | Ensure there is no actor with this exact Outliner label. |
-| Actor With Tag Does Not Exist | Ensure no level actor has a particular tag. |
-| Actor Has Component | Find a component class on an actor identified by Outliner label. |
-| Actor Folder Equals | Check the World Outliner folder path of an actor. |
-| Actor Count Exactly | Require exactly this many level actors. |
-| Actor Class Count Exactly | Require exactly this many actors of a class. |
-
-### Selection
-
-| Assertion | What it checks |
-|---|---|
-| Selected Actor Count At Least | Count selected level actors (at least). |
-| Selected Actor Count Exactly | Require exactly this many selected level actors. |
-| Selected Actor Label Equals | Require one selected actor with an exact label. |
-| Selected Actor Is Class | Require one selected actor derived from a class. |
-| Selected Actor Has Tag | Require one selected actor with a tag. |
-
-### Properties & Values
-
-| Assertion | What it checks |
-|---|---|
-| Object Property Equals | Compare an object property with an expected value. |
-| Object Is Loaded | Check whether an object is already loaded without loading it. |
-| Object Property Exists | Check a loaded or loadable object has a reflected property. |
-| Object Property Does Not Equal | Compare a reflected property with a value and expect inequality. |
-| Actor Property Equals | Compare an actor property by Outliner label. |
-
-## Editor-plugin testing examples
-
-### Probe health / startup
-
-Create a single test with steps: **Plugin Is Installed** (`Probe`), **Plugin Is Enabled** (`Probe`), **Module Is Loaded** (`ProbeEditor`), **Editor Tab Is Open** (`ProbeWorkspace`, only after opening Probe), and **Tool Menu Is Registered** (`LevelEditor.MainMenu.Tools`). The last two make sense during an interactive Editor session, not a headless test run.
-
-### Testing another installed Editor plugin
-
-For Focus, Latch, Prune, Hue, or another Editor plugin, begin with **Plugin Is Installed** and **Module Is Loaded**, using the actual plugin/module identifiers. Add **Class Has Function / Property** for any APIs exposed through Unreal reflection, **Tool Menu Is Registered** for menu paths, or **Editor Tab Is Open** for tab IDs. These checks only verify accessible state; they **do not** prove a UI button functions.
-
-### Asset lifecycle
-
-**Asset Exists** verifies the registry path. **Asset Is Loaded** checks memory without loading. **Asset Has Unsaved Changes** / **Asset Has No Unsaved Changes** inspect the package's current dirty flag and may load the asset if needed. **Asset Registry Tag Equals** works only with tags published to the Asset Registry (not arbitrary UObject fields). **Asset Count In Folder At Least** counts assets recursively under a valid package folder, such as `/Game/ProbeTests`.
-
-### World Outliner and actor workflow checks
-
-**Actor With Label Exists / Does Not Exist** and **Actor Folder Equals** inspect the active level's actor hierarchy. **Actor Has Component** can verify native or plugin component classes on an actor found by label. **Selected Actor Count Exactly** checks selection state after a manual action. Use **Use Selected Actor** to capture an exact label when configuring compatible actor assertions.
-
-### Reflected property checks
-
-**Object Property Equals**, **Object Property Does Not Equal**, and **Actor Property Equals** support bool, numeric (with tolerance), `FString` and `FName`. `Object Property Exists` and `Class Has Property / Function` inspect Unreal reflection. Unreflected private C++ members and arbitrary Slate widget state are not accessible through these assertions.
-
-## Limits and safety
-
-- **Read-only assertions.** Probe does not create actors, change selected assets, press Slate buttons, move actors, execute Editor commands, replay Undo/Redo, or control drag/drop as test actions. It checks observable current Editor state. Some checks resolve or load assets/classes; they do not intentionally modify their contents.
-- **No fixture lifecycle or full UI driver yet.** Selection, tab, and active-level-dependent assertions work best in interactive Editor sessions. They are not necessarily deterministic between projects or clean launches.
-- **ToolMenus and tab checks:** registered menus are not proof that menu entries actually execute. `Editor Tab Is Open` checks the global tab manager's live tabs; some asset editor tabs are managed by a local tab manager and may not be visible there.
-- **Input typing and values:** `MinimumActorCount` is reused as the integer threshold for asset counts, exact actor counts, and selection counts to preserve asset serialization. It appears contextually labeled in Probe's authoring UI. Any assertion that expects a class or interface needs that class to be available to the Editor.
-- Probe's two self-tests use Unreal's built-in automation runner; ordinary Data Asset steps are executed by Probe's own synchronous runner. Integration with full Editor Automation Driver and standalone orchestration is future work.
-
-## Validation status
-
-This source package has undergone **source review, catalog coverage checks, and ZIP integrity validation**, but **has not been compiled or launched against an Unreal Engine 5.8.3 installation** in this environment. Validate it using `Docs/QA_CHECKLIST.md` before relying on it for releases.
+See [Docs/ASSERTION_UX.md](Docs/ASSERTION_UX.md) for assertion authoring behavior and limitations, and [Docs/QA_CHECKLIST.md](Docs/QA_CHECKLIST.md) for acceptance cases. This package has **not** been compiled or run in a local UE 5.8.3 engine environment; it requires a local build and QA pass.

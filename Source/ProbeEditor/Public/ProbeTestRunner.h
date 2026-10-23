@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "ProbeTestAsset.h"
+#include "ProbeTestPack.h"
 
 namespace Probe
 {
@@ -18,6 +19,7 @@ namespace Probe
         int32 Index = 0;
         EResultStatus Status = EResultStatus::Error;
         FString Description;
+        FString AssertionId;
         FString Detail;
         double DurationMs = 0.0;
     };
@@ -35,4 +37,5 @@ namespace Probe
 
     PROBEEDITOR_API const TCHAR* StatusName(EResultStatus Status);
     PROBEEDITOR_API FTestResult RunTest(const UProbeTestAsset* Asset);
+    PROBEEDITOR_API TArray<FTestResult> RunPack(const UProbeTestPack* Pack);
 }

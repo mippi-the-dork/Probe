@@ -1,7 +1,7 @@
 {
   "FileVersion": 3,
-  "Version": 11,
-  "VersionName": "0.5.0",
+  "Version": 16,
+  "VersionName": "0.10.0",
   "FriendlyName": "Probe",
   "Description": "Create, edit, save, and execute QA test assets from a dedicated Unreal Editor interface.",
   "Category": "Testing",
