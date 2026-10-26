@@ -2,7 +2,9 @@
 #include "ProbeTestRunner.h"
 #include "ProbeReferenceValidation.h"
 #include "ProbeAssertionCatalog.h"
+#include "ProbeStepEditing.h"
 #include "ProbeExtensions.h"
+#include "ProbeSelfTest.h"
 #include "ProbeTestAssetFactory.h"
 #include "ProbeTestPack.h"
 #include "ProbeTestPackFactory.h"
@@ -13,6 +15,7 @@
 #include "PluginDescriptor.h"
 #include "ModuleDescriptor.h"
 #include "ToolMenus.h"
+#include <initializer_list>
 #include "ToolMenu.h"
 #include "ContentBrowserMenuContexts.h"
 #include "ContentBrowserModule.h"
@@ -72,6 +75,8 @@
 #include "Misc/DateTime.h"
 #include "Misc/EngineVersion.h"
 #include "HAL/FileManager.h"
+#include "HAL/IConsoleManager.h"
+#include "Misc/Crc.h"
 #include "HAL/PlatformApplicationMisc.h"
 
 #define LOCTEXT_NAMESPACE "ProbeEditor"
@@ -143,6 +148,28 @@ namespace Probe
         if ((Fields & ClassField) && Step.ExpectedClass.TrimStartAndEnd().IsEmpty()) { return TEXT("Choose the expected class"); }
         if ((Fields & PropertyField) && Step.PropertyName.TrimStartAndEnd().IsEmpty()) { return TEXT("Enter a Property, Function, or Tag name"); }
         if ((Fields & ValueField) && Step.ExpectedValue.TrimStartAndEnd().IsEmpty()) { return TEXT("Enter an expected value or search text"); }
+        if (Step.AssertionId.IsNone() &&
+            (Step.Type == EProbeStepType::ActorFixtureSetLocation
+             || Step.Type == EProbeStepType::ActorFixtureLocationNearlyEquals
+             || Step.Type == EProbeStepType::ActorFixtureLocationNotNearlyEquals
+             || Step.Type == EProbeStepType::ActorFixtureSetRotation
+             || Step.Type == EProbeStepType::ActorFixtureRotationNearlyEquals
+             || Step.Type == EProbeStepType::ActorFixtureRotationNotNearlyEquals
+             || Step.Type == EProbeStepType::ActorFixtureSetScale
+             || Step.Type == EProbeStepType::ActorFixtureScaleNearlyEquals
+             || Step.Type == EProbeStepType::ActorFixtureScaleNotNearlyEquals))
+        {
+            TArray<FString> Components;
+            Step.ExpectedValue.ParseIntoArray(Components, TEXT(","), false);
+            if (Components.Num() != 3) { return TEXT("Enter three comma-separated numbers, e.g. 100,0,50"); }
+            for (const FString& Component : Components)
+            {
+                const FString Trimmed = Component.TrimStartAndEnd();
+                double Number = 0.0;
+                if (!LexTryParseString(Number, *Trimmed) || !FMath::IsFinite(Number))
+                { return TEXT("Each vector or rotation component must be a finite number"); }
+            }
+        }
         if (Step.Type == EProbeStepType::ObjectPropertyNumericInRange && Step.AssertionId.IsNone())
         {
             FString Lower, Upper;
@@ -159,6 +186,14 @@ namespace Probe
         if (Asset.Steps.IsEmpty()) { return TEXT("Add at least one assertion step"); }
         for (int32 Index = 0; Index < Asset.Steps.Num(); ++Index)
         {
+            const FProbeTestStep& Step = Asset.Steps[Index];
+            if (Step.AssertionId.IsNone()
+                && Step.Type >= EProbeStepType::ActorFixtureSpawn
+                && Step.Type <= EProbeStepType::ActorFixtureScaleNotNearlyEquals
+                && !Asset.bAllowTransientEditorActors)
+            {
+                return FString::Printf(TEXT("Step %d: Enable 'Allow Transient Editor Actors' to authorize temporary level actors."), Index + 1);
+            }
             const FString Issue = StepConfigurationIssue(Asset.Steps[Index]);
             if (!Issue.IsEmpty()) { return FString::Printf(TEXT("Step %d: %s"), Index + 1, *Issue); }
         }
@@ -593,6 +628,79 @@ namespace Probe
             Step.Target = TEXT("ProbeFolder"); Step.MinimumActorCount = 1; break;
         case EProbeStepType::SelectedActorIsTemporarilyHidden:
         case EProbeStepType::SelectedActorIsNotTemporarilyHidden: break;
+        case EProbeStepType::SelectionClear:
+        case EProbeStepType::SelectionSelectFirstActor:
+        case EProbeStepType::SelectionRestore: break;
+        case EProbeStepType::SelectionSelectActorByLabel:
+            Step.Description = TEXT("Select exactly one actor by its exact Outliner label. Selection is restored after this test."); break;
+        case EProbeStepType::SelectionSelectActorsWithTag:
+            Step.Description = TEXT("Select all actors carrying this actor tag. Selection is restored after this test."); break;
+        // Actor Fixture ID is always a test-scoped alias, not an existing world actor.
+        case EProbeStepType::ActorFixtureSpawn:
+            Step.Target = TEXT("/Script/Engine.Actor");
+            Step.ExpectedValue = TEXT("ActorA");
+            Step.Description = TEXT("Create a transient actor owned by this test. Requires explicit permission in the test header.");
+            break;
+        case EProbeStepType::ActorFixtureSetLabel:
+        case EProbeStepType::ActorFixtureLabelEquals:
+            Step.Target = TEXT("ActorA"); Step.ExpectedValue = TEXT("Probe_Automation_Actor"); break;
+        case EProbeStepType::ActorFixtureSetFolder:
+        case EProbeStepType::ActorFixtureFolderEquals:
+            Step.Target = TEXT("ActorA"); Step.ExpectedValue = TEXT("ProbeAutomation"); break;
+        case EProbeStepType::ActorFixtureAddTag:
+        case EProbeStepType::ActorFixtureRemoveTag:
+        case EProbeStepType::ActorFixtureHasTag:
+            Step.Target = TEXT("ActorA"); Step.ExpectedValue = TEXT("ProbeTestTag"); break;
+        case EProbeStepType::ActorFixtureSelect:
+        case EProbeStepType::ActorFixtureHide:
+        case EProbeStepType::ActorFixtureShow:
+        case EProbeStepType::ActorFixtureExists:
+        case EProbeStepType::ActorFixtureIsSelected:
+        case EProbeStepType::ActorFixtureIsHidden:
+        case EProbeStepType::ActorFixtureDestroy:
+            Step.Target = TEXT("ActorA"); break;
+        // 0.13.0: all actor fixture IDs are local to one test.
+        case EProbeStepType::ActorFixtureSetLocation:
+        case EProbeStepType::ActorFixtureLocationNearlyEquals:
+            Step.Target = TEXT("ActorA"); Step.ExpectedValue = TEXT("100,0,50"); break;
+        case EProbeStepType::ActorFixtureSetRotation:
+        case EProbeStepType::ActorFixtureRotationNearlyEquals:
+            Step.Target = TEXT("ActorA"); Step.ExpectedValue = TEXT("0,45,0"); break;
+        case EProbeStepType::ActorFixtureSetScale:
+        case EProbeStepType::ActorFixtureScaleNearlyEquals:
+            Step.Target = TEXT("ActorA"); Step.ExpectedValue = TEXT("1,1,1"); break;
+        case EProbeStepType::ActorFixtureAttachTo:
+        case EProbeStepType::ActorFixtureHasParent:
+        case EProbeStepType::ActorFixtureDistanceAtMost:
+            Step.Target = TEXT("ActorB"); Step.ExpectedValue = TEXT("ActorA");
+            Step.MinimumActorCount = 200; break;
+        case EProbeStepType::ActorFixtureDetach:
+        case EProbeStepType::ActorFixtureHasNoParent:
+        case EProbeStepType::ActorFixtureChildCountExactly:
+        case EProbeStepType::ActorFixtureIsVisible:
+        case EProbeStepType::ActorFixtureIsNotSelected:
+            Step.Target = TEXT("ActorA"); Step.MinimumActorCount = 1; break;
+        case EProbeStepType::ActorFixtureTagAbsent:
+            Step.Target = TEXT("ActorA"); Step.ExpectedValue = TEXT("ProbeTestTag"); break;
+        case EProbeStepType::ActorFixtureFolderNotEquals:
+            Step.Target = TEXT("ActorA"); Step.ExpectedValue = TEXT("OtherProbeFolder"); break;
+        case EProbeStepType::ActorFixtureChildCountAtLeast:
+        case EProbeStepType::ActorFixtureChildCountAtMost:
+        case EProbeStepType::ActorFixtureTagCountExactly:
+        case EProbeStepType::ActorFixtureHasRootComponent:
+            Step.Target = TEXT("ActorA"); Step.MinimumActorCount = 1; break;
+        case EProbeStepType::ActorFixtureDistanceAtLeast:
+            Step.Target = TEXT("ActorB"); Step.ExpectedValue = TEXT("ActorA"); Step.MinimumActorCount = 100; break;
+        case EProbeStepType::ActorFixtureLabelContains:
+        case EProbeStepType::ActorFixtureLabelStartsWith:
+        case EProbeStepType::ActorFixtureLabelEndsWith:
+            Step.Target = TEXT("ActorA"); Step.ExpectedValue = TEXT("Probe"); break;
+        case EProbeStepType::ActorFixtureLocationNotNearlyEquals:
+            Step.Target = TEXT("ActorA"); Step.ExpectedValue = TEXT("100,0,50"); break;
+        case EProbeStepType::ActorFixtureRotationNotNearlyEquals:
+            Step.Target = TEXT("ActorA"); Step.ExpectedValue = TEXT("0,45,0"); break;
+        case EProbeStepType::ActorFixtureScaleNotNearlyEquals:
+            Step.Target = TEXT("ActorA"); Step.ExpectedValue = TEXT("2,1,1"); break;
 
         }
         return Step;
@@ -974,6 +1082,336 @@ namespace Probe
         }
     }
 
+    // Selection actions are deliberately reversible. Even if a later assertion fails,
+    // the runner restores the Editor's previous actor selection before returning.
+    static void RegisterProbeSelectionTemplates()
+    {
+        auto Make = [](EProbeStepType Type, const TCHAR* Target = TEXT(""))
+        {
+            FProbeTestStep Step;
+            Step.Type = Type;
+            Step.Target = Target;
+            return Step;
+        };
+        {
+            FExtensionTemplate Template;
+            Template.Id = TEXT("Probe.SelectionClearAndRestore");
+            Template.Category = TEXT("Test Actions");
+            Template.Name = TEXT("Selection Clear And Restore");
+            Template.Description = TEXT("Ready to run. Clears selection, confirms zero actors, then restores the original selection.");
+            Template.bRequiresConfiguration = false;
+            Template.Steps.Add(Make(EProbeStepType::SelectionClear));
+            FProbeTestStep Count = Make(EProbeStepType::SelectedActorCountExactly);
+            Count.MinimumActorCount = 0;
+            Template.Steps.Add(Count);
+            Template.Steps.Add(Make(EProbeStepType::SelectionRestore));
+            RegisterTemplate(MoveTemp(Template));
+        }
+        {
+            FExtensionTemplate Template;
+            Template.Id = TEXT("Probe.SelectionFirstAvailable");
+            Template.Category = TEXT("Test Actions");
+            Template.Name = TEXT("Selection First Available Actor");
+            Template.Description = TEXT("Select one actor, check its selection count, then restore. Requires a nonempty level.");
+            Template.bRequiresConfiguration = true;
+            Template.Steps.Add(Make(EProbeStepType::SelectionSelectFirstActor));
+            FProbeTestStep Count = Make(EProbeStepType::SelectedActorCountExactly);
+            Count.MinimumActorCount = 1;
+            Template.Steps.Add(Count);
+            Template.Steps.Add(Make(EProbeStepType::SelectionRestore));
+            RegisterTemplate(MoveTemp(Template));
+        }
+        {
+            FExtensionTemplate Template;
+            Template.Id = TEXT("Probe.SelectionActorByLabel");
+            Template.Category = TEXT("Test Actions");
+            Template.Name = TEXT("Selection By Actor Label");
+            Template.Description = TEXT("Choose an actor label, select it and assert exactly one selected actor, then restore.");
+            Template.bRequiresConfiguration = true;
+            Template.Steps.Add(Make(EProbeStepType::SelectionSelectActorByLabel));
+            FProbeTestStep Count = Make(EProbeStepType::SelectedActorCountExactly);
+            Count.MinimumActorCount = 1;
+            Template.Steps.Add(Count);
+            Template.Steps.Add(Make(EProbeStepType::SelectionRestore));
+            RegisterTemplate(MoveTemp(Template));
+        }
+        {
+            FExtensionTemplate Template;
+            Template.Id = TEXT("Probe.SelectionActorsByTag");
+            Template.Category = TEXT("Test Actions");
+            Template.Name = TEXT("Selection By Actor Tag");
+            Template.Description = TEXT("Choose a tag, select all matching actors, assert at least one selected, then restore.");
+            Template.bRequiresConfiguration = true;
+            Template.Steps.Add(Make(EProbeStepType::SelectionSelectActorsWithTag));
+            FProbeTestStep Count = Make(EProbeStepType::SelectedActorCountAtLeast);
+            Count.MinimumActorCount = 1;
+            Template.Steps.Add(Count);
+            Template.Steps.Add(Make(EProbeStepType::SelectionRestore));
+            RegisterTemplate(MoveTemp(Template));
+        }
+    }
+
+    // 0.12.0: actor workflows operate only on transient actors that Probe owns.
+    // All start Needs Configuration; users must independently opt into world actions.
+    static void RegisterProbeActorFixtureTemplates()
+    {
+        auto Step = [](EProbeStepType Type, const TCHAR* Value = TEXT(""))
+        {
+            FProbeTestStep S;
+            S.Type = Type;
+            S.Target = Type == EProbeStepType::ActorFixtureSpawn ? TEXT("/Script/Engine.Actor") : TEXT("ActorA");
+            S.ExpectedValue = Type == EProbeStepType::ActorFixtureSpawn ? TEXT("ActorA") : Value;
+            return S;
+        };
+        auto Add = [&Step](const TCHAR* Id, const TCHAR* Name, const TCHAR* Description,
+            std::initializer_list<FProbeTestStep> Steps)
+        {
+            FExtensionTemplate T;
+            T.Id = FName(Id);
+            T.Category = TEXT("Test Actions");
+            T.Name = Name;
+            T.Description = Description;
+            T.bRequiresConfiguration = true;
+            for (const FProbeTestStep& OneStep : Steps) { T.Steps.Add(OneStep); }
+            RegisterTemplate(MoveTemp(T));
+        };
+        Add(TEXT("Probe.ActorFixtureLifecycle"), TEXT("Temporary Actor Lifecycle"),
+            TEXT("Create, find, and destroy one transient actor in the Editor world."),
+            {Step(EProbeStepType::ActorFixtureSpawn), Step(EProbeStepType::ActorFixtureExists), Step(EProbeStepType::ActorFixtureDestroy)});
+        Add(TEXT("Probe.ActorFixtureLabel"), TEXT("Temporary Actor Label Round Trip"),
+            TEXT("Set and assert an Outliner label on a test-owned actor."),
+            {Step(EProbeStepType::ActorFixtureSpawn), Step(EProbeStepType::ActorFixtureSetLabel, TEXT("Probe_Automation_Actor")),
+             Step(EProbeStepType::ActorFixtureLabelEquals, TEXT("Probe_Automation_Actor")), Step(EProbeStepType::ActorFixtureDestroy)});
+        Add(TEXT("Probe.ActorFixtureTag"), TEXT("Temporary Actor Tag Round Trip"),
+            TEXT("Set and verify an Actor Tag on a test-owned actor."),
+            {Step(EProbeStepType::ActorFixtureSpawn), Step(EProbeStepType::ActorFixtureAddTag, TEXT("ProbeTestTag")),
+             Step(EProbeStepType::ActorFixtureHasTag, TEXT("ProbeTestTag")), Step(EProbeStepType::ActorFixtureDestroy)});
+        Add(TEXT("Probe.ActorFixtureFolder"), TEXT("Temporary Actor Outliner Folder"),
+            TEXT("Move a test actor to a folder, assert its path, and clean up."),
+            {Step(EProbeStepType::ActorFixtureSpawn), Step(EProbeStepType::ActorFixtureSetFolder, TEXT("ProbeAutomation")),
+             Step(EProbeStepType::ActorFixtureFolderEquals, TEXT("ProbeAutomation")), Step(EProbeStepType::ActorFixtureDestroy)});
+        Add(TEXT("Probe.ActorFixtureVisibility"), TEXT("Temporary Actor Visibility Round Trip"),
+            TEXT("Temporarily hide, verify, then show a test-owned actor."),
+            {Step(EProbeStepType::ActorFixtureSpawn), Step(EProbeStepType::ActorFixtureHide),
+             Step(EProbeStepType::ActorFixtureIsHidden), Step(EProbeStepType::ActorFixtureShow), Step(EProbeStepType::ActorFixtureDestroy)});
+        Add(TEXT("Probe.ActorFixtureSelection"), TEXT("Temporary Actor Selection Round Trip"),
+            TEXT("Select a test actor and assert selection without retaining it afterward."),
+            {Step(EProbeStepType::ActorFixtureSpawn), Step(EProbeStepType::ActorFixtureSelect),
+             Step(EProbeStepType::ActorFixtureIsSelected), Step(EProbeStepType::SelectionRestore), Step(EProbeStepType::ActorFixtureDestroy)});
+        Add(TEXT("Probe.ActorFixtureFailureCleanup"), TEXT("Temporary Actor Failure Cleanup"),
+            TEXT("Negative regression example: intentionally fails after spawning; Probe must still destroy the actor."),
+            {Step(EProbeStepType::ActorFixtureSpawn), Step(EProbeStepType::ActorFixtureLabelEquals, TEXT("IntentionallyWrongLabel"))});
+    }
+
+    // 0.13.0: actionable Editor-plugin QA workflows. All require review and opt-in.
+    // StaticMeshActor supplies a root component for transforms and attachment;
+    // a rootless AActor class would reject these movement operations.
+    static void RegisterProbeSpatialTemplates()
+    {
+        auto Spawn = [](const TCHAR* Id)
+        {
+            FProbeTestStep S;
+            S.Type = EProbeStepType::ActorFixtureSpawn;
+            S.Target = TEXT("/Script/Engine.StaticMeshActor");
+            S.ExpectedValue = Id;
+            return S;
+        };
+        auto Step = [](EProbeStepType Type, const TCHAR* ActorId, const TCHAR* Value = TEXT(""), int32 Count = 0)
+        {
+            FProbeTestStep S;
+            S.Type = Type;
+            S.Target = ActorId;
+            S.ExpectedValue = Value;
+            S.MinimumActorCount = Count;
+            return S;
+        };
+        auto Add = [](const TCHAR* Id, const TCHAR* Name, const TCHAR* Description,
+            std::initializer_list<FProbeTestStep> Steps)
+        {
+            FExtensionTemplate T;
+            T.Id = FName(Id);
+            T.Category = TEXT("Test Actions");
+            T.Name = Name;
+            T.Description = Description;
+            T.bRequiresConfiguration = true;
+            for (const FProbeTestStep& S : Steps) { T.Steps.Add(S); }
+            RegisterTemplate(MoveTemp(T));
+        };
+        Add(TEXT("Probe.SpatialLocation"), TEXT("Temporary Actor Location Round Trip"),
+            TEXT("Spawn, move, verify world position, and destroy a test-owned actor."),
+            {Spawn(TEXT("ActorA")), Step(EProbeStepType::ActorFixtureSetLocation, TEXT("ActorA"), TEXT("100,0,50")),
+             Step(EProbeStepType::ActorFixtureLocationNearlyEquals, TEXT("ActorA"), TEXT("100,0,50")),
+             Step(EProbeStepType::ActorFixtureDestroy, TEXT("ActorA"))});
+        Add(TEXT("Probe.SpatialRotation"), TEXT("Temporary Actor Rotation Round Trip"),
+            TEXT("Spawn, rotate, verify Euler rotation, and destroy."),
+            {Spawn(TEXT("ActorA")), Step(EProbeStepType::ActorFixtureSetRotation, TEXT("ActorA"), TEXT("0,45,0")),
+             Step(EProbeStepType::ActorFixtureRotationNearlyEquals, TEXT("ActorA"), TEXT("0,45,0")),
+             Step(EProbeStepType::ActorFixtureDestroy, TEXT("ActorA"))});
+        Add(TEXT("Probe.SpatialScale"), TEXT("Temporary Actor Scale Round Trip"),
+            TEXT("Spawn, scale, compare, and clean up a test-owned actor."),
+            {Spawn(TEXT("ActorA")), Step(EProbeStepType::ActorFixtureSetScale, TEXT("ActorA"), TEXT("2,1,1")),
+             Step(EProbeStepType::ActorFixtureScaleNearlyEquals, TEXT("ActorA"), TEXT("2,1,1")),
+             Step(EProbeStepType::ActorFixtureDestroy, TEXT("ActorA"))});
+        Add(TEXT("Probe.SpatialTransform"), TEXT("Temporary Actor Transform Contract"),
+            TEXT("Verify position, rotation, and scale in one isolated run."),
+            {Spawn(TEXT("ActorA")), Step(EProbeStepType::ActorFixtureSetLocation, TEXT("ActorA"), TEXT("100,0,50")),
+             Step(EProbeStepType::ActorFixtureLocationNearlyEquals, TEXT("ActorA"), TEXT("100,0,50")),
+             Step(EProbeStepType::ActorFixtureSetRotation, TEXT("ActorA"), TEXT("0,45,0")),
+             Step(EProbeStepType::ActorFixtureRotationNearlyEquals, TEXT("ActorA"), TEXT("0,45,0")),
+             Step(EProbeStepType::ActorFixtureSetScale, TEXT("ActorA"), TEXT("2,1,1")),
+             Step(EProbeStepType::ActorFixtureScaleNearlyEquals, TEXT("ActorA"), TEXT("2,1,1")),
+             Step(EProbeStepType::ActorFixtureDestroy, TEXT("ActorA"))});
+        Add(TEXT("Probe.HierarchyAttach"), TEXT("Temporary Actor Parent And Child"),
+            TEXT("Create a parent and child, attach, verify relationship and count, then clean up."),
+            {Spawn(TEXT("ActorA")), Spawn(TEXT("ActorB")),
+             Step(EProbeStepType::ActorFixtureAttachTo, TEXT("ActorB"), TEXT("ActorA")),
+             Step(EProbeStepType::ActorFixtureHasParent, TEXT("ActorB"), TEXT("ActorA")),
+             Step(EProbeStepType::ActorFixtureChildCountExactly, TEXT("ActorA"), TEXT(""), 1),
+             Step(EProbeStepType::ActorFixtureDestroy, TEXT("ActorB")), Step(EProbeStepType::ActorFixtureDestroy, TEXT("ActorA"))});
+        Add(TEXT("Probe.HierarchyDetach"), TEXT("Temporary Actor Detach Round Trip"),
+            TEXT("Attach, detach, and verify a child no longer has a parent."),
+            {Spawn(TEXT("ActorA")), Spawn(TEXT("ActorB")),
+             Step(EProbeStepType::ActorFixtureAttachTo, TEXT("ActorB"), TEXT("ActorA")),
+             Step(EProbeStepType::ActorFixtureDetach, TEXT("ActorB")),
+             Step(EProbeStepType::ActorFixtureHasNoParent, TEXT("ActorB")),
+             Step(EProbeStepType::ActorFixtureChildCountExactly, TEXT("ActorA"), TEXT(""), 0),
+             Step(EProbeStepType::ActorFixtureDestroy, TEXT("ActorB")), Step(EProbeStepType::ActorFixtureDestroy, TEXT("ActorA"))});
+        Add(TEXT("Probe.HierarchyReparent"), TEXT("Temporary Actor Reparenting"),
+            TEXT("Switch a test actor between two different test-owned parents and check counts."),
+            {Spawn(TEXT("ActorA")), Spawn(TEXT("ActorB")), Spawn(TEXT("ActorC")),
+             Step(EProbeStepType::ActorFixtureAttachTo, TEXT("ActorC"), TEXT("ActorA")),
+             Step(EProbeStepType::ActorFixtureHasParent, TEXT("ActorC"), TEXT("ActorA")),
+             Step(EProbeStepType::ActorFixtureAttachTo, TEXT("ActorC"), TEXT("ActorB")),
+             Step(EProbeStepType::ActorFixtureHasParent, TEXT("ActorC"), TEXT("ActorB")),
+             Step(EProbeStepType::ActorFixtureChildCountExactly, TEXT("ActorA"), TEXT(""), 0),
+             Step(EProbeStepType::ActorFixtureChildCountExactly, TEXT("ActorB"), TEXT(""), 1),
+             Step(EProbeStepType::ActorFixtureDestroy, TEXT("ActorC")),
+             Step(EProbeStepType::ActorFixtureDestroy, TEXT("ActorB")), Step(EProbeStepType::ActorFixtureDestroy, TEXT("ActorA"))});
+        Add(TEXT("Probe.HierarchyDistance"), TEXT("Temporary Actor Distance Threshold"),
+            TEXT("Move two test actors and verify their world-space separation."),
+            {Spawn(TEXT("ActorA")), Spawn(TEXT("ActorB")),
+             Step(EProbeStepType::ActorFixtureSetLocation, TEXT("ActorA"), TEXT("0,0,0")),
+             Step(EProbeStepType::ActorFixtureSetLocation, TEXT("ActorB"), TEXT("100,0,0")),
+             Step(EProbeStepType::ActorFixtureDistanceAtMost, TEXT("ActorB"), TEXT("ActorA"), 125),
+             Step(EProbeStepType::ActorFixtureDestroy, TEXT("ActorB")), Step(EProbeStepType::ActorFixtureDestroy, TEXT("ActorA"))});
+        Add(TEXT("Probe.StateTagRemoval"), TEXT("Temporary Actor Tag Removal"),
+            TEXT("Add and remove an actor tag, then assert the tag is absent."),
+            {Spawn(TEXT("ActorA")), Step(EProbeStepType::ActorFixtureAddTag, TEXT("ActorA"), TEXT("ProbeTestTag")),
+             Step(EProbeStepType::ActorFixtureRemoveTag, TEXT("ActorA"), TEXT("ProbeTestTag")),
+             Step(EProbeStepType::ActorFixtureTagAbsent, TEXT("ActorA"), TEXT("ProbeTestTag")),
+             Step(EProbeStepType::ActorFixtureDestroy, TEXT("ActorA"))});
+        Add(TEXT("Probe.StateVisibility"), TEXT("Temporary Actor Hide And Show"),
+            TEXT("Hide, assert hidden, show, assert visible, clean up."),
+            {Spawn(TEXT("ActorA")), Step(EProbeStepType::ActorFixtureHide, TEXT("ActorA")),
+             Step(EProbeStepType::ActorFixtureIsHidden, TEXT("ActorA")),
+             Step(EProbeStepType::ActorFixtureShow, TEXT("ActorA")),
+             Step(EProbeStepType::ActorFixtureIsVisible, TEXT("ActorA")),
+             Step(EProbeStepType::ActorFixtureDestroy, TEXT("ActorA"))});
+        Add(TEXT("Probe.StateFolderNegative"), TEXT("Temporary Actor Folder Exclusion"),
+            TEXT("Move to a test folder and verify it is not in a forbidden alternative folder."),
+            {Spawn(TEXT("ActorA")), Step(EProbeStepType::ActorFixtureSetFolder, TEXT("ActorA"), TEXT("ProbeAutomation")),
+             Step(EProbeStepType::ActorFixtureFolderNotEquals, TEXT("ActorA"), TEXT("OtherProbeFolder")),
+             Step(EProbeStepType::ActorFixtureDestroy, TEXT("ActorA"))});
+        Add(TEXT("Probe.StateSelectionNegative"), TEXT("Temporary Actor Selection Cleared"),
+            TEXT("Select a test actor, clear selection, verify it is not selected, and auto-restore previous selection."),
+            {Spawn(TEXT("ActorA")), Step(EProbeStepType::ActorFixtureSelect, TEXT("ActorA")),
+             Step(EProbeStepType::SelectionClear, TEXT("")),
+             Step(EProbeStepType::ActorFixtureIsNotSelected, TEXT("ActorA")),
+             Step(EProbeStepType::SelectionRestore, TEXT("")), Step(EProbeStepType::ActorFixtureDestroy, TEXT("ActorA"))});
+    }
+
+    // 0.14.0: parameterized, test-owned actor state contracts. All require
+    // human review and explicit authorization before they can mutate the Editor world.
+    static void RegisterProbeBehaviorContractTemplates()
+    {
+        auto Spawn = [](const TCHAR* Id)
+        {
+            FProbeTestStep S;
+            S.Type = EProbeStepType::ActorFixtureSpawn;
+            S.Target = TEXT("/Script/Engine.StaticMeshActor");
+            S.ExpectedValue = Id;
+            return S;
+        };
+        auto Step = [](EProbeStepType Type, const TCHAR* ActorId, const TCHAR* Value = TEXT(""), int32 Count = 0)
+        {
+            FProbeTestStep S;
+            S.Type = Type;
+            S.Target = ActorId;
+            S.ExpectedValue = Value;
+            S.MinimumActorCount = Count;
+            return S;
+        };
+        auto Add = [](const TCHAR* Id, const TCHAR* Name, const TCHAR* Description,
+            std::initializer_list<FProbeTestStep> Steps)
+        {
+            FExtensionTemplate T;
+            T.Id = FName(Id);
+            T.Category = TEXT("Test Actions");
+            T.Name = Name;
+            T.Description = Description;
+            T.bRequiresConfiguration = true;
+            for (const FProbeTestStep& OneStep : Steps) { T.Steps.Add(OneStep); }
+            RegisterTemplate(MoveTemp(T));
+        };
+        Add(TEXT("Probe.ContractChildMinimum"), TEXT("Temporary Actor Minimum Children"),
+            TEXT("Attach a child and verify that the parent has at least one test-owned child."),
+            {Spawn(TEXT("ActorA")), Spawn(TEXT("ActorB")), Step(EProbeStepType::ActorFixtureAttachTo, TEXT("ActorB"), TEXT("ActorA")),
+             Step(EProbeStepType::ActorFixtureChildCountAtLeast, TEXT("ActorA"), TEXT(""), 1),
+             Step(EProbeStepType::ActorFixtureDestroy, TEXT("ActorB")), Step(EProbeStepType::ActorFixtureDestroy, TEXT("ActorA"))});
+        Add(TEXT("Probe.ContractChildMaximum"), TEXT("Temporary Actor Maximum Children"),
+            TEXT("Verify no more than one child remains after attachment."),
+            {Spawn(TEXT("ActorA")), Spawn(TEXT("ActorB")), Step(EProbeStepType::ActorFixtureAttachTo, TEXT("ActorB"), TEXT("ActorA")),
+             Step(EProbeStepType::ActorFixtureChildCountAtMost, TEXT("ActorA"), TEXT(""), 1),
+             Step(EProbeStepType::ActorFixtureDestroy, TEXT("ActorB")), Step(EProbeStepType::ActorFixtureDestroy, TEXT("ActorA"))});
+        Add(TEXT("Probe.ContractDistanceMinimum"), TEXT("Temporary Actor Minimum Separation"),
+            TEXT("Move two test actors 150 cm apart and verify separation is at least 100 cm."),
+            {Spawn(TEXT("ActorA")), Spawn(TEXT("ActorB")),
+             Step(EProbeStepType::ActorFixtureSetLocation, TEXT("ActorA"), TEXT("0,0,0")),
+             Step(EProbeStepType::ActorFixtureSetLocation, TEXT("ActorB"), TEXT("150,0,0")),
+             Step(EProbeStepType::ActorFixtureDistanceAtLeast, TEXT("ActorB"), TEXT("ActorA"), 100),
+             Step(EProbeStepType::ActorFixtureDestroy, TEXT("ActorB")), Step(EProbeStepType::ActorFixtureDestroy, TEXT("ActorA"))});
+        Add(TEXT("Probe.ContractLabelContains"), TEXT("Temporary Actor Label Substring"),
+            TEXT("Rename a test actor and verify its Outliner label includes a substring."),
+            {Spawn(TEXT("ActorA")), Step(EProbeStepType::ActorFixtureSetLabel, TEXT("ActorA"), TEXT("Probe_Contract_014")),
+             Step(EProbeStepType::ActorFixtureLabelContains, TEXT("ActorA"), TEXT("Contract")),
+             Step(EProbeStepType::ActorFixtureDestroy, TEXT("ActorA"))});
+        Add(TEXT("Probe.ContractLabelPrefix"), TEXT("Temporary Actor Label Prefix"),
+            TEXT("Check that a controlled actor label begins with a specified prefix."),
+            {Spawn(TEXT("ActorA")), Step(EProbeStepType::ActorFixtureSetLabel, TEXT("ActorA"), TEXT("Probe_Contract_014")),
+             Step(EProbeStepType::ActorFixtureLabelStartsWith, TEXT("ActorA"), TEXT("Probe_")),
+             Step(EProbeStepType::ActorFixtureDestroy, TEXT("ActorA"))});
+        Add(TEXT("Probe.ContractLabelSuffix"), TEXT("Temporary Actor Label Suffix"),
+            TEXT("Check that a controlled actor label ends with a specified suffix."),
+            {Spawn(TEXT("ActorA")), Step(EProbeStepType::ActorFixtureSetLabel, TEXT("ActorA"), TEXT("Probe_Contract_014")),
+             Step(EProbeStepType::ActorFixtureLabelEndsWith, TEXT("ActorA"), TEXT("_014")),
+             Step(EProbeStepType::ActorFixtureDestroy, TEXT("ActorA"))});
+        Add(TEXT("Probe.ContractTagCount"), TEXT("Temporary Actor Exact Tag Count"),
+            TEXT("Apply two tags to a controlled actor and verify the exact tag count."),
+            {Spawn(TEXT("ActorA")), Step(EProbeStepType::ActorFixtureAddTag, TEXT("ActorA"), TEXT("ProbeA")),
+             Step(EProbeStepType::ActorFixtureAddTag, TEXT("ActorA"), TEXT("ProbeB")),
+             Step(EProbeStepType::ActorFixtureTagCountExactly, TEXT("ActorA"), TEXT(""), 2),
+             Step(EProbeStepType::ActorFixtureDestroy, TEXT("ActorA"))});
+        Add(TEXT("Probe.ContractRootComponent"), TEXT("Temporary Actor Root Component"),
+            TEXT("Verify the actor fixture has a root SceneComponent."),
+            {Spawn(TEXT("ActorA")), Step(EProbeStepType::ActorFixtureHasRootComponent, TEXT("ActorA")),
+             Step(EProbeStepType::ActorFixtureDestroy, TEXT("ActorA"))});
+        Add(TEXT("Probe.ContractLocationNegative"), TEXT("Temporary Actor Location Exclusion"),
+            TEXT("Position a test actor and assert it is not at a forbidden location."),
+            {Spawn(TEXT("ActorA")), Step(EProbeStepType::ActorFixtureSetLocation, TEXT("ActorA"), TEXT("0,0,0")),
+             Step(EProbeStepType::ActorFixtureLocationNotNearlyEquals, TEXT("ActorA"), TEXT("100,0,0")),
+             Step(EProbeStepType::ActorFixtureDestroy, TEXT("ActorA"))});
+        Add(TEXT("Probe.ContractRotationNegative"), TEXT("Temporary Actor Rotation Exclusion"),
+            TEXT("Assert that the actor is not oriented toward a forbidden rotation."),
+            {Spawn(TEXT("ActorA")), Step(EProbeStepType::ActorFixtureSetRotation, TEXT("ActorA"), TEXT("0,0,0")),
+             Step(EProbeStepType::ActorFixtureRotationNotNearlyEquals, TEXT("ActorA"), TEXT("0,90,0")),
+             Step(EProbeStepType::ActorFixtureDestroy, TEXT("ActorA"))});
+        Add(TEXT("Probe.ContractScaleNegative"), TEXT("Temporary Actor Scale Exclusion"),
+            TEXT("Assert a controlled actor does not have the forbidden scale."),
+            {Spawn(TEXT("ActorA")), Step(EProbeStepType::ActorFixtureSetScale, TEXT("ActorA"), TEXT("1,1,1")),
+             Step(EProbeStepType::ActorFixtureScaleNotNearlyEquals, TEXT("ActorA"), TEXT("2,2,2")),
+             Step(EProbeStepType::ActorFixtureDestroy, TEXT("ActorA"))});
+    }
+
     // 0.8.0 templates are examples requiring explicit configuration before Run All.
     static void RegisterProbeWorkflowTemplates()
     {
@@ -1023,6 +1461,387 @@ namespace Probe
             Item.bRequiresConfiguration = true;
             Item.Steps.Add(MakeStep(Definition.Type, Definition.bSelfAsset ? TEXT("{Self}") : FString()));
             RegisterTemplate(MoveTemp(Item));
+        }
+    }
+
+
+    // One source of truth for the built-in Templates menu and developer asset generator.
+    struct FTemplateInfo
+    {
+        ETestTemplate Type;
+        const TCHAR* Category;
+        const TCHAR* Name;
+        const TCHAR* Description;
+    };
+    static const TArray<FTemplateInfo>& BuiltinTemplates()
+    {
+        static const TArray<FTemplateInfo> Items = {
+            {Probe::ETestTemplate::Plugin, TEXT("Plugins & Modules"), TEXT("Plugin Availability"), TEXT("Check plugin enabled state")},
+            {Probe::ETestTemplate::Module, TEXT("Plugins & Modules"), TEXT("Module Loaded"), TEXT("Confirm ProbeEditor is loaded")},
+            {Probe::ETestTemplate::EditorTab, TEXT("Editor UI"), TEXT("Editor Tab Open"), TEXT("Check a registered tab ID is currently open")},
+            {Probe::ETestTemplate::ToolMenu, TEXT("Editor UI"), TEXT("Registered Tool Menu"), TEXT("Check an Editor menu ID exists")},
+            {Probe::ETestTemplate::ConsoleVariable, TEXT("Editor State"), TEXT("Console Variable"), TEXT("Check a console variable is available")},
+            {Probe::ETestTemplate::Asset, TEXT("Assets"), TEXT("Asset Availability"), TEXT("Check asset path exists")},
+            {Probe::ETestTemplate::AssetClass, TEXT("Assets"), TEXT("Asset Class Check"), TEXT("Check this Test Asset class")},
+            {Probe::ETestTemplate::AssetFolder, TEXT("Assets"), TEXT("Assets In Folder"), TEXT("Count assets in a content folder")},
+            {Probe::ETestTemplate::AssetDirty, TEXT("Assets"), TEXT("Asset Save State"), TEXT("Check an asset package is clean")},
+            {Probe::ETestTemplate::ClassContract, TEXT("Classes & Reflection"), TEXT("Class Property and Function"), TEXT("Check reflected properties and functions")},
+            {Probe::ETestTemplate::World, TEXT("Actors & World"), TEXT("Editor World and Actors"), TEXT("Check Editor world and actor count")},
+            {Probe::ETestTemplate::ActorClass, TEXT("Actors & World"), TEXT("Actor Class Count"), TEXT("Count actors derived from a class")},
+            {Probe::ETestTemplate::ActorTag, TEXT("Actors & World"), TEXT("Actor Tag"), TEXT("Find an actor by tag")},
+            {Probe::ETestTemplate::ActorLabel, TEXT("Actors & World"), TEXT("Actor Label"), TEXT("Find an actor by label")},
+            {Probe::ETestTemplate::ActorComponent, TEXT("Actors & World"), TEXT("Actor Component"), TEXT("Check an actor component class")},
+            {Probe::ETestTemplate::ActorFolder, TEXT("Actors & World"), TEXT("Actor Outliner Folder"), TEXT("Check an actor folder path")},
+            {Probe::ETestTemplate::ActorSelection, TEXT("Selection"), TEXT("Selected Actors"), TEXT("Check a minimum actor selection count")},
+            {Probe::ETestTemplate::SelectionExact, TEXT("Selection"), TEXT("Exact Selection Count"), TEXT("Check an exact actor selection count")},
+            {Probe::ETestTemplate::Property, TEXT("Properties & Values"), TEXT("Object Property Check"), TEXT("Compare a reflected property")},
+            {Probe::ETestTemplate::ObjectPropertyAbsent, TEXT("Properties & Values"), TEXT("Property Does Not Equal"), TEXT("Verify a property differs from a value")},
+            {Probe::ETestTemplate::PluginDescriptor, TEXT("Plugins & Modules"), TEXT("Plugin Descriptor Identity"), TEXT("Compare a plugin's friendly name and version")},
+            {Probe::ETestTemplate::PluginModule, TEXT("Plugins & Modules"), TEXT("Plugin Declared Module"), TEXT("Verify a module is declared and loaded")},
+            {Probe::ETestTemplate::ModuleDiscovery, TEXT("Plugins & Modules"), TEXT("Module Existence And Load"), TEXT("Choose a module from live/discovered identifiers")},
+            {Probe::ETestTemplate::TabRegistration, TEXT("Editor UI"), TEXT("Tab Registration And Open State"), TEXT("Check global tab ID is registered and open")},
+            {Probe::ETestTemplate::EditorNotPlaying, TEXT("Editor State"), TEXT("Editor Not In PIE"), TEXT("Check the Editor is not currently playing")},
+            {Probe::ETestTemplate::ConsoleVariableNegative, TEXT("Editor State"), TEXT("Console Variable Forbidden Value"), TEXT("Verify console variable differs from an unwanted value")},
+            {Probe::ETestTemplate::AssetAbsence, TEXT("Assets"), TEXT("Missing Asset"), TEXT("Verify an asset does not exist")},
+            {Probe::ETestTemplate::AssetTag, TEXT("Assets"), TEXT("Asset Registry Tag Present"), TEXT("Check asset has a searchable tag")},
+            {Probe::ETestTemplate::AssetExactCount, TEXT("Assets"), TEXT("Exact Asset Count"), TEXT("Verify exact number of assets in folder")},
+            {Probe::ETestTemplate::ClassFunctionContract, TEXT("Classes & Reflection"), TEXT("Blueprint Function Contract"), TEXT("Verify a function exists and is Blueprint callable")},
+            {Probe::ETestTemplate::ClassPropertyAbsence, TEXT("Classes & Reflection"), TEXT("Reflected Property Absent"), TEXT("Verify a reflected property does not exist")},
+            {Probe::ETestTemplate::ObjectGreaterThan, TEXT("Properties & Values"), TEXT("Numeric Threshold"), TEXT("Compare numeric property with a threshold")},
+            {Probe::ETestTemplate::ActorSelectionState, TEXT("Actors & World"), TEXT("Actor Selected State"), TEXT("Capture and check the selection state of an actor")},
+            {Probe::ETestTemplate::ActorMaxCount, TEXT("Actors & World"), TEXT("Maximum Actor Count"), TEXT("Verify upper bound for level actors")},
+            {Probe::ETestTemplate::SelectionMaxCount, TEXT("Selection"), TEXT("Maximum Selected Actors"), TEXT("Verify selection count upper bound")},
+            {Probe::ETestTemplate::SelectedComponent, TEXT("Selection"), TEXT("Selected Actor Component"), TEXT("Verify one selected actor contains a component")},
+        };
+        return Items;
+    }
+
+    // Reused by interactive creation and bulk generation; the asset path resolves
+    // the self-targeting steps after the factory has created the actual UObject.
+    static void PopulateBuiltinTemplate(UProbeTestAsset* Asset, ETestTemplate Template)
+    {
+        if (!Asset) { return; }
+        Asset->Modify();
+        Asset->bNeedsConfiguration = Template != ETestTemplate::Smoke;
+        if (Template == ETestTemplate::Blank) { return; }
+            switch (Template)
+            {
+            case Probe::ETestTemplate::Smoke:
+                Asset->TestDescription = TEXT("Basic Probe smoke test: plugin and Editor world availability");
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::PluginEnabled));
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::EditorWorldExists));
+                break;
+            case Probe::ETestTemplate::Plugin:
+                Asset->TestDescription = TEXT("Plugin availability check. Edit the Target plugin name.");
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::PluginEnabled));
+                break;
+            case Probe::ETestTemplate::World:
+                Asset->TestDescription = TEXT("Editor world and minimum actor count checks");
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::EditorWorldExists));
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ActorCountAtLeast));
+                break;
+            case Probe::ETestTemplate::Asset:
+                Asset->TestDescription = TEXT("Check that an asset exists at the specified object path");
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::AssetExists, Asset->GetPathName()));
+                break;
+            case Probe::ETestTemplate::ActorClass:
+                Asset->TestDescription = TEXT("Check actors of a particular class in the Editor world");
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ActorClassCountAtLeast));
+                break;
+            case Probe::ETestTemplate::ActorTag:
+                Asset->TestDescription = TEXT("Check whether an actor has a tag. Set Target and tag an actor first.");
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ActorTagExists));
+                break;
+            case Probe::ETestTemplate::AssetClass:
+                Asset->TestDescription = TEXT("Check this Probe Test asset's class. Change Target/Expected Class as needed.");
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::AssetClassIs, Asset->GetPathName()));
+                break;
+            case Probe::ETestTemplate::ActorLabel:
+                Asset->TestDescription = TEXT("Verify an actor with a specific World Outliner label exists.");
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ActorLabelExists));
+                break;
+            case Probe::ETestTemplate::ActorSelection:
+                Asset->TestDescription = TEXT("Verify the current selection contains at least one level actor.");
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::SelectedActorCountAtLeast));
+                break;
+            case Probe::ETestTemplate::Property:
+                Asset->TestDescription = TEXT("Check this test asset's bEnabled property is True.");
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ObjectPropertyEquals, Asset->GetPathName()));
+                break;
+            case Probe::ETestTemplate::Module:
+                Asset->TestDescription = TEXT("Verify ProbeEditor module has loaded.");
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ModuleLoaded));
+                break;
+            case Probe::ETestTemplate::EditorTab:
+                Asset->TestDescription = TEXT("Verify the Probe Editor tab is open.");
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::EditorTabOpen));
+                break;
+            case Probe::ETestTemplate::ToolMenu:
+                Asset->TestDescription = TEXT("Verify that an Editor ToolMenus path has been registered.");
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ToolMenuRegistered));
+                break;
+            case Probe::ETestTemplate::ConsoleVariable:
+                Asset->TestDescription = TEXT("Check an Editor console variable is present.");
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ConsoleVariableExists));
+                break;
+            case Probe::ETestTemplate::AssetFolder:
+                Asset->TestDescription = TEXT("Count assets in a folder recursively.");
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::AssetCountAtLeast));
+                break;
+            case Probe::ETestTemplate::AssetDirty:
+                Asset->TestDescription = TEXT("Check this test asset has no unsaved changes after saving.");
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::AssetIsClean, Asset->GetPathName()));
+                break;
+            case Probe::ETestTemplate::ClassContract:
+                Asset->TestDescription = TEXT("Verify an Actor class exposes a native property and function.");
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ClassHasProperty));
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ClassHasFunction));
+                break;
+            case Probe::ETestTemplate::ObjectPropertyAbsent:
+                Asset->TestDescription = TEXT("Check a property is different from an expected value.");
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ObjectPropertyNotEquals, Asset->GetPathName()));
+                break;
+            case Probe::ETestTemplate::ActorComponent:
+                Asset->TestDescription = TEXT("Check that an actor has a required component class. Capture an actor label.");
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ActorHasComponent));
+                break;
+            case Probe::ETestTemplate::ActorFolder:
+                Asset->TestDescription = TEXT("Check a World Outliner actor folder path. Capture an actor label.");
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ActorFolderEquals));
+                break;
+            case Probe::ETestTemplate::SelectionExact:
+                Asset->TestDescription = TEXT("Require exactly one actor selected in the level Editor.");
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::SelectedActorCountExactly));
+                break;
+            case Probe::ETestTemplate::PluginDescriptor:
+                Asset->TestDescription = TEXT("Check Probe's descriptor identity. Adjust the version to match your plugin.");
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::PluginFriendlyNameEquals));
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::PluginVersionEquals));
+                break;
+            case Probe::ETestTemplate::PluginModule:
+                Asset->TestDescription = TEXT("Check the plugin descriptor declares the expected module and that it is loaded.");
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::PluginDeclaresModule));
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ModuleLoaded));
+                break;
+            case Probe::ETestTemplate::ModuleDiscovery:
+                Asset->TestDescription = TEXT("Verify a module exists and is currently loaded. Browse to choose identifiers.");
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ModuleExists));
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ModuleLoaded));
+                break;
+            case Probe::ETestTemplate::TabRegistration:
+                Asset->TestDescription = TEXT("Verify Probe's global tab is registered and open.");
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::EditorTabRegistered));
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::EditorTabOpen));
+                break;
+            case Probe::ETestTemplate::EditorNotPlaying:
+                Asset->TestDescription = TEXT("Check Editor world exists and PIE is not currently running.");
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::EditorWorldExists));
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::PIEIsNotRunning));
+                break;
+            case Probe::ETestTemplate::ConsoleVariableNegative:
+                Asset->TestDescription = TEXT("Check a known console variable is not at an unwanted value.");
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ConsoleVariableNotEquals));
+                break;
+            case Probe::ETestTemplate::AssetAbsence:
+                Asset->TestDescription = TEXT("Verify an asset object path is absent from the registry.");
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::AssetNotExists));
+                break;
+            case Probe::ETestTemplate::AssetTag:
+                Asset->TestDescription = TEXT("Check an asset publishes a specified Asset Registry tag. Set tag name.");
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::AssetRegistryTagExists, Asset->GetPathName()));
+                break;
+            case Probe::ETestTemplate::ClassFunctionContract:
+                Asset->TestDescription = TEXT("Check an Actor function exists and is callable from Blueprints.");
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ClassHasFunction));
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ClassFunctionBlueprintCallable));
+                break;
+            case Probe::ETestTemplate::ClassPropertyAbsence:
+                Asset->TestDescription = TEXT("Verify an Actor class does not have a particular reflected property.");
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ClassHasNoProperty));
+                break;
+            case Probe::ETestTemplate::ObjectGreaterThan:
+                Asset->TestDescription = TEXT("Compare numeric property on a target object against a threshold. Configure object path/property.");
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ObjectPropertyGreaterThan));
+                break;
+            case Probe::ETestTemplate::ActorSelectionState:
+                Asset->TestDescription = TEXT("Verify an Outliner actor is selected. Use Selected Actor to capture its label.");
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ActorIsSelected));
+                break;
+            case Probe::ETestTemplate::ActorMaxCount:
+                Asset->TestDescription = TEXT("Check the level has no more than a specified number of actors.");
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ActorCountAtMost));
+                break;
+            case Probe::ETestTemplate::SelectionMaxCount:
+                Asset->TestDescription = TEXT("Check no more than a configured number of actors are selected.");
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::SelectedActorCountAtMost));
+                break;
+            case Probe::ETestTemplate::SelectedComponent:
+                Asset->TestDescription = TEXT("Select an actor and verify it has a component of the configured class.");
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::SelectedActorHasComponent));
+                break;
+            case Probe::ETestTemplate::AssetExactCount:
+                Asset->TestDescription = TEXT("Count assets in a folder exactly. Set the expected count after inspection.");
+                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::AssetCountExactly));
+                break;
+            default: break;
+            }
+
+            for (FProbeTestStep& Step : Asset->Steps)
+            {
+                if (Step.ExpectedValue == TEXT("{InstalledVersion}"))
+                {
+                    const TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("Probe"));
+                    Step.ExpectedValue = Plugin.IsValid() ? Plugin->GetDescriptor().VersionName : FString();
+                }
+            }
+
+        Asset->MarkPackageDirty();
+    }
+
+    static void PopulateExtensionTemplate(UProbeTestAsset* Asset, const FExtensionTemplate& Template)
+    {
+        if (!Asset) { return; }
+        Asset->Modify();
+        Asset->TestDescription = Template.Description;
+        Asset->Steps = Template.Steps;
+        Asset->bNeedsConfiguration = Template.bRequiresConfiguration;
+        for (FProbeTestStep& Step : Asset->Steps)
+        {
+            if (Step.Target == TEXT("{Self}")) { Step.Target = Asset->GetPathName(); }
+            if (Step.ExpectedValue == TEXT("{InstalledVersion}"))
+            {
+                const TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("Probe"));
+                Step.ExpectedValue = Plugin.IsValid() ? Plugin->GetDescriptor().VersionName : FString();
+            }
+        }
+        Asset->MarkPackageDirty();
+    }
+
+
+    // Temporary developer utility. Asset/folder names must be valid Unreal long package names.
+    static FString SafeTemplatePathSegment(const FString& Text)
+    {
+        FString Result;
+        bool bLastSeparator = false;
+        for (const TCHAR Character : Text)
+        {
+            const bool bAllowed = (Character >= TEXT('A') && Character <= TEXT('Z'))
+                || (Character >= TEXT('a') && Character <= TEXT('z'))
+                || (Character >= TEXT('0') && Character <= TEXT('9'));
+            if (bAllowed)
+            {
+                Result.AppendChar(Character);
+                bLastSeparator = false;
+            }
+            else if (!Result.IsEmpty() && !bLastSeparator)
+            {
+                Result.AppendChar(TEXT('_'));
+                bLastSeparator = true;
+            }
+        }
+        while (Result.EndsWith(TEXT("_"))) { Result.LeftChopInline(1); }
+        return Result.IsEmpty() ? TEXT("General") : Result;
+    }
+
+    static void GenerateTemplateTests()
+    {
+        if (!IsInGameThread())
+        {
+            UE_LOG(LogTemp, Error, TEXT("Probe.GenerateTemplateTests must run on the Editor game thread."));
+            return;
+        }
+        struct FGenerationItem
+        {
+            FString StableId;
+            FString Name;
+            FString Category;
+            bool bExtension = false;
+            ETestTemplate Builtin = ETestTemplate::Blank;
+            FName ExtensionId;
+        };
+        TArray<FGenerationItem> Items;
+        Items.Add({TEXT("Probe.Blank"), TEXT("Blank Test"), TEXT("Getting Started"), false, ETestTemplate::Blank, NAME_None});
+        Items.Add({TEXT("Probe.Smoke"), TEXT("Probe Smoke Test"), TEXT("Getting Started"), false, ETestTemplate::Smoke, NAME_None});
+        for (const FTemplateInfo& Info : BuiltinTemplates())
+        {
+            // The enum value remains stable, even when two displayed template names match.
+            const FString Key = FString::Printf(TEXT("Probe.Builtin.%d"), static_cast<int32>(Info.Type));
+            Items.Add({Key, Info.Name, Info.Category, false, Info.Type, NAME_None});
+        }
+        for (const FName Id : GetExtensionTemplateIds())
+        {
+            if (const FExtensionTemplate* Info = FindExtensionTemplate(Id))
+            {
+                Items.Add({Id.ToString(), Info->Name, Info->Category, true, ETestTemplate::Blank, Id});
+            }
+        }
+        Items.Sort([](const FGenerationItem& A, const FGenerationItem& B)
+        {
+            return A.StableId < B.StableId;
+        });
+
+        IAssetTools& AssetTools = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools")).Get();
+        IAssetRegistry& Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+        TArray<UPackage*> PackagesToSave;
+        int32 Created = 0;
+        int32 Skipped = 0;
+        int32 Failed = 0;
+        for (const FGenerationItem& Item : Items)
+        {
+            const FString Group = Item.Category == TEXT("Getting Started")
+                ? TEXT("Basic Tests") : MenuSubgroup(Item.Category, Item.Name);
+            const FString Folder = TEXT("/Game/Probe/") + SafeTemplatePathSegment(Item.Category)
+                + TEXT("/") + SafeTemplatePathSegment(Group);
+            const uint32 IdHash = FCrc::StrCrc32(*Item.StableId);
+            const FString AssetName = FString::Printf(TEXT("PT_%s_%08X"),
+                *SafeTemplatePathSegment(Item.Name).Left(50), IdHash);
+            const FString PackageName = Folder + TEXT("/") + AssetName;
+            const FString ObjectPath = PackageName + TEXT(".") + AssetName;
+            const FAssetData Existing = Registry.GetAssetByObjectPath(FSoftObjectPath(ObjectPath));
+            if (Existing.IsValid() || FindPackage(nullptr, *PackageName) != nullptr
+                || FPackageName::DoesPackageExist(PackageName))
+            {
+                ++Skipped;
+                continue;
+            }
+            UProbeTestAssetFactory* Factory = NewObject<UProbeTestAssetFactory>();
+            UProbeTestAsset* Asset = Cast<UProbeTestAsset>(AssetTools.CreateAsset(
+                AssetName, Folder, UProbeTestAsset::StaticClass(), Factory));
+            if (!Asset)
+            {
+                ++Failed;
+                UE_LOG(LogTemp, Error, TEXT("Probe: Failed to generate template '%s' at %s"), *Item.StableId, *PackageName);
+                continue;
+            }
+            if (Item.bExtension)
+            {
+                if (const FExtensionTemplate* Extension = FindExtensionTemplate(Item.ExtensionId))
+                {
+                    PopulateExtensionTemplate(Asset, *Extension);
+                }
+                else
+                {
+                    ++Failed;
+                    UE_LOG(LogTemp, Error, TEXT("Probe: Template provider disappeared during generation: %s"), *Item.StableId);
+                    continue;
+                }
+            }
+            else
+            {
+                PopulateBuiltinTemplate(Asset, Item.Builtin);
+            }
+            Asset->MarkPackageDirty();
+            PackagesToSave.AddUnique(Asset->GetOutermost());
+            ++Created;
+        }
+        const bool bSaved = PackagesToSave.IsEmpty()
+            || UEditorLoadingAndSavingUtils::SavePackages(PackagesToSave, true);
+        UE_LOG(LogTemp, Display,
+            TEXT("Probe.GenerateTemplateTests: %d created, %d already present (skipped), %d failed. Saved: %s. Root: /Game/Probe"),
+            Created, Skipped, Failed, bSaved ? TEXT("yes") : TEXT("NO - check unsaved assets"));
+        if (!bSaved)
+        {
+            UE_LOG(LogTemp, Warning, TEXT("Probe: Some generated tests may still be unsaved. Use Save All and inspect the Output Log."));
         }
     }
 
@@ -1703,7 +2522,8 @@ private:
                 || Type == EProbeStepType::ActorPropertyEquals || Type == EProbeStepType::ActorIsSelected
                 || Type == EProbeStepType::ActorIsNotSelected || Type == EProbeStepType::ActorLabelCountExactly
                 || Type == EProbeStepType::ActorLabelCountAtLeast || Type == EProbeStepType::ActorHasTagByLabel
-                || Type == EProbeStepType::ActorDoesNotHaveTagByLabel);
+                || Type == EProbeStepType::ActorDoesNotHaveTagByLabel
+                || Type == EProbeStepType::SelectionSelectActorByLabel);
         TMap<FString, FProbeIdentifierChoice> Entries;
         if (bClass)
         {
@@ -1882,7 +2702,7 @@ private:
                         || Type == EProbeStepType::ModuleExists;
                     const bool bTab = Type == EProbeStepType::EditorTabOpen || Type == EProbeStepType::EditorTabNotOpen
                         || Type == EProbeStepType::EditorTabRegistered;
-                    const bool bClass = Type == EProbeStepType::FixtureCreateObject
+                    const bool bClass = Type == EProbeStepType::FixtureCreateObject || Type == EProbeStepType::ActorFixtureSpawn
                         || FString(Probe::GetAssertionInfo(Type).Category) == TEXT("Classes & Reflection")
                         || Type == EProbeStepType::ActorClassCountAtLeast || Type == EProbeStepType::ActorClassCountExactly
                         || Type == EProbeStepType::ActorClassCountAtMost || Type == EProbeStepType::SelectedActorIsClass
@@ -1976,6 +2796,12 @@ private:
                     if (Type == EProbeStepType::ActorCountAtMost || Type == EProbeStepType::ActorClassCountAtMost) { return LOCTEXT("MaxActorsLabel", "Maximum Actors"); }
                     if (Type == EProbeStepType::SelectedActorCountAtMost) { return LOCTEXT("MaxSelectedLabel", "Maximum Selected"); }
                     if (Type == EProbeStepType::ActorLabelCountExactly) { return LOCTEXT("ExactMatchingActors", "Exact Label Count"); }
+                    if (Type == EProbeStepType::ActorFixtureChildCountExactly) { return LOCTEXT("FixtureChildrenExact", "Exact Child Count"); }
+                    if (Type == EProbeStepType::ActorFixtureChildCountAtLeast) { return LOCTEXT("FixtureChildrenMinimum", "Minimum Children"); }
+                    if (Type == EProbeStepType::ActorFixtureChildCountAtMost) { return LOCTEXT("FixtureChildrenMaximum", "Maximum Children"); }
+                    if (Type == EProbeStepType::ActorFixtureTagCountExactly) { return LOCTEXT("FixtureTagsExact", "Exact Tag Count"); }
+                    if (Type == EProbeStepType::ActorFixtureDistanceAtLeast) { return LOCTEXT("FixtureDistanceMinimum", "Minimum Distance (cm)"); }
+                    if (Type == EProbeStepType::ActorFixtureDistanceAtMost) { return LOCTEXT("FixtureDistanceMaximum", "Maximum Distance (cm)"); }
                     if (Type == EProbeStepType::ActorCountExactly || Type == EProbeStepType::ActorClassCountExactly
                         || Type == EProbeStepType::SelectedActorCountExactly) { return LOCTEXT("ExactCountLabel", "Exact Count"); }
                     return Type == EProbeStepType::SelectedActorCountAtLeast
@@ -2066,13 +2892,17 @@ private:
                 || Step.Type == EProbeStepType::AssetCountDirectExactly
                 || Step.Type == EProbeStepType::LoadedModuleCountExactly
                 || Step.Type == EProbeStepType::ActorFolderCountExactly
-                || Step.Type == EProbeStepType::ActorLabelCountExactly;
+                || Step.Type == EProbeStepType::ActorLabelCountExactly
+                || Step.Type == EProbeStepType::ActorFixtureChildCountExactly
+                || Step.Type == EProbeStepType::ActorFixtureTagCountExactly;
             const bool bMaximum = Step.Type == EProbeStepType::ActorCountAtMost
                 || Step.Type == EProbeStepType::ActorClassCountAtMost
                 || Step.Type == EProbeStepType::SelectedActorCountAtMost
                 || Step.Type == EProbeStepType::ActorFolderCountAtMost
                 || Step.Type == EProbeStepType::ActorCountWithTagAtMost
-                || Step.Type == EProbeStepType::ActorLabelCountAtMost;
+                || Step.Type == EProbeStepType::ActorLabelCountAtMost
+                || Step.Type == EProbeStepType::ActorFixtureDistanceAtMost
+                || Step.Type == EProbeStepType::ActorFixtureChildCountAtMost;
             Summary += FString::Printf(TEXT("  |  %s %d"), bExact ? TEXT("exactly") : bMaximum ? TEXT("at most") : TEXT("at least"), Step.MinimumActorCount);
         }
         return Summary.IsEmpty() ? Probe::StepHelp(Step) : Summary;
@@ -2109,27 +2939,46 @@ private:
             [Id](FProbeTestStep& Step) { Step.AssertionId = Id; }, true);
     }
 
-    // Shared categorized submenus keep the growing assertion catalog navigable.
+    // Drilldown is generated from the same catalog metadata for Add Step and
+    // Change Assertion, including third-party extension registrations.
     TSharedRef<SWidget> BuildStepTypeMenu(TWeakObjectPtr<UProbeTestAsset> TestRef, int32 Index)
     {
         FMenuBuilder Menu(true, nullptr);
         for (const FString& Category : Probe::AllCategories())
         {
-            Menu.AddSubMenu(FText::FromString(Category), FText::FromString(Category + TEXT(" assertions")),
-                FNewMenuDelegate::CreateLambda([this, TestRef, Index, Category](FMenuBuilder& SubMenu)
+            Menu.AddSubMenu(FText::FromString(Category), FText::FromString(Category + TEXT(" step types")),
+                FNewMenuDelegate::CreateLambda([this, TestRef, Index, Category](FMenuBuilder& CategoryMenu)
                 {
+                    TArray<FString> Groups;
                     for (const Probe::FAssertionInfo& Info : Probe::AssertionCatalog())
                     {
-                        if (Category != Info.Category) { continue; }
-                        SubMenu.AddMenuEntry(FText::FromString(Info.Name), FText::FromString(FString(Info.Description) + TEXT(". Review and mark Ready before Run All.")), FSlateIcon(),
-                            FUIAction(FExecuteAction::CreateSP(this, &SProbeWorkspace::SetStepType, TestRef, Index, Info.Type)));
+                        if (Category == Info.Category) { Groups.AddUnique(Probe::MenuSubgroup(Category, Info.Name)); }
                     }
                     for (const FName Id : Probe::GetExtensionAssertionIds())
                     {
-                        const Probe::FExtensionAssertion* Info = Probe::FindExtensionAssertion(Id);
-                        if (!Info || Category != Info->Category) { continue; }
-                        SubMenu.AddMenuEntry(FText::FromString(Info->Name), FText::FromString(Info->Description + TEXT(". Configure this assertion before automatic execution.")), FSlateIcon(),
-                            FUIAction(FExecuteAction::CreateSP(this, &SProbeWorkspace::SetExtensionStepType, TestRef, Index, Id)));
+                        if (const Probe::FExtensionAssertion* Info = Probe::FindExtensionAssertion(Id))
+                        { if (Category == Info->Category) { Groups.AddUnique(Probe::MenuSubgroup(Category, Info->Name)); } }
+                    }
+                    Groups.Sort();
+                    for (const FString& Group : Groups)
+                    {
+                        CategoryMenu.AddSubMenu(FText::FromString(Group), FText::FromString(Category + TEXT(" / ") + Group),
+                            FNewMenuDelegate::CreateLambda([this, TestRef, Index, Category, Group](FMenuBuilder& GroupMenu)
+                            {
+                                for (const Probe::FAssertionInfo& Info : Probe::AssertionCatalog())
+                                {
+                                    if (Category != Info.Category || Group != Probe::MenuSubgroup(Category, Info.Name)) { continue; }
+                                    GroupMenu.AddMenuEntry(FText::FromString(Info.Name), FText::FromString(Info.Description), FSlateIcon(),
+                                        FUIAction(FExecuteAction::CreateSP(this, &SProbeWorkspace::SetStepType, TestRef, Index, Info.Type)));
+                                }
+                                for (const FName Id : Probe::GetExtensionAssertionIds())
+                                {
+                                    const Probe::FExtensionAssertion* Info = Probe::FindExtensionAssertion(Id);
+                                    if (!Info || Category != Info->Category || Group != Probe::MenuSubgroup(Category, Info->Name)) { continue; }
+                                    GroupMenu.AddMenuEntry(FText::FromString(Info->Name), FText::FromString(Info->Description), FSlateIcon(),
+                                        FUIAction(FExecuteAction::CreateSP(this, &SProbeWorkspace::SetExtensionStepType, TestRef, Index, Id)));
+                                }
+                            }));
                     }
                 }));
         }
@@ -2145,11 +2994,12 @@ private:
         }
         ChangeAsset(TestRef, LOCTEXT("MoveStepTransaction", "Move Probe Test Step"),
             [Index, Direction](UProbeTestAsset& Test) { Test.Steps.Swap(Index, Index + Direction); });
-        if (ExpandedStepIndices.Contains(Index))
-        {
-            ExpandedStepIndices.Remove(Index);
-            ExpandedStepIndices.Add(Index + Direction);
-        }
+        const bool bFirstExpanded = ExpandedStepIndices.Contains(Index);
+        const bool bSecondExpanded = ExpandedStepIndices.Contains(Index + Direction);
+        ExpandedStepIndices.Remove(Index);
+        ExpandedStepIndices.Remove(Index + Direction);
+        if (bFirstExpanded) { ExpandedStepIndices.Add(Index + Direction); }
+        if (bSecondExpanded) { ExpandedStepIndices.Add(Index); }
         RebuildTestEditor();
         return FReply::Handled();
     }
@@ -2159,7 +3009,14 @@ private:
         UProbeTestAsset* Asset = TestRef.Get();
         if (!Asset || !Asset->Steps.IsValidIndex(Index)) { return FReply::Handled(); }
         ChangeAsset(TestRef, LOCTEXT("DuplicateStepTransaction", "Duplicate Probe Test Step"),
-            [Index](UProbeTestAsset& Test) { Test.Steps.Insert(Test.Steps[Index], Index + 1); });
+            [Index](UProbeTestAsset& Test) { Probe::DuplicateStepSafely(Test, Index); });
+        // Keep expanded/collapsed state associated with existing rows below the insertion.
+        TSet<int32> Shifted;
+        for (const int32 ExpandedIndex : ExpandedStepIndices)
+        {
+            Shifted.Add(ExpandedIndex > Index ? ExpandedIndex + 1 : ExpandedIndex);
+        }
+        ExpandedStepIndices = MoveTemp(Shifted);
         ExpandedStepIndices.Add(Index + 1);
         RebuildTestEditor();
         return FReply::Handled();
@@ -2171,6 +3028,13 @@ private:
         if (!Asset || !Asset->Steps.IsValidIndex(Index)) { return FReply::Handled(); }
         ChangeAsset(TestRef, LOCTEXT("DeleteStepTransaction", "Remove Probe Test Step"),
             [Index](UProbeTestAsset& Test) { Test.Steps.RemoveAt(Index); });
+        TSet<int32> Shifted;
+        for (const int32 ExpandedIndex : ExpandedStepIndices)
+        {
+            if (ExpandedIndex != Index)
+            { Shifted.Add(ExpandedIndex > Index ? ExpandedIndex - 1 : ExpandedIndex); }
+        }
+        ExpandedStepIndices = MoveTemp(Shifted);
         RebuildTestEditor();
         return FReply::Handled();
     }
@@ -2289,6 +3153,13 @@ private:
                       || Type == EProbeStepType::ActorIsNotSelected || Type == EProbeStepType::ActorLabelCountExactly
                       || Type == EProbeStepType::ActorLabelCountAtLeast
                       ? LOCTEXT("ActorLabelTarget", "Actor Label")
+                    : Type == EProbeStepType::ActorFixtureSpawn ? LOCTEXT("FixtureActorClassPath", "Actor Class")
+                    : (Step.AssertionId.IsNone() && ((Type >= EProbeStepType::ActorFixtureSetLabel
+                        && Type <= EProbeStepType::ActorFixtureDestroy) ||
+                        (Type >= EProbeStepType::ActorFixtureSetLocation && Type <= EProbeStepType::ActorFixtureScaleNotNearlyEquals)))
+                      ? LOCTEXT("FixtureActorIdentifier", "Actor ID")
+                    : Type == EProbeStepType::SelectionSelectActorByLabel ? LOCTEXT("ActionActorLabel", "Actor Label")
+                    : Type == EProbeStepType::SelectionSelectActorsWithTag ? LOCTEXT("ActionActorTag", "Actor Tag")
                     : Step.AssertionId.IsNone() && FString(Probe::GetAssertionInfo(Type).Category) == TEXT("Plugins & Modules") ? LOCTEXT("TargetPluginLabel", "Plugin Name")
                     : Step.AssertionId.IsNone() && FString(Probe::GetAssertionInfo(Type).Category) == TEXT("Assets") ? LOCTEXT("TargetAssetPathLabel", "Asset Path")
                     : Step.AssertionId.IsNone() && FString(Probe::GetAssertionInfo(Type).Category) == TEXT("Classes & Reflection") ? LOCTEXT("TargetClassPathLabel", "Class Path")
@@ -2303,7 +3174,8 @@ private:
                 || Type == EProbeStepType::ActorHasComponent || Type == EProbeStepType::ActorFolderEquals
                 || Type == EProbeStepType::ActorPropertyEquals || Type == EProbeStepType::SelectedActorLabelEquals
                 || Type == EProbeStepType::ActorIsSelected || Type == EProbeStepType::ActorIsNotSelected
-                || Type == EProbeStepType::ActorLabelCountExactly)
+                || Type == EProbeStepType::ActorLabelCountExactly
+                || Type == EProbeStepType::SelectionSelectActorByLabel)
             {
                 Fields->AddSlot().AutoHeight().Padding(FMargin(136.0f, 1.0f, 2.0f, 3.0f))
                 [
@@ -2350,7 +3222,33 @@ private:
             if (StepFieldMask & Probe::ValueField)
             {
                 AddStringField(Fields, TestRef, Index, EStepTextField::ExpectedValue,
-                    Type == EProbeStepType::FixtureCreateObject ? LOCTEXT("NewFixtureIdentifier", "New Fixture ID")
+                    Type == EProbeStepType::ActorFixtureSpawn ? LOCTEXT("NewActorFixtureIdentifier", "New Actor ID")
+                    : Type == EProbeStepType::ActorFixtureSetLabel ? LOCTEXT("NewActorFixtureLabel", "New Actor Label")
+                    : Type == EProbeStepType::ActorFixtureSetFolder ? LOCTEXT("NewActorFixtureFolder", "New Outliner Folder")
+                    : Type == EProbeStepType::ActorFixtureAddTag || Type == EProbeStepType::ActorFixtureRemoveTag
+                        ? LOCTEXT("NewActorFixtureTag", "Actor Tag")
+                    : Type == EProbeStepType::ActorFixtureLabelEquals ? LOCTEXT("ExpectedActorFixtureLabel", "Expected Actor Label")
+                    : Type == EProbeStepType::ActorFixtureFolderEquals ? LOCTEXT("ExpectedActorFixtureFolder", "Expected Outliner Folder")
+                    : Type == EProbeStepType::ActorFixtureHasTag || Type == EProbeStepType::ActorFixtureTagAbsent
+                      ? LOCTEXT("ExpectedActorFixtureTag", "Actor Tag")
+                    : Type == EProbeStepType::ActorFixtureSetLocation || Type == EProbeStepType::ActorFixtureLocationNearlyEquals
+                      || Type == EProbeStepType::ActorFixtureLocationNotNearlyEquals
+                      ? LOCTEXT("ActorFixtureLocation", "Location (X,Y,Z cm)")
+                    : Type == EProbeStepType::ActorFixtureSetRotation || Type == EProbeStepType::ActorFixtureRotationNearlyEquals
+                      || Type == EProbeStepType::ActorFixtureRotationNotNearlyEquals
+                      ? LOCTEXT("ActorFixtureRotation", "Rotation (Pitch,Yaw,Roll)")
+                    : Type == EProbeStepType::ActorFixtureSetScale || Type == EProbeStepType::ActorFixtureScaleNearlyEquals
+                      || Type == EProbeStepType::ActorFixtureScaleNotNearlyEquals
+                      ? LOCTEXT("ActorFixtureScale", "Scale (X,Y,Z)")
+                    : Type == EProbeStepType::ActorFixtureAttachTo || Type == EProbeStepType::ActorFixtureHasParent
+                      ? LOCTEXT("ActorFixtureParent", "Parent Actor ID")
+                    : (Type == EProbeStepType::ActorFixtureDistanceAtMost || Type == EProbeStepType::ActorFixtureDistanceAtLeast)
+                      ? LOCTEXT("ActorFixtureOther", "Other Actor ID")
+                    : (Type == EProbeStepType::ActorFixtureLabelContains || Type == EProbeStepType::ActorFixtureLabelStartsWith || Type == EProbeStepType::ActorFixtureLabelEndsWith)
+                      ? LOCTEXT("ActorFixtureLabelPattern", "Outliner Label Text")
+                    : Type == EProbeStepType::ActorFixtureFolderNotEquals
+                      ? LOCTEXT("ActorFixtureOtherFolder", "Forbidden Outliner Folder")
+                    : Type == EProbeStepType::FixtureCreateObject ? LOCTEXT("NewFixtureIdentifier", "New Fixture ID")
                     : Type == EProbeStepType::FixtureSetProperty ? LOCTEXT("FixtureNewPropertyValue", "New Value")
                     : Type == EProbeStepType::ActorFolderEquals || Type == EProbeStepType::AssetPackagePathEquals
                       ? LOCTEXT("FolderValueLabel", "Expected Folder")
@@ -2426,43 +3324,158 @@ private:
                 [ SNew(STextBlock).Text(LOCTEXT("TestEnabled", "Enabled")) ]
             ]
         ];
-        Settings->AddSlot().AutoHeight().Padding(0, 5, 0, 2)
+        // Readiness is a test-lifecycle decision, not a miscellaneous checkbox.
+        // New templates remain excluded from bulk runs until explicitly approved.
+        Settings->AddSlot().AutoHeight().Padding(0, 7, 0, 5)
         [
-            SNew(SHorizontalBox)
-            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
-            [ SNew(SCheckBox)
-              .ToolTipText(LOCTEXT("NeedsConfigurationTip", "Hold template tests out of Run All until their targets, expectations, and required Editor conditions have been reviewed."))
-              .IsChecked_Lambda([TestRef]()
-              {
-                  const UProbeTestAsset* Test = TestRef.Get();
-                  return Test && Test->bNeedsConfiguration ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
-              })
-              .OnCheckStateChanged_Lambda([this, TestRef](ECheckBoxState State)
-              {
-                  const UProbeTestAsset* Test = TestRef.Get();
-                  if (!Test) { return; }
-                  if (State == ECheckBoxState::Unchecked)
-                  {
-                      const FString Issue = Probe::TestConfigurationIssue(*Test);
-                      if (!Issue.IsEmpty())
-                      {
-                          FeedbackMessage = FText::FromString(TEXT("Cannot mark Ready: ") + Issue);
-                          return;
-                      }
-                  }
-                  ChangeAsset(TestRef, LOCTEXT("ReviewTestTransaction", "Change Probe Test Readiness"),
-                      [State](UProbeTestAsset& Test) { Test.bNeedsConfiguration = State == ECheckBoxState::Checked; });
-              })
-              [ SNew(STextBlock).Text(LOCTEXT("NeedsConfigurationLabel", "Needs Configuration")) ] ]
-            + SHorizontalBox::Slot().FillWidth(1.0f).VAlign(VAlign_Center).Padding(12, 0, 0, 0)
-            [ SNew(STextBlock)
-              .Visibility_Lambda([TestRef]()
-              {
-                  const UProbeTestAsset* Test = TestRef.Get();
-                  return Test && Test->bNeedsConfiguration ? EVisibility::Visible : EVisibility::Collapsed;
-              })
-              .Text(LOCTEXT("NeedsConfigurationNotice", "Review inputs, choose a meaningful expectation, then uncheck to run."))
-              .AutoWrapText(true).ColorAndOpacity(FSlateColor::UseSubduedForeground()) ]
+            SNew(SBorder)
+            .BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
+            .Padding(FMargin(10.0f, 8.0f))
+            [
+                SNew(SVerticalBox)
+                + SVerticalBox::Slot().AutoHeight()
+                [
+                    SNew(SHorizontalBox)
+                    + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 8, 0)
+                    [ SNew(SImage).Image(FAppStyle::GetBrush("Icons.Info")) ]
+                    + SHorizontalBox::Slot().FillWidth(1.0f).VAlign(VAlign_Center)
+                    [
+                        SNew(STextBlock)
+                        .Font(FAppStyle::GetFontStyle("NormalFontBold"))
+                        .Text_Lambda([TestRef]()
+                        {
+                            const UProbeTestAsset* Test = TestRef.Get();
+                            if (!Test) { return FText::GetEmpty(); }
+                            if (Test->bNeedsConfiguration) { return LOCTEXT("ReviewStatusTitle", "TEST READINESS  |  Needs Review"); }
+                            if (!Probe::TestConfigurationIssue(*Test).IsEmpty()) { return LOCTEXT("InvalidStatusTitle", "TEST READINESS  |  Configuration Invalid"); }
+                            return LOCTEXT("ReadyStatusTitle", "TEST READINESS  |  Ready");
+                        })
+                    ]
+                    + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+                    [
+                        SNew(SButton)
+                        .ToolTipText(LOCTEXT("ReadinessActionTip", "Ready tests participate in Run All. Mark Needs Review to hold a test out of automatic execution."))
+                        .Text_Lambda([TestRef]()
+                        {
+                            const UProbeTestAsset* Test = TestRef.Get();
+                            return Test && Test->bNeedsConfiguration
+                                ? LOCTEXT("MarkReadyButton", "Mark Ready")
+                                : LOCTEXT("MarkNeedsReviewButton", "Mark Needs Review");
+                        })
+                        .OnClicked_Lambda([this, TestRef]()
+                        {
+                            const UProbeTestAsset* Test = TestRef.Get();
+                            if (!Test) { return FReply::Handled(); }
+                            if (Test->bNeedsConfiguration)
+                            {
+                                const FString Issue = Probe::TestConfigurationIssue(*Test);
+                                if (!Issue.IsEmpty())
+                                {
+                                    FeedbackMessage = FText::FromString(TEXT("Cannot mark Ready: ") + Issue);
+                                    RebuildTestEditor();
+                                    return FReply::Handled();
+                                }
+                            }
+                            const bool bMarkNeedsReview = !Test->bNeedsConfiguration;
+                            ChangeAsset(TestRef, LOCTEXT("ReviewTestTransaction", "Change Probe Test Readiness"),
+                                [bMarkNeedsReview](UProbeTestAsset& Asset) { Asset.bNeedsConfiguration = bMarkNeedsReview; });
+                            RebuildTestEditor();
+                            return FReply::Handled();
+                        })
+                    ]
+                ]
+                + SVerticalBox::Slot().AutoHeight().Padding(25, 5, 0, 0)
+                [
+                    SNew(STextBlock)
+                    .AutoWrapText(true)
+                    .ColorAndOpacity(FSlateColor::UseSubduedForeground())
+                    .Text_Lambda([TestRef]()
+                    {
+                        const UProbeTestAsset* Test = TestRef.Get();
+                        if (!Test) { return FText::GetEmpty(); }
+                        if (Test->bNeedsConfiguration)
+                        {
+                            const FString Issue = Probe::TestConfigurationIssue(*Test);
+                            return Issue.IsEmpty()
+                                ? LOCTEXT("ReviewHint", "Review the step inputs and expected results, then mark this test Ready. It is excluded from Run All until then.")
+                                : FText::FromString(TEXT("Complete before marking Ready: ") + Issue);
+                        }
+                        const FString Issue = Probe::TestConfigurationIssue(*Test);
+                        if (!Issue.IsEmpty()) { return FText::FromString(TEXT("This test needs attention: ") + Issue); }
+                        return LOCTEXT("ReadyHint", "This test can be included in automatic runs. Use Mark Needs Review to temporarily exclude it.");
+                    })
+                ]
+            ]
+        ];
+        // Explicit authorization is separately identifiable from readiness.
+        // Keep both settings serialized as before so existing assets do not migrate.
+        Settings->AddSlot().AutoHeight().Padding(0, 2, 0, 5)
+        [
+            SNew(SBorder)
+            .BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
+            .Padding(FMargin(10.0f, 8.0f))
+            .Visibility_Lambda([TestRef]()
+            {
+                const UProbeTestAsset* Test = TestRef.Get();
+                if (!Test) { return EVisibility::Collapsed; }
+                for (const FProbeTestStep& Step : Test->Steps)
+                {
+                    if (Step.AssertionId.IsNone() && Step.Type >= EProbeStepType::ActorFixtureSpawn
+                        && Step.Type <= EProbeStepType::ActorFixtureScaleNotNearlyEquals)
+                    { return EVisibility::Visible; }
+                }
+                return EVisibility::Collapsed;
+            })
+            [
+                SNew(SVerticalBox)
+                + SVerticalBox::Slot().AutoHeight()
+                [
+                    SNew(SHorizontalBox)
+                    + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 8, 0)
+                    [ SNew(SImage).Image(FAppStyle::GetBrush("Icons.Warning")) ]
+                    + SHorizontalBox::Slot().FillWidth(1.0f).VAlign(VAlign_Center)
+                    [
+                        SNew(STextBlock)
+                        .Font(FAppStyle::GetFontStyle("NormalFontBold"))
+                        .Text_Lambda([TestRef]()
+                        {
+                            const UProbeTestAsset* Test = TestRef.Get();
+                            return Test && Test->bAllowTransientEditorActors
+                                ? LOCTEXT("ActorsAuthorizedStatus", "WORLD ACTIONS  |  Authorized")
+                                : LOCTEXT("ActorsBlockedStatus", "WORLD ACTIONS  |  Not Authorized");
+                        })
+                    ]
+                    + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+                    [
+                        SNew(SButton)
+                        .ToolTipText(LOCTEXT("ActorWorldPermissionTip", "Allows controlled test-owned actors to be created in the current Editor world. Probe attempts cleanup, but level dirtiness and empty folders can remain. Prefer a disposable test map."))
+                        .Text_Lambda([TestRef]()
+                        {
+                            const UProbeTestAsset* Test = TestRef.Get();
+                            return Test && Test->bAllowTransientEditorActors
+                                ? LOCTEXT("RevokeActorPermission", "Revoke Authorization")
+                                : LOCTEXT("GrantActorPermission", "Authorize Temporary Actors");
+                        })
+                        .OnClicked_Lambda([this, TestRef]()
+                        {
+                            const UProbeTestAsset* Test = TestRef.Get();
+                            if (!Test) { return FReply::Handled(); }
+                            const bool bGrant = !Test->bAllowTransientEditorActors;
+                            ChangeAsset(TestRef, LOCTEXT("ActorPermissionTransaction", "Change Probe Editor World Permission"),
+                                [bGrant](UProbeTestAsset& Asset) { Asset.bAllowTransientEditorActors = bGrant; });
+                            RebuildTestEditor();
+                            return FReply::Handled();
+                        })
+                    ]
+                ]
+                + SVerticalBox::Slot().AutoHeight().Padding(25, 5, 0, 0)
+                [
+                    SNew(STextBlock)
+                    .AutoWrapText(true)
+                    .ColorAndOpacity(FSlateColor::UseSubduedForeground())
+                    .Text(LOCTEXT("WorldPermissionNotice", "These steps create or change test-owned actors in the active Editor level. Cleanup is attempted even on failure, but the level may become dirty. Use a disposable map. This authorization is independent of test readiness."))
+                ]
+            ]
         ];
         Settings->AddSlot().AutoHeight().Padding(0, 7, 0, 0)
         [
@@ -2583,178 +3596,9 @@ private:
             Asset->Modify();
             Asset->bNeedsConfiguration = Template != Probe::ETestTemplate::Smoke;
         }
-        if (Asset && Template != Probe::ETestTemplate::Blank)
+        if (Asset)
         {
-            switch (Template)
-            {
-            case Probe::ETestTemplate::Smoke:
-                Asset->TestDescription = TEXT("Basic Probe smoke test: plugin and Editor world availability");
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::PluginEnabled));
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::EditorWorldExists));
-                break;
-            case Probe::ETestTemplate::Plugin:
-                Asset->TestDescription = TEXT("Plugin availability check. Edit the Target plugin name.");
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::PluginEnabled));
-                break;
-            case Probe::ETestTemplate::World:
-                Asset->TestDescription = TEXT("Editor world and minimum actor count checks");
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::EditorWorldExists));
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ActorCountAtLeast));
-                break;
-            case Probe::ETestTemplate::Asset:
-                Asset->TestDescription = TEXT("Check that an asset exists at the specified object path");
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::AssetExists, Asset->GetPathName()));
-                break;
-            case Probe::ETestTemplate::ActorClass:
-                Asset->TestDescription = TEXT("Check actors of a particular class in the Editor world");
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ActorClassCountAtLeast));
-                break;
-            case Probe::ETestTemplate::ActorTag:
-                Asset->TestDescription = TEXT("Check whether an actor has a tag. Set Target and tag an actor first.");
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ActorTagExists));
-                break;
-            case Probe::ETestTemplate::AssetClass:
-                Asset->TestDescription = TEXT("Check this Probe Test asset's class. Change Target/Expected Class as needed.");
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::AssetClassIs, Asset->GetPathName()));
-                break;
-            case Probe::ETestTemplate::ActorLabel:
-                Asset->TestDescription = TEXT("Verify an actor with a specific World Outliner label exists.");
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ActorLabelExists));
-                break;
-            case Probe::ETestTemplate::ActorSelection:
-                Asset->TestDescription = TEXT("Verify the current selection contains at least one level actor.");
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::SelectedActorCountAtLeast));
-                break;
-            case Probe::ETestTemplate::Property:
-                Asset->TestDescription = TEXT("Check this test asset's bEnabled property is True.");
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ObjectPropertyEquals, Asset->GetPathName()));
-                break;
-            case Probe::ETestTemplate::Module:
-                Asset->TestDescription = TEXT("Verify ProbeEditor module has loaded.");
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ModuleLoaded));
-                break;
-            case Probe::ETestTemplate::EditorTab:
-                Asset->TestDescription = TEXT("Verify the Probe Editor tab is open.");
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::EditorTabOpen));
-                break;
-            case Probe::ETestTemplate::ToolMenu:
-                Asset->TestDescription = TEXT("Verify that an Editor ToolMenus path has been registered.");
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ToolMenuRegistered));
-                break;
-            case Probe::ETestTemplate::ConsoleVariable:
-                Asset->TestDescription = TEXT("Check an Editor console variable is present.");
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ConsoleVariableExists));
-                break;
-            case Probe::ETestTemplate::AssetFolder:
-                Asset->TestDescription = TEXT("Count assets in a folder recursively.");
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::AssetCountAtLeast));
-                break;
-            case Probe::ETestTemplate::AssetDirty:
-                Asset->TestDescription = TEXT("Check this test asset has no unsaved changes after saving.");
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::AssetIsClean, Asset->GetPathName()));
-                break;
-            case Probe::ETestTemplate::ClassContract:
-                Asset->TestDescription = TEXT("Verify an Actor class exposes a native property and function.");
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ClassHasProperty));
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ClassHasFunction));
-                break;
-            case Probe::ETestTemplate::ObjectPropertyAbsent:
-                Asset->TestDescription = TEXT("Check a property is different from an expected value.");
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ObjectPropertyNotEquals, Asset->GetPathName()));
-                break;
-            case Probe::ETestTemplate::ActorComponent:
-                Asset->TestDescription = TEXT("Check that an actor has a required component class. Capture an actor label.");
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ActorHasComponent));
-                break;
-            case Probe::ETestTemplate::ActorFolder:
-                Asset->TestDescription = TEXT("Check a World Outliner actor folder path. Capture an actor label.");
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ActorFolderEquals));
-                break;
-            case Probe::ETestTemplate::SelectionExact:
-                Asset->TestDescription = TEXT("Require exactly one actor selected in the level Editor.");
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::SelectedActorCountExactly));
-                break;
-            case Probe::ETestTemplate::PluginDescriptor:
-                Asset->TestDescription = TEXT("Check Probe's descriptor identity. Adjust the version to match your plugin.");
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::PluginFriendlyNameEquals));
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::PluginVersionEquals));
-                break;
-            case Probe::ETestTemplate::PluginModule:
-                Asset->TestDescription = TEXT("Check the plugin descriptor declares the expected module and that it is loaded.");
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::PluginDeclaresModule));
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ModuleLoaded));
-                break;
-            case Probe::ETestTemplate::ModuleDiscovery:
-                Asset->TestDescription = TEXT("Verify a module exists and is currently loaded. Browse to choose identifiers.");
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ModuleExists));
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ModuleLoaded));
-                break;
-            case Probe::ETestTemplate::TabRegistration:
-                Asset->TestDescription = TEXT("Verify Probe's global tab is registered and open.");
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::EditorTabRegistered));
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::EditorTabOpen));
-                break;
-            case Probe::ETestTemplate::EditorNotPlaying:
-                Asset->TestDescription = TEXT("Check Editor world exists and PIE is not currently running.");
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::EditorWorldExists));
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::PIEIsNotRunning));
-                break;
-            case Probe::ETestTemplate::ConsoleVariableNegative:
-                Asset->TestDescription = TEXT("Check a known console variable is not at an unwanted value.");
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ConsoleVariableNotEquals));
-                break;
-            case Probe::ETestTemplate::AssetAbsence:
-                Asset->TestDescription = TEXT("Verify an asset object path is absent from the registry.");
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::AssetNotExists));
-                break;
-            case Probe::ETestTemplate::AssetTag:
-                Asset->TestDescription = TEXT("Check an asset publishes a specified Asset Registry tag. Set tag name.");
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::AssetRegistryTagExists, Asset->GetPathName()));
-                break;
-            case Probe::ETestTemplate::ClassFunctionContract:
-                Asset->TestDescription = TEXT("Check an Actor function exists and is callable from Blueprints.");
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ClassHasFunction));
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ClassFunctionBlueprintCallable));
-                break;
-            case Probe::ETestTemplate::ClassPropertyAbsence:
-                Asset->TestDescription = TEXT("Verify an Actor class does not have a particular reflected property.");
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ClassHasNoProperty));
-                break;
-            case Probe::ETestTemplate::ObjectGreaterThan:
-                Asset->TestDescription = TEXT("Compare numeric property on a target object against a threshold. Configure object path/property.");
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ObjectPropertyGreaterThan));
-                break;
-            case Probe::ETestTemplate::ActorSelectionState:
-                Asset->TestDescription = TEXT("Verify an Outliner actor is selected. Use Selected Actor to capture its label.");
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ActorIsSelected));
-                break;
-            case Probe::ETestTemplate::ActorMaxCount:
-                Asset->TestDescription = TEXT("Check the level has no more than a specified number of actors.");
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::ActorCountAtMost));
-                break;
-            case Probe::ETestTemplate::SelectionMaxCount:
-                Asset->TestDescription = TEXT("Check no more than a configured number of actors are selected.");
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::SelectedActorCountAtMost));
-                break;
-            case Probe::ETestTemplate::SelectedComponent:
-                Asset->TestDescription = TEXT("Select an actor and verify it has a component of the configured class.");
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::SelectedActorHasComponent));
-                break;
-            case Probe::ETestTemplate::AssetExactCount:
-                Asset->TestDescription = TEXT("Count assets in a folder exactly. Set the expected count after inspection.");
-                Asset->Steps.Add(Probe::MakeStep(EProbeStepType::AssetCountExactly));
-                break;
-            default: break;
-            }
-            for (FProbeTestStep& Step : Asset->Steps)
-            {
-                if (Step.ExpectedValue == TEXT("{InstalledVersion}"))
-                {
-                    const TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("Probe"));
-                    Step.ExpectedValue = Plugin.IsValid() ? Plugin->GetDescriptor().VersionName : FString();
-                }
-            }
-            Asset->MarkPackageDirty();
+            Probe::PopulateBuiltinTemplate(Asset, Template);
         }
         RefreshAssets();
         SelectCreatedAsset(Created);
@@ -2785,20 +3629,7 @@ private:
             UProbeTestAsset::StaticClass(), Factory);
         UProbeTestAsset* Asset = Cast<UProbeTestAsset>(Created);
         if (!Asset) { return; }
-        Asset->Modify();
-        Asset->TestDescription = Template->Description;
-        Asset->Steps = Template->Steps;
-        Asset->bNeedsConfiguration = Template->bRequiresConfiguration;
-        for (FProbeTestStep& Step : Asset->Steps)
-        {
-            if (Step.Target == TEXT("{Self}")) { Step.Target = Asset->GetPathName(); }
-            if (Step.ExpectedValue == TEXT("{InstalledVersion}"))
-            {
-                const TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("Probe"));
-                Step.ExpectedValue = Plugin.IsValid() ? Plugin->GetDescriptor().VersionName : FString();
-            }
-        }
-        Asset->MarkPackageDirty();
+        Probe::PopulateExtensionTemplate(Asset, *Template);
         RefreshAssets();
         SelectCreatedAsset(Asset);
         RebuildTestEditor();
@@ -2818,65 +3649,43 @@ private:
         Menu.AddMenuEntry(LOCTEXT("NewTestPack", "New Probe Pack"),
             LOCTEXT("NewTestPackTip", "Create a Probe Pack, then add existing tests in Probe Packs. Packs reference tests without copying them"), FSlateIcon(),
             FUIAction(FExecuteAction::CreateSP(this, &SProbeWorkspace::CreatePack)));
-        struct FTemplateInfo { Probe::ETestTemplate Type; const TCHAR* Category; const TCHAR* Name; const TCHAR* Description; };
-        const TArray<FTemplateInfo> Templates = {
-            {Probe::ETestTemplate::Plugin, TEXT("Plugins & Modules"), TEXT("Plugin Availability"), TEXT("Check plugin enabled state")},
-            {Probe::ETestTemplate::Module, TEXT("Plugins & Modules"), TEXT("Module Loaded"), TEXT("Confirm ProbeEditor is loaded")},
-            {Probe::ETestTemplate::EditorTab, TEXT("Editor UI"), TEXT("Editor Tab Open"), TEXT("Check a registered tab ID is currently open")},
-            {Probe::ETestTemplate::ToolMenu, TEXT("Editor UI"), TEXT("Registered Tool Menu"), TEXT("Check an Editor menu ID exists")},
-            {Probe::ETestTemplate::ConsoleVariable, TEXT("Editor State"), TEXT("Console Variable"), TEXT("Check a console variable is available")},
-            {Probe::ETestTemplate::Asset, TEXT("Assets"), TEXT("Asset Availability"), TEXT("Check asset path exists")},
-            {Probe::ETestTemplate::AssetClass, TEXT("Assets"), TEXT("Asset Class Check"), TEXT("Check this Test Asset class")},
-            {Probe::ETestTemplate::AssetFolder, TEXT("Assets"), TEXT("Assets In Folder"), TEXT("Count assets in a content folder")},
-            {Probe::ETestTemplate::AssetDirty, TEXT("Assets"), TEXT("Asset Save State"), TEXT("Check an asset package is clean")},
-            {Probe::ETestTemplate::ClassContract, TEXT("Classes & Reflection"), TEXT("Class Property and Function"), TEXT("Check reflected properties and functions")},
-            {Probe::ETestTemplate::World, TEXT("Actors & World"), TEXT("Editor World and Actors"), TEXT("Check Editor world and actor count")},
-            {Probe::ETestTemplate::ActorClass, TEXT("Actors & World"), TEXT("Actor Class Count"), TEXT("Count actors derived from a class")},
-            {Probe::ETestTemplate::ActorTag, TEXT("Actors & World"), TEXT("Actor Tag"), TEXT("Find an actor by tag")},
-            {Probe::ETestTemplate::ActorLabel, TEXT("Actors & World"), TEXT("Actor Label"), TEXT("Find an actor by label")},
-            {Probe::ETestTemplate::ActorComponent, TEXT("Actors & World"), TEXT("Actor Component"), TEXT("Check an actor component class")},
-            {Probe::ETestTemplate::ActorFolder, TEXT("Actors & World"), TEXT("Actor Outliner Folder"), TEXT("Check an actor folder path")},
-            {Probe::ETestTemplate::ActorSelection, TEXT("Selection"), TEXT("Selected Actors"), TEXT("Check a minimum actor selection count")},
-            {Probe::ETestTemplate::SelectionExact, TEXT("Selection"), TEXT("Exact Selection Count"), TEXT("Check an exact actor selection count")},
-            {Probe::ETestTemplate::Property, TEXT("Properties & Values"), TEXT("Object Property Check"), TEXT("Compare a reflected property")},
-            {Probe::ETestTemplate::ObjectPropertyAbsent, TEXT("Properties & Values"), TEXT("Property Does Not Equal"), TEXT("Verify a property differs from a value")},
-            {Probe::ETestTemplate::PluginDescriptor, TEXT("Plugins & Modules"), TEXT("Plugin Descriptor Identity"), TEXT("Compare a plugin's friendly name and version")},
-            {Probe::ETestTemplate::PluginModule, TEXT("Plugins & Modules"), TEXT("Plugin Declared Module"), TEXT("Verify a module is declared and loaded")},
-            {Probe::ETestTemplate::ModuleDiscovery, TEXT("Plugins & Modules"), TEXT("Module Existence And Load"), TEXT("Choose a module from live/discovered identifiers")},
-            {Probe::ETestTemplate::TabRegistration, TEXT("Editor UI"), TEXT("Tab Registration And Open State"), TEXT("Check global tab ID is registered and open")},
-            {Probe::ETestTemplate::EditorNotPlaying, TEXT("Editor State"), TEXT("Editor Not In PIE"), TEXT("Check the Editor is not currently playing")},
-            {Probe::ETestTemplate::ConsoleVariableNegative, TEXT("Editor State"), TEXT("Console Variable Forbidden Value"), TEXT("Verify console variable differs from an unwanted value")},
-            {Probe::ETestTemplate::AssetAbsence, TEXT("Assets"), TEXT("Missing Asset"), TEXT("Verify an asset does not exist")},
-            {Probe::ETestTemplate::AssetTag, TEXT("Assets"), TEXT("Asset Registry Tag Present"), TEXT("Check asset has a searchable tag")},
-            {Probe::ETestTemplate::AssetExactCount, TEXT("Assets"), TEXT("Exact Asset Count"), TEXT("Verify exact number of assets in folder")},
-            {Probe::ETestTemplate::ClassFunctionContract, TEXT("Classes & Reflection"), TEXT("Blueprint Function Contract"), TEXT("Verify a function exists and is Blueprint callable")},
-            {Probe::ETestTemplate::ClassPropertyAbsence, TEXT("Classes & Reflection"), TEXT("Reflected Property Absent"), TEXT("Verify a reflected property does not exist")},
-            {Probe::ETestTemplate::ObjectGreaterThan, TEXT("Properties & Values"), TEXT("Numeric Threshold"), TEXT("Compare numeric property with a threshold")},
-            {Probe::ETestTemplate::ActorSelectionState, TEXT("Actors & World"), TEXT("Actor Selected State"), TEXT("Capture and check the selection state of an actor")},
-            {Probe::ETestTemplate::ActorMaxCount, TEXT("Actors & World"), TEXT("Maximum Actor Count"), TEXT("Verify upper bound for level actors")},
-            {Probe::ETestTemplate::SelectionMaxCount, TEXT("Selection"), TEXT("Maximum Selected Actors"), TEXT("Verify selection count upper bound")},
-            {Probe::ETestTemplate::SelectedComponent, TEXT("Selection"), TEXT("Selected Actor Component"), TEXT("Verify one selected actor contains a component")},
-        };
+        const TArray<Probe::FTemplateInfo>& Templates = Probe::BuiltinTemplates();
         Menu.AddMenuSeparator();
         for (const FString& Category : Probe::AllCategories())
         {
             // Capture the descriptors by value; the submenu can be opened after this function returns.
             Menu.AddSubMenu(FText::FromString(Category), FText::FromString(Category + TEXT(" templates")),
-                FNewMenuDelegate::CreateLambda([this, Category, Templates](FMenuBuilder& SubMenu)
+                FNewMenuDelegate::CreateLambda([this, Category, Templates](FMenuBuilder& CategoryMenu)
                 {
-                    for (const FTemplateInfo& Info : Templates)
-                    {
-                        if (Category != Info.Category) { continue; }
-                        SubMenu.AddMenuEntry(FText::FromString(Info.Name), FText::FromString(FString(Info.Description) + TEXT(". Review and mark Ready before Run All.")), FSlateIcon(),
-                            FUIAction(FExecuteAction::CreateSP(this, &SProbeWorkspace::CreateAsset, Info.Type)));
-                    }
+                    TArray<FString> Groups;
+                    for (const Probe::FTemplateInfo& Info : Templates)
+                    { if (Category == Info.Category) { Groups.AddUnique(Probe::MenuSubgroup(Category, Info.Name)); } }
                     for (const FName Id : Probe::GetExtensionTemplateIds())
                     {
-                        const Probe::FExtensionTemplate* Info = Probe::FindExtensionTemplate(Id);
-                        if (!Info || Category != Info->Category) { continue; }
-                        SubMenu.AddMenuEntry(FText::FromString(Info->Name), FText::FromString(Info->Description +
-                            (Info->bRequiresConfiguration ? TEXT(". Needs configuration before automatic execution.") : TEXT(". Ready-to-run starter."))), FSlateIcon(),
-                            FUIAction(FExecuteAction::CreateSP(this, &SProbeWorkspace::CreateExtensionTemplate, Id)));
+                        if (const Probe::FExtensionTemplate* Info = Probe::FindExtensionTemplate(Id))
+                        { if (Category == Info->Category) { Groups.AddUnique(Probe::MenuSubgroup(Category, Info->Name)); } }
+                    }
+                    Groups.Sort();
+                    for (const FString& Group : Groups)
+                    {
+                        CategoryMenu.AddSubMenu(FText::FromString(Group), FText::FromString(Category + TEXT(" / ") + Group),
+                            FNewMenuDelegate::CreateLambda([this, Category, Group, Templates](FMenuBuilder& GroupMenu)
+                            {
+                                for (const Probe::FTemplateInfo& Info : Templates)
+                                {
+                                    if (Category != Info.Category || Group != Probe::MenuSubgroup(Category, Info.Name)) { continue; }
+                                    GroupMenu.AddMenuEntry(FText::FromString(Info.Name), FText::FromString(FString(Info.Description) + TEXT(". Review and mark Ready before Run All.")), FSlateIcon(),
+                                        FUIAction(FExecuteAction::CreateSP(this, &SProbeWorkspace::CreateAsset, Info.Type)));
+                                }
+                                for (const FName Id : Probe::GetExtensionTemplateIds())
+                                {
+                                    const Probe::FExtensionTemplate* Info = Probe::FindExtensionTemplate(Id);
+                                    if (!Info || Category != Info->Category || Group != Probe::MenuSubgroup(Category, Info->Name)) { continue; }
+                                    GroupMenu.AddMenuEntry(FText::FromString(Info->Name), FText::FromString(Info->Description +
+                                        (Info->bRequiresConfiguration ? TEXT(". Review inputs before automatic execution.") : TEXT(". Ready-to-run starter."))), FSlateIcon(),
+                                        FUIAction(FExecuteAction::CreateSP(this, &SProbeWorkspace::CreateExtensionTemplate, Id)));
+                                }
+                            }));
                     }
                 }));
         }
@@ -2917,21 +3726,37 @@ private:
         FMenuBuilder Menu(true, nullptr);
         for (const FString& Category : Probe::AllCategories())
         {
-            Menu.AddSubMenu(FText::FromString(Category), FText::FromString(Category + TEXT(" assertions")),
-                FNewMenuDelegate::CreateLambda([this, Category](FMenuBuilder& SubMenu)
+            Menu.AddSubMenu(FText::FromString(Category), FText::FromString(Category + TEXT(" step types")),
+                FNewMenuDelegate::CreateLambda([this, Category](FMenuBuilder& CategoryMenu)
                 {
+                    TArray<FString> Groups;
                     for (const Probe::FAssertionInfo& Info : Probe::AssertionCatalog())
-                    {
-                        if (Category != Info.Category) { continue; }
-                        SubMenu.AddMenuEntry(FText::FromString(Info.Name), FText::FromString(FString(Info.Description) + TEXT(". Review and mark Ready before Run All.")), FSlateIcon(),
-                            FUIAction(FExecuteAction::CreateSP(this, &SProbeWorkspace::AddStep, Info.Type)));
-                    }
+                    { if (Category == Info.Category) { Groups.AddUnique(Probe::MenuSubgroup(Category, Info.Name)); } }
                     for (const FName Id : Probe::GetExtensionAssertionIds())
                     {
-                        const Probe::FExtensionAssertion* Info = Probe::FindExtensionAssertion(Id);
-                        if (!Info || Category != Info->Category) { continue; }
-                        SubMenu.AddMenuEntry(FText::FromString(Info->Name), FText::FromString(Info->Description + TEXT(". Configure this assertion before automatic execution.")), FSlateIcon(),
-                            FUIAction(FExecuteAction::CreateSP(this, &SProbeWorkspace::AddExtensionStep, Id)));
+                        if (const Probe::FExtensionAssertion* Info = Probe::FindExtensionAssertion(Id))
+                        { if (Category == Info->Category) { Groups.AddUnique(Probe::MenuSubgroup(Category, Info->Name)); } }
+                    }
+                    Groups.Sort();
+                    for (const FString& Group : Groups)
+                    {
+                        CategoryMenu.AddSubMenu(FText::FromString(Group), FText::FromString(Category + TEXT(" / ") + Group),
+                            FNewMenuDelegate::CreateLambda([this, Category, Group](FMenuBuilder& GroupMenu)
+                            {
+                                for (const Probe::FAssertionInfo& Info : Probe::AssertionCatalog())
+                                {
+                                    if (Category != Info.Category || Group != Probe::MenuSubgroup(Category, Info.Name)) { continue; }
+                                    GroupMenu.AddMenuEntry(FText::FromString(Info.Name), FText::FromString(Info.Description), FSlateIcon(),
+                                        FUIAction(FExecuteAction::CreateSP(this, &SProbeWorkspace::AddStep, Info.Type)));
+                                }
+                                for (const FName Id : Probe::GetExtensionAssertionIds())
+                                {
+                                    const Probe::FExtensionAssertion* Info = Probe::FindExtensionAssertion(Id);
+                                    if (!Info || Category != Info->Category || Group != Probe::MenuSubgroup(Category, Info->Name)) { continue; }
+                                    GroupMenu.AddMenuEntry(FText::FromString(Info->Name), FText::FromString(Info->Description), FSlateIcon(),
+                                        FUIAction(FExecuteAction::CreateSP(this, &SProbeWorkspace::AddExtensionStep, Id)));
+                                }
+                            }));
                     }
                 }));
         }
@@ -3649,6 +4474,11 @@ public:
                 .OnClicked(this, &SProbePackWorkspace::NewPack)
                 [ SNew(STextBlock).Text(LOCTEXT("CreatePackInManager", "+ New Pack")) ] ]
               + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0,0,12,0)
+              [ SNew(SButton)
+                .ToolTipText(LOCTEXT("CreatePluginQAHelp", "Create a ready-to-run baseline QA Pack for an enabled Editor plugin. Automatically fills identifiers and expectations from the plugin descriptor."))
+                .OnClicked(this, &SProbePackWorkspace::OpenPluginQAGenerator)
+                [ SNew(STextBlock).Text(LOCTEXT("CreatePluginQA", "Plugin QA Pack...")) ] ]
+              + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0,0,12,0)
               [ SNew(SButton).ToolTipText(LOCTEXT("SavePackTooltip", "Save changes to this Pack (Ctrl+S)."))
                 .OnClicked(this, &SProbePackWorkspace::SavePack)
                 .IsEnabled_Lambda([this]() { const UProbeTestPack* Pack = GetPack(); return Pack && Pack->GetOutermost()->IsDirty(); })
@@ -3930,6 +4760,152 @@ private:
             Report.PacksChecked, Report.ReferencesChecked, Report.Problems);
         RebuildMembers();
         return FReply::Handled();
+    }
+
+    FReply OpenPluginQAGenerator()
+    {
+        TArray<FProbeIdentifierChoice> Choices;
+        for (const TSharedRef<IPlugin>& Plugin : IPluginManager::Get().GetDiscoveredPlugins())
+        {
+            if (!Plugin->IsEnabled()) { continue; } // Generated enabled assertion must be meaningful.
+            FProbeIdentifierChoice Choice;
+            Choice.Id = Plugin->GetName();
+            Choice.Display = Plugin->GetFriendlyName();
+            if (Choice.Display.IsEmpty()) { Choice.Display = Choice.Id; }
+            Choice.Owner = Plugin->GetDescriptor().Category;
+            Choice.State = FString::Printf(TEXT("%d module(s)"), Plugin->GetDescriptor().Modules.Num());
+            Choices.Add(MoveTemp(Choice));
+        }
+        Choices.Sort([](const FProbeIdentifierChoice& A, const FProbeIdentifierChoice& B)
+        { return A.Display < B.Display; });
+        TSharedRef<SWindow> Window = SNew(SWindow)
+            .Title(LOCTEXT("SelectPluginForQAPack", "Generate Plugin QA Pack"))
+            .ClientSize(FVector2D(485.0f, 405.0f))
+            .SupportsMinimize(false).SupportsMaximize(false);
+        Window->SetContent(
+            SNew(SVerticalBox)
+            + SVerticalBox::Slot().AutoHeight().Padding(8,8,8,0)
+            [ SNew(STextBlock).AutoWrapText(true)
+              .Text(LOCTEXT("PluginQAGeneratorIntro", "Choose an enabled plugin. Probe will create four ready-to-run Test Assets plus a Pack, with identifiers taken from its live descriptor. No project levels or plugin settings are changed.")) ]
+            + SVerticalBox::Slot().FillHeight(1).Padding(6)
+            [ SNew(SProbeIdentifierPicker)
+              .Candidates(Choices)
+              .SearchHint(LOCTEXT("PluginQAFindPlugin", "Search enabled plugins by name or category..."))
+              .OnPicked(FOnProbeIdentifierPicked::CreateLambda([this, WeakWindow = TWeakPtr<SWindow>(Window)](const FString& PluginName)
+              {
+                  if (const TSharedPtr<SWindow> WindowToClose = WeakWindow.Pin())
+                  { WindowToClose->RequestDestroyWindow(); }
+                  GeneratePluginQAPack(PluginName);
+              })) ]);
+        FSlateApplication::Get().AddModalWindow(Window, FSlateApplication::Get().GetActiveTopLevelWindow(), false);
+        return FReply::Handled();
+    }
+
+    void GeneratePluginQAPack(const FString& PluginName)
+    {
+        const TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(PluginName);
+        if (!Plugin.IsValid() || !Plugin->IsEnabled())
+        { Message = TEXT("Choose an enabled, installed plugin."); return; }
+
+        const FPluginDescriptor& Descriptor = Plugin->GetDescriptor();
+        FString FolderName = Plugin->GetName();
+        FolderName.ReplaceInline(TEXT("-"), TEXT("_"));
+        FolderName.ReplaceInline(TEXT("."), TEXT("_"));
+        FolderName.ReplaceInline(TEXT(" "), TEXT("_"));
+        const FString Folder = TEXT("/Game/ProbeTests/PluginQA/") + FolderName;
+        IAssetTools& Tools = FModuleManager::LoadModuleChecked<FAssetToolsModule>("AssetTools").Get();
+        TArray<UProbeTestAsset*> CreatedTests;
+        TArray<UPackage*> PackagesToSave;
+
+        auto MakeStep = [](EProbeStepType Type, const FString& Target, const FString& Value = FString(), int32 Count = 0)
+        {
+            FProbeTestStep Step;
+            Step.Type = Type;
+            Step.Target = Target;
+            Step.ExpectedValue = Value;
+            Step.MinimumActorCount = Count;
+            return Step;
+        };
+        auto CreateTest = [&](const TCHAR* Suffix, const FString& Description, TArray<FProbeTestStep> Steps)
+        {
+            FString PackageName, AssetName;
+            Tools.CreateUniqueAssetName(Folder + TEXT("/QA_") + FolderName + TEXT("_") + Suffix,
+                TEXT(""), PackageName, AssetName);
+            UProbeTestAssetFactory* Factory = NewObject<UProbeTestAssetFactory>();
+            UProbeTestAsset* Test = Cast<UProbeTestAsset>(Tools.CreateAsset(AssetName,
+                FPackageName::GetLongPackagePath(PackageName), UProbeTestAsset::StaticClass(), Factory));
+            if (Test)
+            {
+                Test->Modify();
+                Test->TestDescription = Description;
+                Test->bEnabled = true;
+                Test->bNeedsConfiguration = false;
+                Test->Steps = MoveTemp(Steps);
+                Test->MarkPackageDirty();
+                CreatedTests.Add(Test);
+                PackagesToSave.AddUnique(Test->GetOutermost());
+            }
+        };
+
+        {
+            TArray<FProbeTestStep> Steps;
+            Steps.Add(MakeStep(EProbeStepType::PluginInstalled, PluginName));
+            Steps.Add(MakeStep(EProbeStepType::PluginEnabled, PluginName));
+            CreateTest(TEXT("Availability"), TEXT("Verify plugin discovery and enabled state."), MoveTemp(Steps));
+        }
+        {
+            TArray<FProbeTestStep> Steps;
+            Steps.Add(MakeStep(EProbeStepType::PluginFriendlyNameEquals, PluginName, Plugin->GetFriendlyName()));
+            if (!Descriptor.VersionName.IsEmpty())
+            { Steps.Add(MakeStep(EProbeStepType::PluginVersionEquals, PluginName, Descriptor.VersionName)); }
+            if (!Descriptor.Category.IsEmpty())
+            { Steps.Add(MakeStep(EProbeStepType::PluginCategoryEquals, PluginName, Descriptor.Category)); }
+            CreateTest(TEXT("Descriptor"), TEXT("Check plugin identity against the descriptor at Pack generation time. Update these expectations after intentional plugin version changes."), MoveTemp(Steps));
+        }
+        {
+            TArray<FProbeTestStep> Steps;
+            Steps.Add(MakeStep(EProbeStepType::PluginModuleCountExactly, PluginName, FString(), Descriptor.Modules.Num()));
+            for (const FModuleDescriptor& Module : Descriptor.Modules)
+            {
+                const FString ModuleName = Module.Name.ToString();
+                Steps.Add(MakeStep(EProbeStepType::PluginDeclaresModule, PluginName, ModuleName));
+                // Lazy modules are not assumed to be loaded. Only baseline what is loaded now.
+                if (FModuleManager::Get().IsModuleLoaded(Module.Name))
+                { Steps.Add(MakeStep(EProbeStepType::ModuleLoaded, ModuleName)); }
+            }
+            CreateTest(TEXT("Modules"), TEXT("Validate descriptor module entries; checks loaded state only for modules currently loaded."), MoveTemp(Steps));
+        }
+        {
+            TArray<FProbeTestStep> Steps;
+            Steps.Add(MakeStep(EProbeStepType::EditorWorldExists, FString()));
+            Steps.Add(MakeStep(EProbeStepType::PIEIsNotRunning, FString()));
+            CreateTest(TEXT("EditorPreflight"), TEXT("Verify a loaded editor level and no active Play In Editor session."), MoveTemp(Steps));
+        }
+
+        if (CreatedTests.Num() != 4)
+        {
+            Message = FString::Printf(TEXT("Created only %d/4 QA tests. Check Output Log; partial assets were not deleted."), CreatedTests.Num());
+            return;
+        }
+        FString PackageName, AssetName;
+        Tools.CreateUniqueAssetName(Folder + TEXT("/QA_") + FolderName + TEXT("_Pack"),
+            TEXT(""), PackageName, AssetName);
+        UProbeTestPackFactory* PackFactory = NewObject<UProbeTestPackFactory>();
+        UProbeTestPack* Pack = Cast<UProbeTestPack>(Tools.CreateAsset(AssetName,
+            FPackageName::GetLongPackagePath(PackageName), UProbeTestPack::StaticClass(), PackFactory));
+        if (!Pack)
+        { Message = TEXT("QA tests created, but Pack creation failed. Check Output Log."); return; }
+        Pack->Modify();
+        Pack->Description = FString::Printf(TEXT("Generated baseline Editor plugin QA for %s. Validates descriptor, availability, declared modules, and Editor preflight. Does not yet test plugin-specific interactive behavior."), *PluginName);
+        for (UProbeTestAsset* Test : CreatedTests)
+        { Pack->Tests.Add(TSoftObjectPtr<UProbeTestAsset>(FSoftObjectPath(Test->GetPathName()))); }
+        Pack->MarkPackageDirty();
+        PackagesToSave.AddUnique(Pack->GetOutermost());
+        const bool bSaved = UEditorLoadingAndSavingUtils::SavePackages(PackagesToSave, true);
+        SelectPackPath(Pack->GetPathName());
+        Message = FString::Printf(TEXT("Generated %d QA tests for '%s' and selected its Pack. %s Run Pack to establish your baseline."),
+            CreatedTests.Num(), *PluginName,
+            bSaved ? TEXT("Saved.") : TEXT("Save All to persist assets."));
     }
 
     FReply NewPack()
@@ -4340,7 +5316,22 @@ public:
         Probe::RegisterProbeAdvancedTemplates();
         Probe::RegisterProbeWorkflowTemplates();
         Probe::RegisterProbeActionTemplates();
+        Probe::RegisterProbeSelectionTemplates();
+        Probe::RegisterProbeActorFixtureTemplates();
+        Probe::RegisterProbeSpatialTemplates();
+        Probe::RegisterProbeBehaviorContractTemplates();
         Probe::RegisterProbeContractTemplates();
+        // Temporary developer console command; not exposed in production Probe menus.
+        IConsoleManager::Get().RegisterConsoleCommand(
+            TEXT("Probe.GenerateTemplateTests"),
+            TEXT("Create one Probe Test asset per registered template under /Game/Probe/<Category>/<Group>; skip existing assets."),
+            FConsoleCommandDelegate::CreateStatic(&Probe::GenerateTemplateTests),
+            ECVF_Default);
+        IConsoleManager::Get().RegisterConsoleCommand(
+            TEXT("Probe.SelfTest"),
+            TEXT("Run deterministic Probe Self-Test Smoke cases, verify all outcomes independently, and write a JSON report under Saved/Probe/SelfTests."),
+            FConsoleCommandDelegate::CreateStatic(&Probe::RunSelfTestConsoleCommand),
+            ECVF_Default);
         RegisterAssetAppearance();
 
         // Record only Probe assets affected by Undo/Redo. The post-transaction callback
@@ -4362,6 +5353,8 @@ public:
 
     virtual void ShutdownModule() override
     {
+        IConsoleManager::Get().UnregisterConsoleObject(TEXT("Probe.SelfTest"), false);
+        IConsoleManager::Get().UnregisterConsoleObject(TEXT("Probe.GenerateTemplateTests"), false);
         for (const FName Id : Probe::GetExtensionTemplateIds())
         {
             if (Id.ToString().StartsWith(TEXT("Probe."))) { Probe::UnregisterTemplate(Id); }

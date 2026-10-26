@@ -172,7 +172,57 @@ enum class EProbeStepType : uint8
     ActorFolderCountExactly UMETA(DisplayName="Actor Folder Count Exactly"),
     ActorFolderCountAtMost UMETA(DisplayName="Actor Folder Count At Most"),
     SelectedActorIsTemporarilyHidden UMETA(DisplayName="Selected Actor Is Temporarily Hidden"),
-    SelectedActorIsNotTemporarilyHidden UMETA(DisplayName="Selected Actor Is Not Temporarily Hidden")
+    SelectedActorIsNotTemporarilyHidden UMETA(DisplayName="Selected Actor Is Not Temporarily Hidden"),
+    // 0.11.0: selection-only Editor actions. Selection is restored after every run.
+    SelectionClear UMETA(DisplayName="Clear Editor Actor Selection"),
+    SelectionSelectFirstActor UMETA(DisplayName="Select First Available Actor"),
+    SelectionSelectActorByLabel UMETA(DisplayName="Select Actor By Label"),
+    SelectionSelectActorsWithTag UMETA(DisplayName="Select Actors With Tag"),
+    SelectionRestore UMETA(DisplayName="Restore Original Actor Selection"),
+    // 0.12.0: controlled transient Editor-world actor fixtures. Append only.
+    ActorFixtureSpawn UMETA(DisplayName="Spawn Temporary Editor Actor"),
+    ActorFixtureSetLabel UMETA(DisplayName="Set Temporary Actor Label"),
+    ActorFixtureSetFolder UMETA(DisplayName="Set Temporary Actor Folder"),
+    ActorFixtureAddTag UMETA(DisplayName="Add Temporary Actor Tag"),
+    ActorFixtureRemoveTag UMETA(DisplayName="Remove Temporary Actor Tag"),
+    ActorFixtureSelect UMETA(DisplayName="Select Temporary Actor"),
+    ActorFixtureHide UMETA(DisplayName="Hide Temporary Actor In Editor"),
+    ActorFixtureShow UMETA(DisplayName="Show Temporary Actor In Editor"),
+    ActorFixtureExists UMETA(DisplayName="Temporary Actor Exists"),
+    ActorFixtureLabelEquals UMETA(DisplayName="Temporary Actor Label Equals"),
+    ActorFixtureHasTag UMETA(DisplayName="Temporary Actor Has Tag"),
+    ActorFixtureFolderEquals UMETA(DisplayName="Temporary Actor Folder Equals"),
+    ActorFixtureIsSelected UMETA(DisplayName="Temporary Actor Is Selected"),
+    ActorFixtureIsHidden UMETA(DisplayName="Temporary Actor Is Hidden"),
+    ActorFixtureDestroy UMETA(DisplayName="Destroy Temporary Editor Actor"),
+    // 0.13.0: reversible test-owned transform and attachment workflows. Append only.
+    ActorFixtureSetLocation UMETA(DisplayName="Set Temporary Actor Location"),
+    ActorFixtureLocationNearlyEquals UMETA(DisplayName="Temporary Actor Location Nearly Equals"),
+    ActorFixtureSetRotation UMETA(DisplayName="Set Temporary Actor Rotation"),
+    ActorFixtureRotationNearlyEquals UMETA(DisplayName="Temporary Actor Rotation Nearly Equals"),
+    ActorFixtureSetScale UMETA(DisplayName="Set Temporary Actor Scale"),
+    ActorFixtureScaleNearlyEquals UMETA(DisplayName="Temporary Actor Scale Nearly Equals"),
+    ActorFixtureAttachTo UMETA(DisplayName="Attach Temporary Actor To Temporary Parent"),
+    ActorFixtureDetach UMETA(DisplayName="Detach Temporary Actor"),
+    ActorFixtureHasParent UMETA(DisplayName="Temporary Actor Has Parent"),
+    ActorFixtureHasNoParent UMETA(DisplayName="Temporary Actor Has No Parent"),
+    ActorFixtureChildCountExactly UMETA(DisplayName="Temporary Actor Child Count Exactly"),
+    ActorFixtureTagAbsent UMETA(DisplayName="Temporary Actor Does Not Have Tag"),
+    ActorFixtureIsVisible UMETA(DisplayName="Temporary Actor Is Visible"),
+    ActorFixtureIsNotSelected UMETA(DisplayName="Temporary Actor Is Not Selected"),
+    ActorFixtureFolderNotEquals UMETA(DisplayName="Temporary Actor Folder Does Not Equal"),
+    ActorFixtureDistanceAtMost UMETA(DisplayName="Temporary Actors Distance At Most"),
+    ActorFixtureChildCountAtLeast UMETA(DisplayName="Temporary Actor Child Count At Least"),
+    ActorFixtureChildCountAtMost UMETA(DisplayName="Temporary Actor Child Count At Most"),
+    ActorFixtureDistanceAtLeast UMETA(DisplayName="Temporary Actors Distance At Least"),
+    ActorFixtureLabelContains UMETA(DisplayName="Temporary Actor Label Contains"),
+    ActorFixtureLabelStartsWith UMETA(DisplayName="Temporary Actor Label Starts With"),
+    ActorFixtureLabelEndsWith UMETA(DisplayName="Temporary Actor Label Ends With"),
+    ActorFixtureTagCountExactly UMETA(DisplayName="Temporary Actor Tag Count Exactly"),
+    ActorFixtureHasRootComponent UMETA(DisplayName="Temporary Actor Has Root Component"),
+    ActorFixtureLocationNotNearlyEquals UMETA(DisplayName="Temporary Actor Location Not Nearly Equals"),
+    ActorFixtureRotationNotNearlyEquals UMETA(DisplayName="Temporary Actor Rotation Not Nearly Equals"),
+    ActorFixtureScaleNotNearlyEquals UMETA(DisplayName="Temporary Actor Scale Not Nearly Equals")
 };
 
 USTRUCT(BlueprintType)
@@ -228,6 +278,11 @@ public:
     // are held back from Run All until the author marks them ready in Probe.
     UPROPERTY(EditAnywhere, Category="Probe", meta=(ToolTip="Templates require review before inclusion in automatic runs."))
     bool bNeedsConfiguration = false;
+
+    // Default is opt-out for old and new assets. Controlled actor actions briefly
+    // affect the loaded Editor world and may mark its level package dirty.
+    UPROPERTY(EditAnywhere, Category="Probe", meta=(ToolTip="Allow this test to spawn transient actors in the active Editor level. Probe only edits its own fixtures and always attempts cleanup. The level can still become dirty."))
+    bool bAllowTransientEditorActors = false;
 
     UPROPERTY(EditAnywhere, Category="Probe")
     TArray<FProbeTestStep> Steps;

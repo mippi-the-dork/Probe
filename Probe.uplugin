@@ -1,9 +1,9 @@
 {
   "FileVersion": 3,
-  "Version": 16,
-  "VersionName": "0.10.0",
+  "Version": 25,
+  "VersionName": "0.15.3",
   "FriendlyName": "Probe",
-  "Description": "Create, edit, save, and execute QA test assets from a dedicated Unreal Editor interface.",
+  "Description": "Visual QA tests, Packs, automated Editor checks, and deterministic self-test smoke verification for Unreal Engine.",
   "Category": "Testing",
   "CreatedBy": "Mippi",
   "CanContainContent": true,

@@ -178,6 +178,54 @@ namespace Probe
             {EProbeStepType::ActorFolderCountAtMost, TEXT("Actors & World"), TEXT("Actor Folder Count At Most"), TEXT("Count actors whose Outliner folder path matches exactly, requiring an upper bound"), TargetField | CountField},
             {EProbeStepType::SelectedActorIsTemporarilyHidden, TEXT("Selection"), TEXT("Selected Actor Is Temporarily Hidden"), TEXT("Require one selected actor and verify its temporary Editor visibility is hidden"), 0},
             {EProbeStepType::SelectedActorIsNotTemporarilyHidden, TEXT("Selection"), TEXT("Selected Actor Is Not Temporarily Hidden"), TEXT("Require one selected actor and verify it is not temporarily hidden in the Editor"), 0},
+            {EProbeStepType::SelectionClear, TEXT("Test Actions"), TEXT("Clear Editor Actor Selection"), TEXT("Clear actor selection temporarily. Probe restores your prior selection after the test, even on failure."), 0},
+            {EProbeStepType::SelectionSelectFirstActor, TEXT("Test Actions"), TEXT("Select First Available Actor"), TEXT("Select a deterministic first non-WorldSettings actor. Existing actor state and assets are not modified; selection is restored automatically."), 0},
+            {EProbeStepType::SelectionSelectActorByLabel, TEXT("Test Actions"), TEXT("Select Actor By Label"), TEXT("Select exactly one level actor matching its case-sensitive Outliner label; errors when missing or ambiguous. Restored after this test."), TargetField},
+            {EProbeStepType::SelectionSelectActorsWithTag, TEXT("Test Actions"), TEXT("Select Actors With Tag"), TEXT("Select all level actors carrying the specified tag. Errors if none match; prior selection is restored."), TargetField},
+            {EProbeStepType::SelectionRestore, TEXT("Test Actions"), TEXT("Restore Original Actor Selection"), TEXT("Restore the Editor selection captured before this test's first selection action. Automatic cleanup also restores it."), 0},
+            {EProbeStepType::ActorFixtureSpawn, TEXT("Test Actions"), TEXT("Spawn Temporary Editor Actor"), TEXT("Spawn a transient actor in the active Editor world. Target is a concrete actor class; New Actor ID is Expected Value. Requires explicit per-test permission. May dirty the active level."), TargetField | ValueField},
+            {EProbeStepType::ActorFixtureSetLabel, TEXT("Test Actions"), TEXT("Set Temporary Actor Label"), TEXT("Set the Outliner label on an actor created by this test. Target is Actor ID; Value is label."), TargetField | ValueField},
+            {EProbeStepType::ActorFixtureSetFolder, TEXT("Test Actions"), TEXT("Set Temporary Actor Folder"), TEXT("Move a temporary actor into an Outliner folder. Target is Actor ID; Value is folder path."), TargetField | ValueField},
+            {EProbeStepType::ActorFixtureAddTag, TEXT("Test Actions"), TEXT("Add Temporary Actor Tag"), TEXT("Add an Actor Tag to a temporary actor. Target is Actor ID; Value is tag."), TargetField | ValueField},
+            {EProbeStepType::ActorFixtureRemoveTag, TEXT("Test Actions"), TEXT("Remove Temporary Actor Tag"), TEXT("Remove an Actor Tag from a temporary actor. Target is Actor ID; Value is tag."), TargetField | ValueField},
+            {EProbeStepType::ActorFixtureSelect, TEXT("Test Actions"), TEXT("Select Temporary Actor"), TEXT("Select only this test's temporary actor, automatically restoring prior Editor selection after the run."), TargetField},
+            {EProbeStepType::ActorFixtureHide, TEXT("Test Actions"), TEXT("Hide Temporary Actor In Editor"), TEXT("Temporarily hide a test-owned actor in the Editor, without changing production actors."), TargetField},
+            {EProbeStepType::ActorFixtureShow, TEXT("Test Actions"), TEXT("Show Temporary Actor In Editor"), TEXT("Remove temporary Editor hiding on a test-owned actor."), TargetField},
+            {EProbeStepType::ActorFixtureExists, TEXT("Test Actions"), TEXT("Temporary Actor Exists"), TEXT("Check whether a temporary actor with this Actor ID exists in this test."), TargetField},
+            {EProbeStepType::ActorFixtureLabelEquals, TEXT("Test Actions"), TEXT("Temporary Actor Label Equals"), TEXT("Verify the exact Outliner label of a test-owned temporary actor."), TargetField | ValueField},
+            {EProbeStepType::ActorFixtureHasTag, TEXT("Test Actions"), TEXT("Temporary Actor Has Tag"), TEXT("Verify a tag on a test-owned temporary actor."), TargetField | ValueField},
+            {EProbeStepType::ActorFixtureFolderEquals, TEXT("Test Actions"), TEXT("Temporary Actor Folder Equals"), TEXT("Verify the Outliner folder path of a test-owned temporary actor."), TargetField | ValueField},
+            {EProbeStepType::ActorFixtureIsSelected, TEXT("Test Actions"), TEXT("Temporary Actor Is Selected"), TEXT("Verify the test-owned temporary actor is currently selected."), TargetField},
+            {EProbeStepType::ActorFixtureIsHidden, TEXT("Test Actions"), TEXT("Temporary Actor Is Hidden"), TEXT("Verify the test-owned temporary actor is temporarily hidden in the Editor."), TargetField},
+            {EProbeStepType::ActorFixtureDestroy, TEXT("Test Actions"), TEXT("Destroy Temporary Editor Actor"), TEXT("Destroy a test-owned temporary actor. Undestroyed fixtures are cleaned up after the test."), TargetField},
+            // Probe 0.13.0: transform and attachment workflows never target production actors.
+            {EProbeStepType::ActorFixtureSetLocation, TEXT("Test Actions"), TEXT("Set Temporary Actor Location"), TEXT("Move a test-owned actor. Expected Value: X,Y,Z (centimeters). Requires an actor class with a root component."), TargetField | ValueField},
+            {EProbeStepType::ActorFixtureLocationNearlyEquals, TEXT("Test Actions"), TEXT("Temporary Actor Location Nearly Equals"), TEXT("Compare actor world location with X,Y,Z, using Numeric Tolerance (centimeters)."), TargetField | ValueField | ToleranceField},
+            {EProbeStepType::ActorFixtureSetRotation, TEXT("Test Actions"), TEXT("Set Temporary Actor Rotation"), TEXT("Rotate a test-owned actor. Expected Value: Pitch,Yaw,Roll (degrees)."), TargetField | ValueField},
+            {EProbeStepType::ActorFixtureRotationNearlyEquals, TEXT("Test Actions"), TEXT("Temporary Actor Rotation Nearly Equals"), TEXT("Compare world rotation Pitch,Yaw,Roll within Numeric Tolerance (degrees)."), TargetField | ValueField | ToleranceField},
+            {EProbeStepType::ActorFixtureSetScale, TEXT("Test Actions"), TEXT("Set Temporary Actor Scale"), TEXT("Set world scale using X,Y,Z on a test-owned actor."), TargetField | ValueField},
+            {EProbeStepType::ActorFixtureScaleNearlyEquals, TEXT("Test Actions"), TEXT("Temporary Actor Scale Nearly Equals"), TEXT("Compare world scale X,Y,Z using Numeric Tolerance."), TargetField | ValueField | ToleranceField},
+            {EProbeStepType::ActorFixtureAttachTo, TEXT("Test Actions"), TEXT("Attach Temporary Actor To Temporary Parent"), TEXT("Target is the child Actor ID; Expected Value is the parent Actor ID. Both must be test-owned."), TargetField | ValueField},
+            {EProbeStepType::ActorFixtureDetach, TEXT("Test Actions"), TEXT("Detach Temporary Actor"), TEXT("Detach test-owned child from its temporary parent while keeping world transform."), TargetField},
+            {EProbeStepType::ActorFixtureHasParent, TEXT("Test Actions"), TEXT("Temporary Actor Has Parent"), TEXT("Verify that the test-owned child is attached to the test-owned Parent Actor ID in Expected Value."), TargetField | ValueField},
+            {EProbeStepType::ActorFixtureHasNoParent, TEXT("Test Actions"), TEXT("Temporary Actor Has No Parent"), TEXT("Verify a test-owned actor has no attach parent."), TargetField},
+            {EProbeStepType::ActorFixtureChildCountExactly, TEXT("Test Actions"), TEXT("Temporary Actor Child Count Exactly"), TEXT("Count directly attached test-owned child actors; compare to Exact Count."), TargetField | CountField},
+            {EProbeStepType::ActorFixtureTagAbsent, TEXT("Test Actions"), TEXT("Temporary Actor Does Not Have Tag"), TEXT("Verify a tag was removed from a test-owned actor."), TargetField | ValueField},
+            {EProbeStepType::ActorFixtureIsVisible, TEXT("Test Actions"), TEXT("Temporary Actor Is Visible"), TEXT("Assert this test-owned actor is not temporarily hidden in the Editor."), TargetField},
+            {EProbeStepType::ActorFixtureIsNotSelected, TEXT("Test Actions"), TEXT("Temporary Actor Is Not Selected"), TEXT("Verify this test-owned actor is not currently selected."), TargetField},
+            {EProbeStepType::ActorFixtureFolderNotEquals, TEXT("Test Actions"), TEXT("Temporary Actor Folder Does Not Equal"), TEXT("Assert a test-owned actor is not in a specified World Outliner folder."), TargetField | ValueField},
+            {EProbeStepType::ActorFixtureDistanceAtMost, TEXT("Test Actions"), TEXT("Temporary Actors Distance At Most"), TEXT("Compare distance to the second temporary Actor ID in Expected Value with Maximum Distance (cm) in Count."), TargetField | ValueField | CountField},
+            {EProbeStepType::ActorFixtureChildCountAtLeast, TEXT("Test Actions"), TEXT("Temporary Actor Child Count At Least"), TEXT("Minimum direct test-owned child actors attached to this fixture."), TargetField | CountField},
+            {EProbeStepType::ActorFixtureChildCountAtMost, TEXT("Test Actions"), TEXT("Temporary Actor Child Count At Most"), TEXT("Maximum direct test-owned child actors attached to this fixture."), TargetField | CountField},
+            {EProbeStepType::ActorFixtureDistanceAtLeast, TEXT("Test Actions"), TEXT("Temporary Actors Distance At Least"), TEXT("Minimum distance between two run-owned actors, in centimeters."), TargetField | ValueField | CountField},
+            {EProbeStepType::ActorFixtureLabelContains, TEXT("Test Actions"), TEXT("Temporary Actor Label Contains"), TEXT("Check that the temporary actor's Outliner label contains this substring."), TargetField | ValueField},
+            {EProbeStepType::ActorFixtureLabelStartsWith, TEXT("Test Actions"), TEXT("Temporary Actor Label Starts With"), TEXT("Check that a temporary actor's Outliner label begins with this text."), TargetField | ValueField},
+            {EProbeStepType::ActorFixtureLabelEndsWith, TEXT("Test Actions"), TEXT("Temporary Actor Label Ends With"), TEXT("Check that a temporary actor's Outliner label ends with this text."), TargetField | ValueField},
+            {EProbeStepType::ActorFixtureTagCountExactly, TEXT("Test Actions"), TEXT("Temporary Actor Tag Count Exactly"), TEXT("Count the tags on a test-owned actor."), TargetField | CountField},
+            {EProbeStepType::ActorFixtureHasRootComponent, TEXT("Test Actions"), TEXT("Temporary Actor Has Root Component"), TEXT("Verify that the run-owned actor has a root SceneComponent."), TargetField},
+            {EProbeStepType::ActorFixtureLocationNotNearlyEquals, TEXT("Test Actions"), TEXT("Temporary Actor Location Not Nearly Equals"), TEXT("Check world location is outside numeric tolerance."), TargetField | ValueField | ToleranceField},
+            {EProbeStepType::ActorFixtureRotationNotNearlyEquals, TEXT("Test Actions"), TEXT("Temporary Actor Rotation Not Nearly Equals"), TEXT("Check Euler rotation is outside numeric tolerance."), TargetField | ValueField | ToleranceField},
+            {EProbeStepType::ActorFixtureScaleNotNearlyEquals, TEXT("Test Actions"), TEXT("Temporary Actor Scale Not Nearly Equals"), TEXT("Check actor scale is outside numeric tolerance."), TargetField | ValueField | ToleranceField},
         };
         return Catalog;
     }
@@ -189,6 +237,59 @@ namespace Probe
             if (Item.Type == Type) { return Item; }
         }
         return AssertionCatalog()[0];
+    }
+
+    // Shared classification for built-in and extension entries in Add Step,
+    // Change Assertion, and Templates. No serialized data depends on these labels.
+    inline FString MenuSubgroup(const FString& Category, const FString& Name)
+    {
+        if (Category == TEXT("Test Actions"))
+        {
+            if (Name.Contains(TEXT("Object"))) { return TEXT("Temporary Objects"); }
+            if (Name.Contains(TEXT("Selection")) || (Name.Contains(TEXT("Select")) && !Name.Contains(TEXT("Temporary Actor")))) { return TEXT("Editor Selection"); }
+            if (Name.Contains(TEXT("Location")) || Name.Contains(TEXT("Rotation")) || Name.Contains(TEXT("Scale")) || Name.Contains(TEXT("Distance")) || Name.Contains(TEXT("Transform")) || Name.Contains(TEXT("Spatial"))) { return TEXT("Actor Transforms & Distance"); }
+            if (Name.Contains(TEXT("Parent")) || Name.Contains(TEXT("Child")) || Name.Contains(TEXT("Attach")) || Name.Contains(TEXT("Detach")) || Name.Contains(TEXT("Hierarchy")) || Name.Contains(TEXT("Reparent"))) { return TEXT("Actor Hierarchy"); }
+            if (Name.Contains(TEXT("Spawn")) || Name.Contains(TEXT("Destroy")) || Name.Contains(TEXT("Lifecycle")) || Name.Contains(TEXT("Exists")) || Name.Contains(TEXT("Cleanup"))) { return TEXT("Actor Lifecycle"); }
+            return TEXT("Actor State & Properties");
+        }
+        if (Category == TEXT("Plugins & Modules")) { return Name.Contains(TEXT("Module")) ? TEXT("Modules") : TEXT("Plugins"); }
+        if (Category == TEXT("Editor UI")) { return Name.Contains(TEXT("Tab")) ? TEXT("Tabs") : TEXT("Menus & Commands"); }
+        if (Category == TEXT("Editor State")) { return Name.Contains(TEXT("Console")) ? TEXT("Console Variables") : TEXT("Editor Lifecycle"); }
+        if (Category == TEXT("Assets"))
+        {
+            if (Name.Contains(TEXT("Registry")) || Name.Contains(TEXT("Tag"))) { return TEXT("Registry & Tags"); }
+            if (Name.Contains(TEXT("Count")) || Name.Contains(TEXT("Assets In"))) { return TEXT("Asset Counts"); }
+            if (Name.Contains(TEXT("Name")) || Name.Contains(TEXT("Folder")) || Name.Contains(TEXT("Path"))) { return TEXT("Naming & Folders"); }
+            return TEXT("Existence, Classes & State");
+        }
+        if (Category == TEXT("Classes & Reflection"))
+        {
+            if (Name.Contains(TEXT("Function"))) { return TEXT("Functions"); }
+            if (Name.Contains(TEXT("Property"))) { return TEXT("Properties"); }
+            return TEXT("Class Contracts");
+        }
+        if (Category == TEXT("Actors & World"))
+        {
+            if (Name.Contains(TEXT("Label"))) { return TEXT("Outliner Labels"); }
+            if (Name.Contains(TEXT("Folder"))) { return TEXT("Outliner Folders"); }
+            if (Name.Contains(TEXT("Tag"))) { return TEXT("Actor Tags"); }
+            if (Name.Contains(TEXT("Count"))) { return TEXT("Actor Counts"); }
+            return TEXT("Actor State & Components");
+        }
+        if (Category == TEXT("Selection"))
+        {
+            if (Name.Contains(TEXT("Count")) || Name.Contains(TEXT("Empty"))) { return TEXT("Selection Counts"); }
+            if (Name.Contains(TEXT("Label")) || Name.Contains(TEXT("Tag")) || Name.Contains(TEXT("Folder"))) { return TEXT("Selected Actor Details"); }
+            return TEXT("Selection State & Types");
+        }
+        if (Category == TEXT("Properties & Values"))
+        {
+            if (Name.Contains(TEXT("Numeric")) || Name.Contains(TEXT("Threshold")) || Name.Contains(TEXT("Range"))) { return TEXT("Numeric Comparisons"); }
+            if (Name.Contains(TEXT("String"))) { return TEXT("String Comparisons"); }
+            if (Name.Contains(TEXT("True")) || Name.Contains(TEXT("False")) || Name.Contains(TEXT("Boolean"))) { return TEXT("Boolean Checks"); }
+            return TEXT("Value Comparisons");
+        }
+        return TEXT("General");
     }
 
     inline const TArray<FString>& AssertionCategories()

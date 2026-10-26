@@ -15,7 +15,10 @@
 #include "GameFramework/Actor.h"
 #include "UObject/Package.h"
 #include "Engine/World.h"
+#include "Engine/Level.h"
 #include "EngineUtils.h"
+#include "Selection.h"
+#include "GameFramework/WorldSettings.h"
 #include "HAL/PlatformTime.h"
 #include "Interfaces/IPluginManager.h"
 #include "PluginDescriptor.h"
@@ -25,6 +28,7 @@
 #include "UObject/SoftObjectPath.h"
 #include "UObject/UnrealType.h"
 #include "UObject/UObjectIterator.h"
+#include "UObject/UObjectGlobals.h"
 
 namespace Probe
 {
@@ -171,13 +175,141 @@ namespace Probe
         return nullptr;
     }
 
+    // Plain numeric triples are easier to author than an Unreal export string.
+    // Require exactly three finite values, e.g. "100,0,50" (X,Y,Z or Pitch,Yaw,Roll).
+    static bool ParseProbeTriple(const FString& Input, FVector& Out, FString& Reason)
+    {
+        TArray<FString> Parts;
+        Input.ParseIntoArray(Parts, TEXT(","), false);
+        if (Parts.Num() != 3)
+        {
+            Reason = TEXT("Expected three comma-separated numbers, e.g. 100,0,50.");
+            return false;
+        }
+        double Numbers[3] = {};
+        for (int32 Index = 0; Index < 3; ++Index)
+        {
+            const FString Part = Parts[Index].TrimStartAndEnd();
+            if (!LexTryParseString(Numbers[Index], *Part) || !FMath::IsFinite(Numbers[Index]))
+            {
+                Reason = FString::Printf(TEXT("Invalid numeric component '%s'. Use X,Y,Z or Pitch,Yaw,Roll."), *Part);
+                return false;
+            }
+        }
+        Out = FVector(Numbers[0], Numbers[1], Numbers[2]);
+        return true;
+    }
+
     // Fixtures live only for a synchronous test execution. They are rooted during the
     // run and unrooted on every exit path, including a failing assertion or action.
     struct FProbeRunContext
     {
         TMap<FString, UObject*> Objects;
+        TMap<FString, TWeakObjectPtr<AActor>> ActorFixtures;
+        TWeakObjectPtr<UWorld> FixtureWorld;
+        bool bAllowTransientEditorActors = false;
+
+        AActor* GetActor(const FString& Id) const
+        {
+            const TWeakObjectPtr<AActor>* Entry = ActorFixtures.Find(Id.TrimStartAndEnd());
+            return Entry ? Entry->Get() : nullptr;
+        }
+        bool DestroyActorFixture(const FString& Id)
+        {
+            const FString Key = Id.TrimStartAndEnd();
+            TWeakObjectPtr<AActor>* Entry = ActorFixtures.Find(Key);
+            if (!Entry) { return false; }
+            AActor* Actor = Entry->Get();
+            ActorFixtures.Remove(Key);
+            if (IsValid(Actor))
+            {
+                UWorld* World = Actor->GetWorld();
+                if (IsValid(World))
+                {
+                    // False for bShouldModifyLevel: Probe must not deliberately mark
+                    // the user's level modified as part of cleanup.
+                    World->DestroyActor(Actor, false, false);
+                }
+            }
+            return true;
+        }
+        bool CheckActorWorld(FString& Reason) const
+        {
+            if (!bAllowTransientEditorActors)
+            {
+                Reason = TEXT("Temporary level actors are disabled for this test. Enable 'Allow Transient Editor Actors' in the test header, review your level, and run again.");
+                return false;
+            }
+            UWorld* World = GetEditorWorld();
+            if (!World || World->WorldType != EWorldType::Editor || !GEditor || GEditor->PlayWorld)
+            {
+                Reason = TEXT("Transient Editor actor actions require a loaded Editor level with PIE stopped.");
+                return false;
+            }
+            if (FixtureWorld.IsValid() && FixtureWorld.Get() != World)
+            {
+                Reason = TEXT("Editor world changed during fixture execution. Refusing to touch a different level.");
+                return false;
+            }
+            return true;
+        }
+
+        // These snapshots belong to ONE test execution, not the whole Pack.
+        TWeakObjectPtr<UWorld> OriginalSelectionWorld;
+        TArray<TWeakObjectPtr<AActor>> OriginalSelectedActors;
+        bool bTouchedSelection = false;
+
+        bool BeginSelectionAction(FString& Reason)
+        {
+            if (!GEditor || !GetEditorWorld() || !GEditor->GetSelectedActors())
+            {
+                Reason = TEXT("A loaded Editor level and actor selection are required.");
+                return false;
+            }
+            if (!bTouchedSelection)
+            {
+                OriginalSelectionWorld = GetEditorWorld();
+                for (FSelectionIterator It(*GEditor->GetSelectedActors()); It; ++It)
+                {
+                    if (AActor* Actor = Cast<AActor>(*It))
+                    { OriginalSelectedActors.Add(Actor); }
+                }
+                bTouchedSelection = true;
+            }
+            if (OriginalSelectionWorld.Get() != GetEditorWorld())
+            {
+                Reason = TEXT("Editor world changed during the test; refusing to modify another level's selection.");
+                return false;
+            }
+            return true;
+        }
+
+        void RestoreActorSelection()
+        {
+            if (!bTouchedSelection || !GEditor || !OriginalSelectionWorld.IsValid()
+                || GetEditorWorld() != OriginalSelectionWorld.Get()) { return; }
+            GEditor->SelectNone(false, false, false);
+            for (const TWeakObjectPtr<AActor>& Entry : OriginalSelectedActors)
+            {
+                AActor* Actor = Entry.Get();
+                if (IsValid(Actor) && Actor->GetWorld() == OriginalSelectionWorld.Get())
+                { GEditor->SelectActor(Actor, true, false, true); }
+            }
+            GEditor->NoteSelectionChange();
+            // Allow another explicit action to capture a fresh snapshot only after
+            // the original snapshot has been fully restored.
+            bTouchedSelection = false;
+            OriginalSelectedActors.Reset();
+            OriginalSelectionWorld.Reset();
+        }
         ~FProbeRunContext()
         {
+            // Clean up ALL test-owned actors even when the first failing step
+            // aborts execution. Never delete actors Probe did not create.
+            TArray<FString> FixtureIds;
+            ActorFixtures.GenerateKeyArray(FixtureIds);
+            for (const FString& Id : FixtureIds) { DestroyActorFixture(Id); }
+            RestoreActorSelection();
             for (const TPair<FString, UObject*>& Entry : Objects)
             {
                 if (IsValid(Entry.Value)) { Entry.Value->RemoveFromRoot(); }
@@ -283,6 +415,453 @@ namespace Probe
         }
         switch (Step.Type)
         {
+        case EProbeStepType::ActorFixtureSpawn:
+        {
+            if (!Context.CheckActorWorld(Reason)) { return EResultStatus::Error; }
+            const FString Id = Step.ExpectedValue.TrimStartAndEnd();
+            if (Id.IsEmpty() || Context.ActorFixtures.Contains(Id))
+            {
+                Reason = TEXT("New Actor ID must be nonempty and unique within the current test.");
+                return EResultStatus::Error;
+            }
+            UClass* Class = FindTestClass(Target);
+            if (!Class || !Class->IsChildOf(AActor::StaticClass()) || Class->HasAnyClassFlags(CLASS_Abstract))
+            {
+                Reason = FString::Printf(TEXT("'%s' is not a concrete AActor class."), *Target);
+                return EResultStatus::Error;
+            }
+            UWorld* World = GetEditorWorld();
+            FActorSpawnParameters Params;
+            Params.Name = MakeUniqueObjectName(World->GetCurrentLevel(), Class, FName(TEXT("ProbeTransientActor")));
+            Params.ObjectFlags = RF_Transient;
+            Params.bTemporaryEditorActor = true;
+            Params.bHideFromSceneOutliner = false;
+            Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+            AActor* Actor = World->SpawnActor<AActor>(Class, FTransform::Identity, Params);
+            if (!IsValid(Actor))
+            {
+                Reason = TEXT("Editor world refused to spawn the temporary actor.");
+                return EResultStatus::Error;
+            }
+            Context.FixtureWorld = World;
+            Context.ActorFixtures.Add(Id, Actor);
+            Actor->SetActorLabel(FString::Printf(TEXT("Probe_%s"), *Id), false);
+            Reason = FString::Printf(TEXT("Created transient actor '%s' (%s). Probe will destroy it when this test ends. The level may become dirty."), *Id, *Class->GetName());
+            return EResultStatus::Passed;
+        }
+        case EProbeStepType::ActorFixtureExists:
+        {
+            const bool bExists = IsValid(Context.GetActor(Target));
+            Reason = FString::Printf(TEXT("Temporary actor '%s' %s."), *Target, bExists ? TEXT("exists") : TEXT("does not exist"));
+            return bExists ? EResultStatus::Passed : EResultStatus::Failed;
+        }
+        case EProbeStepType::ActorFixtureDestroy:
+        {
+            if (!Context.CheckActorWorld(Reason)) { return EResultStatus::Error; }
+            const bool bRemoved = Context.DestroyActorFixture(Target);
+            Reason = bRemoved ? FString::Printf(TEXT("Destroyed temporary actor '%s'."), *Target)
+                : FString::Printf(TEXT("Temporary actor '%s' was not found."), *Target);
+            return bRemoved ? EResultStatus::Passed : EResultStatus::Failed;
+        }
+        case EProbeStepType::ActorFixtureSetLabel:
+        case EProbeStepType::ActorFixtureSetFolder:
+        case EProbeStepType::ActorFixtureAddTag:
+        case EProbeStepType::ActorFixtureRemoveTag:
+        case EProbeStepType::ActorFixtureSelect:
+        case EProbeStepType::ActorFixtureHide:
+        case EProbeStepType::ActorFixtureShow:
+        case EProbeStepType::ActorFixtureLabelEquals:
+        case EProbeStepType::ActorFixtureHasTag:
+        case EProbeStepType::ActorFixtureFolderEquals:
+        case EProbeStepType::ActorFixtureIsSelected:
+        case EProbeStepType::ActorFixtureIsHidden:
+        {
+            if (!Context.CheckActorWorld(Reason)) { return EResultStatus::Error; }
+            AActor* Actor = Context.GetActor(Target);
+            if (!IsValid(Actor) || Actor->GetWorld() != GetEditorWorld())
+            {
+                Reason = FString::Printf(TEXT("Temporary actor '%s' was not created in this test or no longer exists."), *Target);
+                return EResultStatus::Error;
+            }
+            const FString Value = Step.ExpectedValue.TrimStartAndEnd();
+            switch (Step.Type)
+            {
+            case EProbeStepType::ActorFixtureSetLabel:
+                Actor->SetActorLabel(Value, false);
+                Reason = FString::Printf(TEXT("Temporary actor '%s' label set to '%s'."), *Target, *Value);
+                return EResultStatus::Passed;
+            case EProbeStepType::ActorFixtureSetFolder:
+                Actor->SetFolderPath(FName(*Value));
+                Reason = FString::Printf(TEXT("Temporary actor '%s' folder set to '%s'."), *Target, *Value);
+                return EResultStatus::Passed;
+            case EProbeStepType::ActorFixtureAddTag:
+                Actor->Tags.AddUnique(FName(*Value));
+                Reason = FString::Printf(TEXT("Added tag '%s' to temporary actor '%s'."), *Value, *Target);
+                return EResultStatus::Passed;
+            case EProbeStepType::ActorFixtureRemoveTag:
+                Actor->Tags.Remove(FName(*Value));
+                Reason = FString::Printf(TEXT("Removed tag '%s' from temporary actor '%s'."), *Value, *Target);
+                return EResultStatus::Passed;
+            case EProbeStepType::ActorFixtureSelect:
+                if (!Context.BeginSelectionAction(Reason)) { return EResultStatus::Error; }
+                GEditor->SelectNone(false, false, false);
+                GEditor->SelectActor(Actor, true, false, true);
+                GEditor->NoteSelectionChange();
+                Reason = FString::Printf(TEXT("Temporarily selected Probe actor '%s'. Prior selection will be restored."), *Target);
+                return Actor->IsSelectedInEditor() ? EResultStatus::Passed : EResultStatus::Failed;
+            case EProbeStepType::ActorFixtureHide:
+            case EProbeStepType::ActorFixtureShow:
+                Actor->SetIsTemporarilyHiddenInEditor(Step.Type == EProbeStepType::ActorFixtureHide);
+                Reason = FString::Printf(TEXT("Temporary actor '%s' hidden: %s."), *Target,
+                    Actor->IsTemporarilyHiddenInEditor() ? TEXT("yes") : TEXT("no"));
+                return EResultStatus::Passed;
+            case EProbeStepType::ActorFixtureLabelEquals:
+            {
+                const FString Actual = Actor->GetActorLabel();
+                Reason = FString::Printf(TEXT("Temporary actor '%s' label is '%s'; expected '%s'."), *Target, *Actual, *Value);
+                return Actual == Value ? EResultStatus::Passed : EResultStatus::Failed;
+            }
+            case EProbeStepType::ActorFixtureHasTag:
+            {
+                const bool bHas = Actor->ActorHasTag(FName(*Value));
+                Reason = FString::Printf(TEXT("Temporary actor '%s' %s tag '%s'."), *Target, bHas ? TEXT("has") : TEXT("lacks"), *Value);
+                return bHas ? EResultStatus::Passed : EResultStatus::Failed;
+            }
+            case EProbeStepType::ActorFixtureFolderEquals:
+            {
+                const FString Actual = Actor->GetFolderPath().ToString();
+                Reason = FString::Printf(TEXT("Temporary actor '%s' folder '%s'; expected '%s'."), *Target, *Actual, *Value);
+                return Actual == Value ? EResultStatus::Passed : EResultStatus::Failed;
+            }
+            case EProbeStepType::ActorFixtureIsSelected:
+                Reason = FString::Printf(TEXT("Temporary actor '%s' selected: %s."), *Target, Actor->IsSelectedInEditor() ? TEXT("yes") : TEXT("no"));
+                return Actor->IsSelectedInEditor() ? EResultStatus::Passed : EResultStatus::Failed;
+            case EProbeStepType::ActorFixtureIsHidden:
+                Reason = FString::Printf(TEXT("Temporary actor '%s' hidden: %s."), *Target, Actor->IsTemporarilyHiddenInEditor() ? TEXT("yes") : TEXT("no"));
+                return Actor->IsTemporarilyHiddenInEditor() ? EResultStatus::Passed : EResultStatus::Failed;
+            default: break;
+            }
+            Reason = TEXT("Unsupported actor fixture action.");
+            return EResultStatus::Error;
+        }
+        // 0.13.0: transform and hierarchy actions target only run-owned actor IDs.
+        case EProbeStepType::ActorFixtureSetLocation:
+        case EProbeStepType::ActorFixtureLocationNearlyEquals:
+        case EProbeStepType::ActorFixtureSetRotation:
+        case EProbeStepType::ActorFixtureRotationNearlyEquals:
+        case EProbeStepType::ActorFixtureSetScale:
+        case EProbeStepType::ActorFixtureScaleNearlyEquals:
+        case EProbeStepType::ActorFixtureAttachTo:
+        case EProbeStepType::ActorFixtureDetach:
+        case EProbeStepType::ActorFixtureHasParent:
+        case EProbeStepType::ActorFixtureHasNoParent:
+        case EProbeStepType::ActorFixtureChildCountExactly:
+        case EProbeStepType::ActorFixtureTagAbsent:
+        case EProbeStepType::ActorFixtureIsVisible:
+        case EProbeStepType::ActorFixtureIsNotSelected:
+        case EProbeStepType::ActorFixtureFolderNotEquals:
+        case EProbeStepType::ActorFixtureDistanceAtMost:
+        case EProbeStepType::ActorFixtureChildCountAtLeast:
+        case EProbeStepType::ActorFixtureChildCountAtMost:
+        case EProbeStepType::ActorFixtureDistanceAtLeast:
+        case EProbeStepType::ActorFixtureLabelContains:
+        case EProbeStepType::ActorFixtureLabelStartsWith:
+        case EProbeStepType::ActorFixtureLabelEndsWith:
+        case EProbeStepType::ActorFixtureTagCountExactly:
+        case EProbeStepType::ActorFixtureHasRootComponent:
+        case EProbeStepType::ActorFixtureLocationNotNearlyEquals:
+        case EProbeStepType::ActorFixtureRotationNotNearlyEquals:
+        case EProbeStepType::ActorFixtureScaleNotNearlyEquals:
+        {
+            if (!Context.CheckActorWorld(Reason)) { return EResultStatus::Error; }
+            AActor* Actor = Context.GetActor(Target);
+            if (!IsValid(Actor) || Actor->GetWorld() != GetEditorWorld())
+            {
+                Reason = FString::Printf(TEXT("Actor ID '%s' does not identify a living actor created by this test."), *Target);
+                return EResultStatus::Error;
+            }
+            const FString Value = Step.ExpectedValue.TrimStartAndEnd();
+            const bool bNeedsTriple = Step.Type == EProbeStepType::ActorFixtureSetLocation
+                || Step.Type == EProbeStepType::ActorFixtureLocationNearlyEquals
+                || Step.Type == EProbeStepType::ActorFixtureLocationNotNearlyEquals
+                || Step.Type == EProbeStepType::ActorFixtureSetRotation
+                || Step.Type == EProbeStepType::ActorFixtureRotationNearlyEquals
+                || Step.Type == EProbeStepType::ActorFixtureRotationNotNearlyEquals
+                || Step.Type == EProbeStepType::ActorFixtureSetScale
+                || Step.Type == EProbeStepType::ActorFixtureScaleNearlyEquals
+                || Step.Type == EProbeStepType::ActorFixtureScaleNotNearlyEquals;
+            FVector Triple = FVector::ZeroVector;
+            if (bNeedsTriple && !ParseProbeTriple(Value, Triple, Reason))
+            { return EResultStatus::Error; }
+            const double Tolerance = FMath::Max(0.0, Step.NumericTolerance);
+            switch (Step.Type)
+            {
+            case EProbeStepType::ActorFixtureSetLocation:
+                if (!Actor->GetRootComponent() || !Actor->SetActorLocation(Triple, false))
+                {
+                    Reason = TEXT("Unable to move temporary actor. Use a concrete actor class with a root component, such as /Script/Engine.StaticMeshActor.");
+                    return EResultStatus::Error;
+                }
+                Reason = FString::Printf(TEXT("Actor '%s' location set to %s cm."), *Target, *Triple.ToString());
+                return EResultStatus::Passed;
+            case EProbeStepType::ActorFixtureLocationNearlyEquals:
+            case EProbeStepType::ActorFixtureLocationNotNearlyEquals:
+            {
+                const FVector Actual = Actor->GetActorLocation();
+                const bool bEquals = Actual.Equals(Triple, Tolerance);
+                const bool bPass = Step.Type == EProbeStepType::ActorFixtureLocationNearlyEquals ? bEquals : !bEquals;
+                Reason = FString::Printf(TEXT("Actor '%s' location %s; compared with %s (tolerance %.4f cm, %s)."),
+                    *Target, *Actual.ToString(), *Triple.ToString(), Tolerance,
+                    Step.Type == EProbeStepType::ActorFixtureLocationNearlyEquals ? TEXT("equals") : TEXT("not equals"));
+                return bPass ? EResultStatus::Passed : EResultStatus::Failed;
+            }
+            case EProbeStepType::ActorFixtureSetRotation:
+            {
+                if (!Actor->GetRootComponent() || !Actor->SetActorRotation(FRotator(Triple.X, Triple.Y, Triple.Z)))
+                {
+                    Reason = TEXT("Unable to rotate temporary actor. Use an actor class with a root component.");
+                    return EResultStatus::Error;
+                }
+                Reason = FString::Printf(TEXT("Actor '%s' rotation set to Pitch,Yaw,Roll %s degrees."), *Target, *Value);
+                return EResultStatus::Passed;
+            }
+            case EProbeStepType::ActorFixtureRotationNearlyEquals:
+            case EProbeStepType::ActorFixtureRotationNotNearlyEquals:
+            {
+                const FRotator Expected(Triple.X, Triple.Y, Triple.Z);
+                const FRotator Actual = Actor->GetActorRotation();
+                Reason = FString::Printf(TEXT("Actor '%s' rotation %s; compared with %s (tolerance %.4f degrees, %s)."),
+                    *Target, *Actual.ToString(), *Expected.ToString(), Tolerance,
+                    Step.Type == EProbeStepType::ActorFixtureRotationNearlyEquals ? TEXT("equals") : TEXT("not equals"));
+                const bool bEquals = Actual.Equals(Expected, Tolerance);
+                const bool bPass = Step.Type == EProbeStepType::ActorFixtureRotationNearlyEquals ? bEquals : !bEquals;
+                return bPass ? EResultStatus::Passed : EResultStatus::Failed;
+            }
+            case EProbeStepType::ActorFixtureSetScale:
+                if (!Actor->GetRootComponent())
+                {
+                    Reason = TEXT("Cannot set scale without a root component. Use /Script/Engine.StaticMeshActor.");
+                    return EResultStatus::Error;
+                }
+                Actor->SetActorScale3D(Triple);
+                Reason = FString::Printf(TEXT("Actor '%s' scale set to %s."), *Target, *Triple.ToString());
+                return EResultStatus::Passed;
+            case EProbeStepType::ActorFixtureScaleNearlyEquals:
+            case EProbeStepType::ActorFixtureScaleNotNearlyEquals:
+            {
+                const FVector Actual = Actor->GetActorScale3D();
+                Reason = FString::Printf(TEXT("Actor '%s' scale %s; compared with %s (tolerance %.4f, %s)."),
+                    *Target, *Actual.ToString(), *Triple.ToString(), Tolerance,
+                    Step.Type == EProbeStepType::ActorFixtureScaleNearlyEquals ? TEXT("equals") : TEXT("not equals"));
+                const bool bEquals = Actual.Equals(Triple, Tolerance);
+                const bool bPass = Step.Type == EProbeStepType::ActorFixtureScaleNearlyEquals ? bEquals : !bEquals;
+                return bPass ? EResultStatus::Passed : EResultStatus::Failed;
+            }
+            case EProbeStepType::ActorFixtureAttachTo:
+            {
+                AActor* Parent = Context.GetActor(Value);
+                if (!IsValid(Parent) || Parent == Actor || Parent->GetWorld() != Actor->GetWorld())
+                {
+                    Reason = TEXT("Parent Actor ID must identify another living actor owned by this test.");
+                    return EResultStatus::Error;
+                }
+                if (!Actor->GetRootComponent() || !Parent->GetRootComponent())
+                {
+                    Reason = TEXT("Child and parent must have root components for attachment. Use /Script/Engine.StaticMeshActor for both.");
+                    return EResultStatus::Error;
+                }
+                if (!Actor->AttachToActor(Parent, FAttachmentTransformRules::KeepWorldTransform))
+                {
+                    Reason = TEXT("Actor attachment failed (possibly due to a hierarchy cycle).");
+                    return EResultStatus::Failed;
+                }
+                Reason = FString::Printf(TEXT("Attached test actor '%s' to test actor '%s'."), *Target, *Value);
+                return EResultStatus::Passed;
+            }
+            case EProbeStepType::ActorFixtureDetach:
+                if (!Actor->GetAttachParentActor())
+                {
+                    Reason = FString::Printf(TEXT("Actor '%s' is already detached."), *Target);
+                    return EResultStatus::Failed;
+                }
+                Actor->DetachFromActor(FDetachmentTransformRules::KeepWorldTransform);
+                Reason = FString::Printf(TEXT("Detached test actor '%s'."), *Target);
+                return Actor->GetAttachParentActor() == nullptr ? EResultStatus::Passed : EResultStatus::Failed;
+            case EProbeStepType::ActorFixtureHasParent:
+            {
+                AActor* Parent = Context.GetActor(Value);
+                if (!IsValid(Parent))
+                {
+                    Reason = FString::Printf(TEXT("Parent Actor ID '%s' has not been created by this test."), *Value);
+                    return EResultStatus::Error;
+                }
+                Reason = FString::Printf(TEXT("Actor '%s' parent: '%s'; expected '%s'."), *Target,
+                    Actor->GetAttachParentActor() ? *Actor->GetAttachParentActor()->GetActorLabel() : TEXT("none"), *Value);
+                return Actor->GetAttachParentActor() == Parent ? EResultStatus::Passed : EResultStatus::Failed;
+            }
+            case EProbeStepType::ActorFixtureHasNoParent:
+                Reason = FString::Printf(TEXT("Actor '%s' %s an attachment parent."), *Target,
+                    Actor->GetAttachParentActor() ? TEXT("has") : TEXT("does not have"));
+                return Actor->GetAttachParentActor() == nullptr ? EResultStatus::Passed : EResultStatus::Failed;
+            case EProbeStepType::ActorFixtureChildCountExactly:
+            case EProbeStepType::ActorFixtureChildCountAtLeast:
+            case EProbeStepType::ActorFixtureChildCountAtMost:
+            {
+                int32 Count = 0;
+                for (const TPair<FString, TWeakObjectPtr<AActor>>& Entry : Context.ActorFixtures)
+                {
+                    AActor* Other = Entry.Value.Get();
+                    if (IsValid(Other) && Other != Actor && Other->GetAttachParentActor() == Actor) { ++Count; }
+                }
+                Reason = FString::Printf(TEXT("Actor '%s' has %d direct test-owned children; expected %d."),
+                    *Target, Count, Step.MinimumActorCount);
+                const bool bPass = Step.Type == EProbeStepType::ActorFixtureChildCountExactly ? Count == Step.MinimumActorCount
+                    : Step.Type == EProbeStepType::ActorFixtureChildCountAtLeast ? Count >= Step.MinimumActorCount
+                    : Count <= Step.MinimumActorCount;
+                return bPass ? EResultStatus::Passed : EResultStatus::Failed;
+            }
+            case EProbeStepType::ActorFixtureLabelContains:
+            case EProbeStepType::ActorFixtureLabelStartsWith:
+            case EProbeStepType::ActorFixtureLabelEndsWith:
+            {
+                const FString Label = Actor->GetActorLabel();
+                const bool bPass = Step.Type == EProbeStepType::ActorFixtureLabelContains ? Label.Contains(Value)
+                    : Step.Type == EProbeStepType::ActorFixtureLabelStartsWith ? Label.StartsWith(Value)
+                    : Label.EndsWith(Value);
+                Reason = FString::Printf(TEXT("Temporary actor '%s' label '%s'; pattern '%s': %s."),
+                    *Target, *Label, *Value, bPass ? TEXT("matched") : TEXT("not matched"));
+                return bPass ? EResultStatus::Passed : EResultStatus::Failed;
+            }
+            case EProbeStepType::ActorFixtureTagCountExactly:
+            {
+                const int32 Count = Actor->Tags.Num();
+                Reason = FString::Printf(TEXT("Temporary actor '%s' has %d tags; expected exactly %d."),
+                    *Target, Count, Step.MinimumActorCount);
+                return Count == Step.MinimumActorCount ? EResultStatus::Passed : EResultStatus::Failed;
+            }
+            case EProbeStepType::ActorFixtureHasRootComponent:
+                Reason = FString::Printf(TEXT("Temporary actor '%s' %s a root component."), *Target,
+                    Actor->GetRootComponent() ? TEXT("has") : TEXT("does not have"));
+                return Actor->GetRootComponent() ? EResultStatus::Passed : EResultStatus::Failed;
+            case EProbeStepType::ActorFixtureTagAbsent:
+            {
+                const bool bAbsent = !Actor->ActorHasTag(FName(*Value));
+                Reason = FString::Printf(TEXT("Actor '%s' tag '%s' is %s."), *Target, *Value, bAbsent ? TEXT("absent") : TEXT("present"));
+                return bAbsent ? EResultStatus::Passed : EResultStatus::Failed;
+            }
+            case EProbeStepType::ActorFixtureIsVisible:
+            {
+                const bool bVisible = !Actor->IsTemporarilyHiddenInEditor();
+                Reason = FString::Printf(TEXT("Actor '%s' Editor visibility: %s."), *Target, bVisible ? TEXT("visible") : TEXT("hidden"));
+                return bVisible ? EResultStatus::Passed : EResultStatus::Failed;
+            }
+            case EProbeStepType::ActorFixtureIsNotSelected:
+                Reason = FString::Printf(TEXT("Actor '%s' selected: %s."), *Target, Actor->IsSelectedInEditor() ? TEXT("yes") : TEXT("no"));
+                return !Actor->IsSelectedInEditor() ? EResultStatus::Passed : EResultStatus::Failed;
+            case EProbeStepType::ActorFixtureFolderNotEquals:
+            {
+                const FString Folder = Actor->GetFolderPath().ToString();
+                Reason = FString::Printf(TEXT("Actor '%s' folder '%s' must differ from '%s'."), *Target, *Folder, *Value);
+                return Folder != Value ? EResultStatus::Passed : EResultStatus::Failed;
+            }
+            case EProbeStepType::ActorFixtureDistanceAtMost:
+            case EProbeStepType::ActorFixtureDistanceAtLeast:
+            {
+                AActor* Other = Context.GetActor(Value);
+                if (!IsValid(Other))
+                {
+                    Reason = FString::Printf(TEXT("Other Actor ID '%s' was not created by this test."), *Value);
+                    return EResultStatus::Error;
+                }
+                if (Step.MinimumActorCount < 0)
+                {
+                    Reason = TEXT("Maximum Distance must be nonnegative (centimeters).");
+                    return EResultStatus::Error;
+                }
+                const double Distance = FVector::Dist(Actor->GetActorLocation(), Other->GetActorLocation());
+                Reason = FString::Printf(TEXT("Distance between test actors '%s' and '%s': %.3f cm; expected %s %d cm."),
+                    *Target, *Value, Distance,
+                    Step.Type == EProbeStepType::ActorFixtureDistanceAtMost ? TEXT("<=") : TEXT(">="), Step.MinimumActorCount);
+                const bool bPass = Step.Type == EProbeStepType::ActorFixtureDistanceAtMost
+                    ? Distance <= Step.MinimumActorCount : Distance >= Step.MinimumActorCount;
+                return bPass ? EResultStatus::Passed : EResultStatus::Failed;
+            }
+            default: break;
+            }
+            Reason = TEXT("Unknown temporary actor operation.");
+            return EResultStatus::Error;
+        }
+        case EProbeStepType::SelectionClear:
+        case EProbeStepType::SelectionSelectFirstActor:
+        case EProbeStepType::SelectionSelectActorByLabel:
+        case EProbeStepType::SelectionSelectActorsWithTag:
+        {
+            if (!Context.BeginSelectionAction(Reason)) { return EResultStatus::Error; }
+            UWorld* World = GetEditorWorld();
+            TArray<AActor*> ToSelect;
+            if (Step.Type == EProbeStepType::SelectionSelectFirstActor)
+            {
+                // Sort by full path for deterministic selection across runs.
+                for (TActorIterator<AActor> It(World); It; ++It)
+                {
+                    AActor* Actor = *It;
+                    if (IsValid(Actor) && !Actor->IsA<AWorldSettings>())
+                    { ToSelect.Add(Actor); }
+                }
+                ToSelect.Sort([](const AActor& A, const AActor& B)
+                { return A.GetPathName() < B.GetPathName(); });
+                if (ToSelect.Num() > 1) { ToSelect.SetNum(1); }
+            }
+            else if (Step.Type == EProbeStepType::SelectionSelectActorByLabel
+                || Step.Type == EProbeStepType::SelectionSelectActorsWithTag)
+            {
+                for (TActorIterator<AActor> It(World); It; ++It)
+                {
+                    AActor* Actor = *It;
+                    if (!IsValid(Actor)) { continue; }
+                    const bool bMatch = Step.Type == EProbeStepType::SelectionSelectActorByLabel
+                        ? Actor->GetActorLabel().Equals(Target, ESearchCase::CaseSensitive)
+                        : Actor->ActorHasTag(FName(*Target));
+                    if (bMatch) { ToSelect.Add(Actor); }
+                }
+                if (Step.Type == EProbeStepType::SelectionSelectActorByLabel && ToSelect.Num() > 1)
+                {
+                    Reason = FString::Printf(TEXT("Outliner label '%s' matches %d actors. Use a unique label before selecting."),
+                        *Target, ToSelect.Num());
+                    return EResultStatus::Error;
+                }
+            }
+            if (Step.Type != EProbeStepType::SelectionClear && ToSelect.IsEmpty())
+            {
+                Reason = Step.Type == EProbeStepType::SelectionSelectFirstActor
+                    ? TEXT("No selectable actors found in the current level.")
+                    : FString::Printf(TEXT("No level actors match '%s'."), *Target);
+                return EResultStatus::Failed;
+            }
+            GEditor->SelectNone(false, false, false);
+            for (AActor* Actor : ToSelect) { GEditor->SelectActor(Actor, true, false, true); }
+            GEditor->NoteSelectionChange();
+            const int32 SelectedCount = GEditor->GetSelectedActorCount();
+            if (SelectedCount != ToSelect.Num())
+            {
+                Reason = FString::Printf(TEXT("Requested selection of %d actors, but Editor selected %d. Original selection will be restored."),
+                    ToSelect.Num(), SelectedCount);
+                return EResultStatus::Failed;
+            }
+            Reason = FString::Printf(TEXT("Selected %d level actor(s) temporarily. Original selection is restored after this test."), SelectedCount);
+            return EResultStatus::Passed;
+        }
+        case EProbeStepType::SelectionRestore:
+        {
+            if (!Context.bTouchedSelection)
+            {
+                Reason = TEXT("No previous selection action to restore in this test.");
+                return EResultStatus::Error;
+            }
+            Context.RestoreActorSelection();
+            Reason = TEXT("Original Editor actor selection restored.");
+            return EResultStatus::Passed;
+        }
         case EProbeStepType::FixtureCreateObject:
         {
             const FString Id = Step.ExpectedValue.TrimStartAndEnd();
@@ -1684,6 +2263,7 @@ namespace Probe
         else
         {
             FProbeRunContext Context; // RAII cleanup even if any step fails or errors.
+            Context.bAllowTransientEditorActors = Asset->bAllowTransientEditorActors;
             Result.Status = EResultStatus::Passed;
             for (int32 Index = 0; Index < Asset->Steps.Num(); ++Index)
             {
