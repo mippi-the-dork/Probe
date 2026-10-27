@@ -1,6 +1,24 @@
-# Probe 0.15.3
+# Probe 0.15.3-hotfix2
 
 Probe is an **Unreal Engine 5.8.3 Editor-only QA plugin** for creating, executing, and organizing QA checks against plugins, Editor UI registrations, assets, actor state, reflection, and properties. Probe also supports safe temporary UObject fixtures, reversible Editor selection actions, and one-click plugin QA Pack generation. This source package targets Windows 64-bit; no engine source modifications.
+
+
+## 0.15.3-hotfix2: Native Details search behavior and state restoration
+
+- Fixes the real Details search test checking `HasActiveSearch()` too early. Automation Driver types text through the existing Slate field, waits 1600 ms on its worker thread for possible `SSearchBox` deferred change notifications, then verifies the native Details filter state on the Editor thread.
+- Starts from a known unfiltered view to ensure the filter assertion cannot pass because an earlier user-entered search was already active.
+- Handles no actor/object selection by displaying a transient, in-memory Probe Test Asset in the existing Details 1 panel during the test only. The original displayed objects are restored unconditionally, including on partial setup failure. No level actor or asset file is created.
+- Searches for Details 1 in the Details view's hosting tab manager before falling back to global tabs. Missing tab lookup alone is diagnostic, not a failure if Slate interaction works.
+- Fixes a dead focus-restoration branch. Original search and Details content restoration remain mandatory.
+- Documents that a passing click and matching search text do not alone prove the Details filter changed. The independent `HasActiveSearch()` assertion still must pass.
+
+**UE 5.8.3 compilation and real UI execution of this hotfix have not yet been verified.** Run the native Details test with and without an actor selected; see `Docs/SELF_TEST_0153_HOTFIX2.md`.
+
+## 0.15.3-hotfix1: Native Details widget discovery
+
+The first live UE 5.8.3 run found the native `SSearchBox` in the `IDetailsView` tree, but Automation Driver could not reach it as a visible Slate element. The smoke gate (15/15) and `Probe.Driver.SlateButton` passed; only `Probe.Driver.EditorDetailsSearch` failed.
+
+The updated interactive spec activates the *existing* Details 1 dock tab before driving input (it does not open or create a replacement tab), checks Slate's actual arranged visible widget path, and attempts input after an Editor tick. Cleanup restores the original search text, keyboard focus, and the previously active tab when available. Locator failures produce a specific path/tab diagnostic instead of five cascading input assertions. This hotfix has not been compiled or run in the user's UE 5.8.3 installation. See [hotfix validation](Docs/SELF_TEST_0153_HOTFIX1.md).
 
 
 ## 0.15.3: Native Level Editor Details search integration
