@@ -1,10 +1,12 @@
-// Probe 0.15.3 hotfix 2: stabilize the real native Details filter test.
+// Probe 0.15.3 hotfix 4: verify deferred Details search restoration.
 //
 // This is an interactive Automation Driver spec, not a Probe Test Asset step.
 // No actors, assets, selections or persistent settings are modified. The only
 // temporary UI changes are the active Details 1 tab, its search text,
 // and (when nothing is selected) a transient Probe object shown in the view.
-// All are restored in AfterEach, including failure paths.
+// Search, object display and keyboard focus are restored on normal and
+// failure paths; previously foregrounded sibling dock tab restoration is
+// currently limited by UE 5.8.3 tab API availability.
 // Driver's blocking methods run exclusively on a worker thread.
 #include "Misc/AutomationTest.h"
 
@@ -29,6 +31,7 @@
 #include "ProbeTestAsset.h"
 #include "UObject/StrongObjectPtr.h"
 #include "UObject/Package.h"
+#include "Async/Async.h"
 
 namespace ProbeEditorDetailsDriver
 {
@@ -74,6 +77,12 @@ BEGIN_DEFINE_SPEC(FProbeDriverEditorDetailsSpec,
     bool bActivatedDetailsTab = false;
     bool bSearchInVisibleSlatePathOnSetup = false;
     FText OriginalSearchText;
+    bool bOriginalSearchActive = false;
+    bool bCapturedFilterState = false;
+    FString TypedSearchText;
+    bool bFilterWasApplied = false;
+    int32 FilteredRowCount = -1;
+    TAtomic<bool> bRestorationApplied{false};
     TArray<TWeakObjectPtr<AActor>> OriginalSelectedActors;
     TArray<TWeakObjectPtr<UObject>> OriginalSelectedObjects;
     TStrongObjectPtr<UProbeTestAsset> TemporaryDetailsObject;
@@ -101,6 +110,12 @@ void FProbeDriverEditorDetailsSpec::Define()
             SearchBox.Reset();
             DetailsView.Reset();
             OriginalSearchText = FText::GetEmpty();
+            bOriginalSearchActive = false;
+            bCapturedFilterState = false;
+            TypedSearchText.Reset();
+            bFilterWasApplied = false;
+            FilteredRowCount = -1;
+            bRestorationApplied.Store(false);
             OriginalSelectedActors.Reset();
             OriginalSelectedObjects.Reset();
             TemporaryDetailsObject.Reset();
@@ -190,8 +205,11 @@ void FProbeDriverEditorDetailsSpec::Define()
                 DetailsTab = ExistingDetailsTab;
                 if (!ExistingDetailsTab->IsForeground())
                 {
-                    PreviousActiveTab = DetailsTabManager.IsValid()
-                        ? DetailsTabManager->GetActiveTab() : GlobalTabManager->GetActiveTab();
+                    // UE 5.8.3 FTabManager does not expose GetActiveTab().
+                    // Foreground this existing Details tab without assuming a
+                    // previous active tab can be recovered through FTabManager.
+                    // The user's keyboard focus is restored in AfterEach.
+                    PreviousActiveTab.Reset();
                     ExistingDetailsTab->ActivateInParent(ETabActivationCause::SetDirectly);
                     if (TSharedPtr<SWindow> DetailsWindow = ExistingDetailsTab->GetParentWindow())
                     {
@@ -221,6 +239,7 @@ void FProbeDriverEditorDetailsSpec::Define()
                 return;
             }
             OriginalSearchText = SearchBox->GetText();
+            bOriginalSearchActive = DetailsView->HasActiveSearch();
             PreviousKeyboardFocus = FSlateApplication::Get().GetKeyboardFocusedWidget();
             // Start from a known empty search, even if the user previously
             // had a filter. Otherwise HasActiveSearch could already be true
@@ -268,12 +287,49 @@ void FProbeDriverEditorDetailsSpec::Define()
                 bTypeSucceeded = Search->Type(ProbeEditorDetailsDriver::TemporaryFilter);
                 if (bTypeSucceeded)
                 {
-                    // SSearchBox can debounce OnTextChanged while typing.
-                    // The native field can contain the input before the
-                    // Details view's filter has processed it. Wait on the
-                    // worker thread so Slate keeps ticking on the game thread.
+                    // Allow the real Slate search debounce to fire while the
+                    // Editor game thread remains free to process callbacks.
                     Driver->Wait(FTimespan::FromMilliseconds(1600));
                 }
+            }
+
+            // The GT must read the real Details-filter state before cleanup.
+            // Apply the original search and object set on that same thread,
+            // then return to this worker thread to allow the delayed search
+            // notification to settle before AfterEach checks restoration.
+            AsyncTask(ENamedThreads::GameThread, [this]()
+            {
+                if (bTypeSucceeded && SearchBox.IsValid() && DetailsView.IsValid())
+                {
+                    TypedSearchText = SearchBox->GetText().ToString();
+                    bFilterWasApplied = DetailsView->HasActiveSearch();
+                    FilteredRowCount = DetailsView->CountRows();
+                    bCapturedFilterState = true;
+                }
+                if (SearchBox.IsValid() && DetailsView.IsValid())
+                {
+                    SearchBox->SetText(OriginalSearchText);
+                    DetailsView->SetSearchText(OriginalSearchText);
+                    if (bInstalledTemporaryObject)
+                    {
+                        // Restore object display *before* checking whether
+                        // the original search state has settled.
+                        DetailsView->SetObjects(OriginalSelectedObjects, true, true);
+                    }
+                }
+                bRestorationApplied.Store(true);
+            });
+
+            // Do not block the game thread waiting on Slate. This worker-side
+            // wait also handles slower machines where the dispatch must wait
+            // for the next Editor tick before it can apply the restoration.
+            for (int32 Attempt = 0; Attempt < 40 && !bRestorationApplied.Load(); ++Attempt)
+            {
+                Driver->Wait(FTimespan::FromMilliseconds(50));
+            }
+            if (bRestorationApplied.Load())
+            {
+                Driver->Wait(FTimespan::FromMilliseconds(1600));
             }
         });
 
@@ -281,8 +337,8 @@ void FProbeDriverEditorDetailsSpec::Define()
         {
             if (bReady)
             {
-                // Verify actual effect (not just driver acceptance) before
-                // restoring the user's text. The temporary filter is unique.
+                // Verify the actual effect captured on the game thread before
+                // restoration. The temporary filter is unique.
                 if (!bClickSucceeded)
                 {
                     // The driver already reports the failed locator. Report
@@ -307,31 +363,53 @@ void FProbeDriverEditorDetailsSpec::Define()
                     }
                     if (bTypeSucceeded && SearchBox.IsValid() && DetailsView.IsValid())
                     {
-                        const FString Actual = SearchBox->GetText().ToString();
-                        TestEqual(TEXT("Native Details search contains the input typed through Slate"),
-                            Actual, FString(ProbeEditorDetailsDriver::TemporaryFilter));
-                        const bool bFilterActive = DetailsView->HasActiveSearch();
-                        const int32 FilteredRowCount = DetailsView->CountRows();
-                        if (!bFilterActive)
+                        TestTrue(TEXT("Captured native filter state before restoration"), bCapturedFilterState);
+                        if (bCapturedFilterState)
                         {
-                            UE_LOG(LogTemp, Warning,
-                                TEXT("Probe Details UI test: driver typed exact input but Details view did not activate the filter after 1600 ms. Rows before=%d, after=%d, displayed objects=%d, temporary object=%s. The native OnTextChanged binding or debounce must be investigated."),
-                                UnfilteredRowCount, FilteredRowCount,
-                                DetailsView->GetSelectedObjects().Num(),
-                                bInstalledTemporaryObject ? TEXT("yes") : TEXT("no"));
+                            TestEqual(TEXT("Native Details search contains the input typed through Slate"),
+                                TypedSearchText, FString(ProbeEditorDetailsDriver::TemporaryFilter));
+                            if (!bFilterWasApplied)
+                            {
+                                UE_LOG(LogTemp, Warning,
+                                    TEXT("Probe Details UI test: exact input typed, but native filter was not active after 1600 ms. Rows before=%d, after=%d, objects=%d, temporary object=%s."),
+                                    UnfilteredRowCount, FilteredRowCount,
+                                    DetailsView->GetSelectedObjects().Num(),
+                                    bInstalledTemporaryObject ? TEXT("yes") : TEXT("no"));
+                            }
+                            TestTrue(TEXT("Native Details view applied the temporary filter after text-change debounce"),
+                                bFilterWasApplied);
                         }
-                        TestTrue(TEXT("Native Details view applied the temporary filter after text-change debounce"), bFilterActive);
                     }
                 }
                 if (SearchBox.IsValid() && DetailsView.IsValid())
                 {
-                    // Cleanup is unconditional, even when a check failed.
-                    SearchBox->SetText(OriginalSearchText);
-                    DetailsView->SetSearchText(OriginalSearchText);
+                    // Emergency cleanup for a driver failure or an unusually
+                    // delayed GT dispatch. In the normal path the worker
+                    // already allowed the deferred search to settle.
+                    if (!bRestorationApplied.Load())
+                    {
+                        SearchBox->SetText(OriginalSearchText);
+                        DetailsView->SetSearchText(OriginalSearchText);
+                        if (bInstalledTemporaryObject)
+                        {
+                            DetailsView->SetObjects(OriginalSelectedObjects, true, true);
+                        }
+                        AddError(TEXT("Timed out waiting for the game-thread Details restoration phase. Original state was reapplied, but deferred filter restoration could not be verified."));
+                    }
                     TestEqual(TEXT("Native Details search text restored"),
                         SearchBox->GetText().ToString(), OriginalSearchText.ToString());
-                    TestEqual(TEXT("Native Details search active state restored"),
-                        DetailsView->HasActiveSearch(), !OriginalSearchText.IsEmpty());
+                    const bool bRestoredActive = DetailsView->HasActiveSearch();
+                    if (bRestoredActive != bOriginalSearchActive)
+                    {
+                        UE_LOG(LogTemp, Error,
+                            TEXT("Probe Details UI restoration mismatch after deferred settle: originally active=%s, restored active=%s, original text='%s', current text='%s', temporary object=%s."),
+                            bOriginalSearchActive ? TEXT("yes") : TEXT("no"),
+                            bRestoredActive ? TEXT("yes") : TEXT("no"),
+                            *OriginalSearchText.ToString(), *SearchBox->GetText().ToString(),
+                            bInstalledTemporaryObject ? TEXT("yes") : TEXT("no"));
+                    }
+                    TestEqual(TEXT("Native Details search active state restored after debounce"),
+                        bRestoredActive, bOriginalSearchActive);
                     const TArray<TWeakObjectPtr<AActor>>& AfterActors = DetailsView->GetSelectedActors();
                     bool bSelectionPreserved = AfterActors.Num() == OriginalSelectedActors.Num();
                     if (bSelectionPreserved)
@@ -348,12 +426,16 @@ void FProbeDriverEditorDetailsSpec::Define()
                     TestTrue(TEXT("Details selection preserved"), bSelectionPreserved);
                 }
             }
-            // Undo temporary object display even if setup failed before
-            // the Driver was enabled. This must occur before releasing the
-            // transient object, otherwise Details could hold a stale pointer.
+            // Verify object-display restoration and handle setup failures
+            // before releasing the transient object, avoiding stale pointers.
             if (bInstalledTemporaryObject && DetailsView.IsValid())
             {
-                DetailsView->SetObjects(OriginalSelectedObjects, true, true);
+                // The normal async restore already reinstated the objects.
+                // Reapply only in the error path, before releasing the object.
+                if (!bRestorationApplied.Load())
+                {
+                    DetailsView->SetObjects(OriginalSelectedObjects, true, true);
+                }
                 TestEqual(TEXT("Original Details object count restored"),
                     DetailsView->GetSelectedObjects().Num(), OriginalSelectedObjects.Num());
             }

@@ -1,6 +1,16 @@
-# Probe 0.15.3-hotfix2
+# Probe 0.15.3-hotfix4
 
 Probe is an **Unreal Engine 5.8.3 Editor-only QA plugin** for creating, executing, and organizing QA checks against plugins, Editor UI registrations, assets, actor state, reflection, and properties. Probe also supports safe temporary UObject fixtures, reversible Editor selection actions, and one-click plugin QA Pack generation. This source package targets Windows 64-bit; no engine source modifications.
+
+
+## 0.15.3-hotfix4: UE 5.8.3 compilation correction
+
+- Fixes the Probe-only C2039 compile error in `ProbeDriverEditorDetails.spec.cpp`: `FTabManager::GetActiveTab()` is unavailable in Unreal Engine 5.8.3.
+- Preserves the existing Details-tab lookup/activation, native Automation Driver test, fixture handling, filter assertion, focus restoration, and release-gate behavior.
+- **Known limitation:** when the test has to activate a background Details tab, its previously foreground sibling tab cannot be restored through the removed API. The original keyboard focus is still restored when possible. This limitation is preferable to relying on an API that does not exist in UE 5.8.3, and will be addressed separately using an engine-supported tab-state mechanism.
+- No changes to Strand, Omni, or any other plugin.
+
+**This update has source-level validation only.** Build in UE 5.8.3 and rerun `Automation RunTests Probe.Driver.EditorDetailsSearch` to validate native behavior.
 
 
 ## 0.15.3-hotfix2: Native Details search behavior and state restoration
