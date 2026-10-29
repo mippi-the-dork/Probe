@@ -199,6 +199,23 @@ namespace Probe
             {EProbeStepType::ActorFixtureIsHidden, TEXT("Test Actions"), TEXT("Temporary Actor Is Hidden"), TEXT("Verify the test-owned temporary actor is temporarily hidden in the Editor."), TargetField},
             {EProbeStepType::ActorFixtureDestroy, TEXT("Test Actions"), TEXT("Destroy Temporary Editor Actor"), TEXT("Destroy a test-owned temporary actor. Undestroyed fixtures are cleaned up after the test."), TargetField},
             // Probe 0.13.0: transform and attachment workflows never target production actors.
+            {EProbeStepType::UIWidgetClick, TEXT("Editor UI"), TEXT("UI Click Widget"), TEXT("Automation Driver clicks a live widget. Target: details:search or id:<automation ID>. Requires Allow Editor UI Input; non-reversible button actions remain the author's responsibility."), TargetField},
+            {EProbeStepType::UIWidgetTypeText, TEXT("Editor UI"), TEXT("UI Type Text Into Widget"), TEXT("Automation Driver clicks, Ctrl+A and types Expected Value. Target: details:search or id:<automation ID>. Details search is restored after the test; other text inputs are not."), TargetField | ValueField},
+            {EProbeStepType::UIDetailsSearchVisible, TEXT("Editor UI"), TEXT("UI Details Search Is Visible"), TEXT("Read-only: requires an existing visible Level Editor Details 1 search field. No new tab is spawned."), 0},
+            {EProbeStepType::UIDetailsSearchTextEquals, TEXT("Editor UI"), TEXT("UI Details Search Text Equals"), TEXT("Compare the real native Details 1 search-box text against Expected Value."), ValueField},
+            {EProbeStepType::UIDetailsSearchFilterActive, TEXT("Editor UI"), TEXT("UI Details Filter Is Active"), TEXT("Read the native Details 1 HasActiveSearch state after the Slate input debounce."), 0},
+            {EProbeStepType::UIWidgetExists, TEXT("Editor UI"), TEXT("UI Widget Exists"), TEXT("Read-only check for a unique tagged Slate widget or Details 1 search. Target: id:<automation ID> or details:search. No input permission required."), TargetField},
+            {EProbeStepType::UIWidgetNotExists, TEXT("Editor UI"), TEXT("UI Widget Does Not Exist"), TEXT("Read-only absence check. Target: id:<automation ID> or details:search. No input permission required."), TargetField},
+            {EProbeStepType::UIWidgetVisible, TEXT("Editor UI"), TEXT("UI Widget Is Visible"), TEXT("Verify a tagged widget exists and is visible in Slate. Does not click or activate hidden tabs."), TargetField},
+            {EProbeStepType::UIWidgetInteractable, TEXT("Editor UI"), TEXT("UI Widget Is Interactable"), TEXT("Verify the target is visible and enabled for interaction without generating input."), TargetField},
+            {EProbeStepType::UIWidgetTextEquals, TEXT("Editor UI"), TEXT("UI Widget Text Equals"), TEXT("Read and compare the target's exposed Slate text. Useful for text inputs and labels."), TargetField | ValueField},
+            {EProbeStepType::UIWidgetTextContains, TEXT("Editor UI"), TEXT("UI Widget Text Contains"), TEXT("Verify the widget text contains Expected Value (case-sensitive)."), TargetField | ValueField},
+            {EProbeStepType::UIWidgetTextNotEquals, TEXT("Editor UI"), TEXT("UI Widget Text Does Not Equal"), TEXT("Verify a present widget's text does not equal Expected Value."), TargetField | ValueField},
+            {EProbeStepType::UIWaitForWidgetVisible, TEXT("Editor UI"), TEXT("UI Wait For Widget Visible"), TEXT("Poll a widget until visible or Wait Timeout expires; no input is emitted. Configure Target and Wait Timeout (seconds)."), TargetField},
+            {EProbeStepType::UIWaitForWidgetTextEquals, TEXT("Editor UI"), TEXT("UI Wait For Widget Text Equals"), TEXT("Poll widget text until it equals Expected Value or Wait Timeout expires. No input is emitted."), TargetField | ValueField},
+            {EProbeStepType::UIDetailsSearchTextContains, TEXT("Editor UI"), TEXT("UI Details Search Text Contains"), TEXT("Read-only case-sensitive substring check for native Details 1 search."), ValueField},
+            {EProbeStepType::UIDetailsSearchTextNotEquals, TEXT("Editor UI"), TEXT("UI Details Search Text Does Not Equal"), TEXT("Verify native Details 1 search text is different from Expected Value."), ValueField},
+            {EProbeStepType::UIDetailsSearchFilterInactive, TEXT("Editor UI"), TEXT("UI Details Filter Is Inactive"), TEXT("Verify native Details 1 has no active search filter."), 0},
             {EProbeStepType::ActorFixtureSetLocation, TEXT("Test Actions"), TEXT("Set Temporary Actor Location"), TEXT("Move a test-owned actor. Expected Value: X,Y,Z (centimeters). Requires an actor class with a root component."), TargetField | ValueField},
             {EProbeStepType::ActorFixtureLocationNearlyEquals, TEXT("Test Actions"), TEXT("Temporary Actor Location Nearly Equals"), TEXT("Compare actor world location with X,Y,Z, using Numeric Tolerance (centimeters)."), TargetField | ValueField | ToleranceField},
             {EProbeStepType::ActorFixtureSetRotation, TEXT("Test Actions"), TEXT("Set Temporary Actor Rotation"), TEXT("Rotate a test-owned actor. Expected Value: Pitch,Yaw,Roll (degrees)."), TargetField | ValueField},
@@ -253,7 +270,15 @@ namespace Probe
             return TEXT("Actor State & Properties");
         }
         if (Category == TEXT("Plugins & Modules")) { return Name.Contains(TEXT("Module")) ? TEXT("Modules") : TEXT("Plugins"); }
-        if (Category == TEXT("Editor UI")) { return Name.Contains(TEXT("Tab")) ? TEXT("Tabs") : TEXT("Menus & Commands"); }
+        if (Category == TEXT("Editor UI"))
+        {
+            if (Name.StartsWith(TEXT("UI Wait"))) { return TEXT("Native Widget Waits"); }
+            if (Name.StartsWith(TEXT("UI Details"))) { return TEXT("Details Panel"); }
+            if (Name.StartsWith(TEXT("UI Widget")) && !Name.Contains(TEXT("Click")) && !Name.Contains(TEXT("Type Text")))
+            { return TEXT("Native Widget Assertions"); }
+            if (Name.StartsWith(TEXT("UI "))) { return TEXT("Native Widget Automation"); }
+            return Name.Contains(TEXT("Tab")) ? TEXT("Tabs") : TEXT("Menus & Commands");
+        }
         if (Category == TEXT("Editor State")) { return Name.Contains(TEXT("Console")) ? TEXT("Console Variables") : TEXT("Editor Lifecycle"); }
         if (Category == TEXT("Assets"))
         {

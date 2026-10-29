@@ -9,6 +9,7 @@
 #include "ProbeTestPack.h"
 #include "ProbeTestPackFactory.h"
 #include "ProbeEditorNavigation.h"
+#include "ProbeWidgetDiscovery.h"
 #include "AssetDefinition.h"
 #include "Modules/ModuleManager.h"
 #include "Interfaces/IPluginManager.h"
@@ -59,6 +60,7 @@
 #include "Framework/Application/SlateApplication.h"
 #include "Misc/PackageName.h"
 #include "HAL/PlatformTime.h"
+#include "Containers/Ticker.h"
 #include "InputCoreTypes.h"
 #include "ScopedTransaction.h"
 #include "Misc/TransactionObjectEvent.h"
@@ -147,7 +149,16 @@ namespace Probe
         if ((Fields & TargetField) && Step.Target.TrimStartAndEnd().IsEmpty()) { return TEXT("Choose a Target"); }
         if ((Fields & ClassField) && Step.ExpectedClass.TrimStartAndEnd().IsEmpty()) { return TEXT("Choose the expected class"); }
         if ((Fields & PropertyField) && Step.PropertyName.TrimStartAndEnd().IsEmpty()) { return TEXT("Enter a Property, Function, or Tag name"); }
-        if ((Fields & ValueField) && Step.ExpectedValue.TrimStartAndEnd().IsEmpty()) { return TEXT("Enter an expected value or search text"); }
+        // Empty text is a legitimate expected value for equality/inequality
+        // on text widgets, including an intentionally cleared Details search.
+        const bool bEmptyExpectedIsValid = Step.AssertionId.IsNone() &&
+            (Step.Type == EProbeStepType::UIWidgetTextEquals
+            || Step.Type == EProbeStepType::UIWidgetTextNotEquals
+            || Step.Type == EProbeStepType::UIWaitForWidgetTextEquals
+            || Step.Type == EProbeStepType::UIDetailsSearchTextEquals
+            || Step.Type == EProbeStepType::UIDetailsSearchTextNotEquals);
+        if ((Fields & ValueField) && Step.ExpectedValue.TrimStartAndEnd().IsEmpty() && !bEmptyExpectedIsValid)
+        { return TEXT("Enter an expected value or search text"); }
         if (Step.AssertionId.IsNone() &&
             (Step.Type == EProbeStepType::ActorFixtureSetLocation
              || Step.Type == EProbeStepType::ActorFixtureLocationNearlyEquals
@@ -170,6 +181,18 @@ namespace Probe
                 { return TEXT("Each vector or rotation component must be a finite number"); }
             }
         }
+        if (Step.AssertionId.IsNone() &&
+            ((Step.Type == EProbeStepType::UIWidgetClick || Step.Type == EProbeStepType::UIWidgetTypeText)
+            || (Step.Type >= EProbeStepType::UIWidgetExists && Step.Type <= EProbeStepType::UIWaitForWidgetTextEquals))
+            && !Step.Target.Equals(TEXT("details:search"), ESearchCase::IgnoreCase)
+            && !(Step.Target.StartsWith(TEXT("id:"), ESearchCase::IgnoreCase)
+                && Step.Target.Len() > 3 && !Step.Target.RightChop(3).TrimStartAndEnd().IsEmpty()))
+        { return TEXT("Use details:search or id:<Slate automation ID>, not screen coordinates"); }
+        if (Step.AssertionId.IsNone() &&
+            (Step.Type == EProbeStepType::UIWaitForWidgetVisible || Step.Type == EProbeStepType::UIWaitForWidgetTextEquals)
+            && (!FMath::IsFinite(Step.UIWaitTimeoutSeconds)
+                || Step.UIWaitTimeoutSeconds < 0.1 || Step.UIWaitTimeoutSeconds > 30.0))
+        { return TEXT("Wait Timeout must be between 0.1 and 30 seconds"); }
         if (Step.Type == EProbeStepType::ObjectPropertyNumericInRange && Step.AssertionId.IsNone())
         {
             FString Lower, Upper;
@@ -193,6 +216,12 @@ namespace Probe
                 && !Asset.bAllowTransientEditorActors)
             {
                 return FString::Printf(TEXT("Step %d: Enable 'Allow Transient Editor Actors' to authorize temporary level actors."), Index + 1);
+            }
+            if (Step.AssertionId.IsNone() &&
+                (Step.Type == EProbeStepType::UIWidgetClick || Step.Type == EProbeStepType::UIWidgetTypeText)
+                && !Asset.bAllowEditorUIInput)
+            {
+                return FString::Printf(TEXT("Step %d: Enable 'Allow Editor UI Input' to authorize live Editor interactions."), Index + 1);
             }
             const FString Issue = StepConfigurationIssue(Asset.Steps[Index]);
             if (!Issue.IsEmpty()) { return FString::Printf(TEXT("Step %d: %s"), Index + 1, *Issue); }
@@ -701,6 +730,30 @@ namespace Probe
             Step.Target = TEXT("ActorA"); Step.ExpectedValue = TEXT("0,45,0"); break;
         case EProbeStepType::ActorFixtureScaleNotNearlyEquals:
             Step.Target = TEXT("ActorA"); Step.ExpectedValue = TEXT("2,1,1"); break;
+        case EProbeStepType::UIWidgetClick:
+            Step.Target = TEXT("details:search"); break;
+        case EProbeStepType::UIWidgetTypeText:
+            Step.Target = TEXT("details:search"); Step.ExpectedValue = TEXT("ProbeTemporarySearch"); break;
+        case EProbeStepType::UIDetailsSearchVisible:
+        case EProbeStepType::UIDetailsSearchFilterActive:
+            break;
+        case EProbeStepType::UIDetailsSearchTextEquals:
+        case EProbeStepType::UIDetailsSearchTextContains:
+        case EProbeStepType::UIDetailsSearchTextNotEquals:
+            Step.ExpectedValue = TEXT("ProbeTemporarySearch"); break;
+        case EProbeStepType::UIWidgetExists:
+        case EProbeStepType::UIWidgetNotExists:
+        case EProbeStepType::UIWidgetVisible:
+        case EProbeStepType::UIWidgetInteractable:
+        case EProbeStepType::UIWaitForWidgetVisible:
+            Step.Target = TEXT("details:search"); break;
+        case EProbeStepType::UIWidgetTextEquals:
+        case EProbeStepType::UIWidgetTextContains:
+        case EProbeStepType::UIWidgetTextNotEquals:
+        case EProbeStepType::UIWaitForWidgetTextEquals:
+            Step.Target = TEXT("details:search"); Step.ExpectedValue = TEXT("ProbeTemporarySearch"); break;
+        case EProbeStepType::UIDetailsSearchFilterInactive:
+            break;
 
         }
         return Step;
@@ -1933,6 +1986,138 @@ private:
     }
 };
 
+// Discovery surface shared by the top-level browser and the per-step Target picker.
+// Only explicit Automation Driver IDs are offered; duplicate IDs cannot be applied.
+DECLARE_DELEGATE_OneParam(FOnProbeWidgetTargetChosen, const FString&);
+
+class SProbeWidgetTargetPicker : public SCompoundWidget
+{
+public:
+    SLATE_BEGIN_ARGS(SProbeWidgetTargetPicker) {}
+        SLATE_EVENT(FOnProbeWidgetTargetChosen, OnChosen)
+    SLATE_END_ARGS()
+
+    void Construct(const FArguments& Args)
+    {
+        OnChosen = Args._OnChosen;
+        ChildSlot
+        [ SNew(SBox).WidthOverride(560.0f)
+          [ SNew(SVerticalBox)
+            + SVerticalBox::Slot().AutoHeight().Padding(8, 7, 8, 4)
+            [ SNew(STextBlock).Text(LOCTEXT("WidgetTargetPickerTitle", "Live Widget Targets"))
+              .Font(FAppStyle::GetFontStyle("HeadingExtraSmall")) ]
+            + SVerticalBox::Slot().AutoHeight().Padding(8, 0, 8, 5)
+            [ SNew(STextBlock).AutoWrapText(true)
+              .Text(LOCTEXT("WidgetTargetPickerInfo", "Only explicitly tagged Automation Driver IDs can be selected. Open the plugin's UI first. Untagged widgets are intentionally omitted."))
+              .ColorAndOpacity(FSlateColor::UseSubduedForeground()) ]
+            + SVerticalBox::Slot().AutoHeight().Padding(8, 0, 8, 5)
+            [ SNew(SHorizontalBox)
+                + SHorizontalBox::Slot().FillWidth(1.0f)
+                [ SNew(SSearchBox)
+                  .HintText(LOCTEXT("WidgetTargetSearch", "Filter ID, window, or widget type..."))
+                  .OnTextChanged(this, &SProbeWidgetTargetPicker::FilterChanged) ]
+                + SHorizontalBox::Slot().AutoWidth().Padding(5, 0, 0, 0)
+                [ SNew(SButton)
+                  .ToolTipText(LOCTEXT("WidgetTargetRefreshTip", "Rescan currently visible Slate windows without changing Editor state"))
+                  .OnClicked(this, &SProbeWidgetTargetPicker::Rescan)
+                  [ SNew(SImage).Image(FAppStyle::GetBrush("Icons.Refresh")) ] ] ]
+            + SVerticalBox::Slot().AutoHeight().Padding(8, 0, 8, 5)
+            [ SAssignNew(SummaryText, STextBlock).ColorAndOpacity(FSlateColor::UseSubduedForeground()) ]
+            + SVerticalBox::Slot().FillHeight(1).Padding(6, 0, 6, 4)
+            [ SNew(SBox).HeightOverride(345.0f)
+              [ SNew(SScrollBox) + SScrollBox::Slot()
+                [ SAssignNew(Rows, SVerticalBox) ] ] ]
+            + SVerticalBox::Slot().AutoHeight().Padding(8, 1, 8, 8)
+            [ SNew(STextBlock).AutoWrapText(true)
+              .ColorAndOpacity(FSlateColor::UseSubduedForeground())
+              .Text(LOCTEXT("WidgetTargetPickerFooter", "Red 'duplicate' targets are ambiguous and cannot be inserted. For the native Level Editor Details search, use details:search manually.")) ]
+          ] ];
+        Scan();
+    }
+
+private:
+    TArray<ProbeWidgetDiscovery::FCandidate> Candidates;
+    TSharedPtr<SVerticalBox> Rows;
+    TSharedPtr<STextBlock> SummaryText;
+    FOnProbeWidgetTargetChosen OnChosen;
+    FString Filter;
+
+    void FilterChanged(const FText& NewText) { Filter = NewText.ToString(); Rebuild(); }
+    FReply Rescan() { Scan(); return FReply::Handled(); }
+    void Scan() { Candidates = ProbeWidgetDiscovery::Collect(); Rebuild(); }
+    void Rebuild()
+    {
+        if (!Rows.IsValid()) { return; }
+        Rows->ClearChildren();
+        int32 Duplicates = 0;
+        for (const auto& Candidate : Candidates) { if (!Candidate.IsUnique()) { ++Duplicates; } }
+        if (SummaryText.IsValid())
+        {
+            SummaryText->SetText(FText::FromString(FString::Printf(
+                TEXT("%d tagged widgets  |  %d ambiguous matches  |  read-only scan"), Candidates.Num(), Duplicates)));
+        }
+        int32 Shown = 0;
+        for (const auto& Candidate : Candidates)
+        {
+            const FString Searchable = Candidate.Id + TEXT(" ") + Candidate.WindowTitle + TEXT(" ") + Candidate.WidgetType;
+            if (!Filter.IsEmpty() && !Searchable.Contains(Filter, ESearchCase::IgnoreCase)) { continue; }
+            if (Shown++ >= 250) { break; }
+            const FString Selector = Candidate.Selector();
+            const bool bUnique = Candidate.IsUnique();
+            const FString Status = bUnique
+                ? (Candidate.bVisible ? (Candidate.bEnabled ? TEXT("Visible / Enabled") : TEXT("Visible / Disabled")) : TEXT("Hidden"))
+                : FString::Printf(TEXT("DUPLICATE x%d"), Candidate.Matches);
+            Rows->AddSlot().AutoHeight().Padding(1, 2)
+            [ SNew(SBorder).BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder")).Padding(5)
+              [ SNew(SHorizontalBox)
+                + SHorizontalBox::Slot().FillWidth(1.0f).VAlign(VAlign_Center)
+                [ SNew(SVerticalBox)
+                    + SVerticalBox::Slot().AutoHeight()
+                    [ SNew(STextBlock).Text(FText::FromString(Candidate.Id)) ]
+                    + SVerticalBox::Slot().AutoHeight()
+                    [ SNew(STextBlock)
+                      .Text(FText::FromString(Candidate.WindowTitle + TEXT("  |  ") + Candidate.WidgetType))
+                      .Font(FAppStyle::GetFontStyle("SmallFont"))
+                      .ColorAndOpacity(FSlateColor::UseSubduedForeground()) ]
+                    + SVerticalBox::Slot().AutoHeight()
+                    [ SNew(STextBlock).Text(FText::FromString(Status))
+                      .Font(FAppStyle::GetFontStyle("SmallFont"))
+                      .ColorAndOpacity(bUnique ? FSlateColor::UseSubduedForeground() : FSlateColor(FLinearColor(1.0f, 0.45f, 0.38f))) ] ]
+                + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(5, 0)
+                [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
+                  .IsEnabled(bUnique)
+                  .ToolTipText(LOCTEXT("WidgetTargetCopyTip", "Copy the id: selector to the clipboard"))
+                  .OnClicked_Lambda([Selector]()
+                  { FPlatformApplicationMisc::ClipboardCopy(*Selector); return FReply::Handled(); })
+                  [ SNew(STextBlock).Text(LOCTEXT("WidgetTargetCopy", "Copy")) ] ]
+                + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+                [ SNew(SButton).IsEnabled(bUnique && OnChosen.IsBound())
+                  .ToolTipText(LOCTEXT("WidgetTargetUseTip", "Insert this selector in the selected Probe step"))
+                  .OnClicked_Lambda([this, Selector]()
+                  {
+                      // Applying the target rebuilds its step card and may destroy
+                      // this popup. Copy the callback and close the menu first.
+                      const FOnProbeWidgetTargetChosen Chosen = OnChosen;
+                      FSlateApplication::Get().DismissAllMenus();
+                      Chosen.ExecuteIfBound(Selector);
+                      return FReply::Handled();
+                  })
+                  [ SNew(STextBlock).Text(LOCTEXT("WidgetTargetUse", "Use")) ] ]
+              ] ];
+        }
+        if (Shown == 0)
+        {
+            Rows->AddSlot().AutoHeight().Padding(8)
+            [ SNew(STextBlock).AutoWrapText(true).Text(LOCTEXT("WidgetTargetNone", "No matching tagged widgets. Open a plugin panel with Automation Driver IDs and click Refresh.")) ];
+        }
+        else if (Shown > 250)
+        {
+            Rows->AddSlot().AutoHeight().Padding(8)
+            [ SNew(STextBlock).Text(LOCTEXT("WidgetTargetCap", "Showing first 250 matches. Narrow the filter to see more.")) ];
+        }
+    }
+};
+
 // A result row uses native button styling while supporting double-click-to-edit.
 class SProbeResultButton : public SButton
 {
@@ -2036,6 +2221,7 @@ public:
                             [
                                 SNew(SButton)
                                 .ButtonStyle(FAppStyle::Get(), "SimpleButton")
+                                .AddMetaData(MakeShared<FDriverIdMetaData>(FName(TEXT("Probe.Workspace.RefreshTests"))))
                                 .ToolTipText(LOCTEXT("RefreshTip", "Refresh available Probe tests"))
                                 .OnClicked(this, &SProbeWorkspace::RefreshClicked)
                                 [ SNew(SImage).Image(FAppStyle::GetBrush("Icons.Refresh")) ]
@@ -2088,6 +2274,7 @@ public:
                             [
                                 SNew(SButton)
                                 .IsEnabled(this, &SProbeWorkspace::HasSelectedAsset)
+                                .AddMetaData(MakeShared<FDriverIdMetaData>(FName(TEXT("Probe.Workspace.RunSelected"))))
                                 .ToolTipText(LOCTEXT("RunSelectedTip", "Run the selected test without saving its unsaved edits"))
                                 .OnClicked(this, &SProbeWorkspace::RunSelected)
                                 [
@@ -2139,11 +2326,21 @@ public:
                         SNew(SHorizontalBox)
                         + SHorizontalBox::Slot().FillWidth(1.0f).VAlign(VAlign_Center)
                         [ SNew(STextBlock).Text(LOCTEXT("DefinitionTitle", "Test Definition")) ]
+                        + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 6, 0)
+                        [
+                            SNew(SComboButton)
+                            .ToolTipText(LOCTEXT("OpenWidgetTargetBrowser", "Find explicitly tagged widgets in currently visible Unreal Editor windows. Copy stable id: selectors for your UI steps."))
+                            .OnGetMenuContent_Lambda([]() -> TSharedRef<SWidget>
+                            { return SNew(SProbeWidgetTargetPicker); })
+                            .ButtonContent()
+                            [ SNew(STextBlock).Text(LOCTEXT("WidgetTargets", "Widget Targets")) ]
+                        ]
                         + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
                         [
                             SNew(SComboButton)
                             .IsEnabled(this, &SProbeWorkspace::HasSelectedAsset)
                             .OnGetMenuContent(this, &SProbeWorkspace::BuildAddStepMenu)
+                            .AddMetaData(MakeShared<FDriverIdMetaData>(FName(TEXT("Probe.Workspace.AddStep"))))
                             .ToolTipText(LOCTEXT("AddStepTip", "Add an assertion step to this test"))
                             .ButtonContent()
                             [
@@ -2296,6 +2493,11 @@ public:
 
     void RunAssetPaths(const TArray<FString>& AssetPaths)
     {
+        if (bRunInProgress)
+        {
+            FeedbackMessage = LOCTEXT("ProbeRunAlreadyActive", "A Probe run is already in progress. Wait for it to finish before starting another.");
+            return;
+        }
         Results.Reset();
         ActiveResultFilter = EResultFilter::All;
         SelectedResultIndex = INDEX_NONE;
@@ -2334,6 +2536,8 @@ private:
     TSharedPtr<SWidgetSwitcher> ResultViewSwitcher;
     TSharedPtr<SHorizontalBox> ResultTabs;
     TArray<Probe::FTestResult> Results;
+    TArray<int32> QueuedTestResultIndices;
+    bool bRunInProgress = false;
     enum class EResultFilter : uint8 { All, Passed, Failed, Skipped, Error };
     EResultFilter ActiveResultFilter = EResultFilter::All;
     int32 SelectedResultIndex = INDEX_NONE;
@@ -2690,6 +2894,34 @@ private:
                 SNew(SComboButton)
                 .Visibility_Lambda([TestRef, Index, Field]()
                 {
+                    if (Field != EStepTextField::Target) { return EVisibility::Collapsed; }
+                    const UProbeTestAsset* Test = TestRef.Get();
+                    if (!Test || !Test->Steps.IsValidIndex(Index) || !Test->Steps[Index].AssertionId.IsNone())
+                    { return EVisibility::Collapsed; }
+                    const EProbeStepType Type = Test->Steps[Index].Type;
+                    return Type == EProbeStepType::UIWidgetClick || Type == EProbeStepType::UIWidgetTypeText
+                        || (Type >= EProbeStepType::UIWidgetExists && Type <= EProbeStepType::UIWaitForWidgetTextEquals)
+                        ? EVisibility::Visible : EVisibility::Collapsed;
+                })
+                .ToolTipText(LOCTEXT("FindWidgetTargetTip", "Discover live Automation Driver IDs and insert a unique widget target"))
+                .OnGetMenuContent_Lambda([this, TestRef, Index]() -> TSharedRef<SWidget>
+                {
+                    return SNew(SProbeWidgetTargetPicker)
+                        .OnChosen(FOnProbeWidgetTargetChosen::CreateLambda([this, TestRef, Index](const FString& Selector)
+                        {
+                            ChangeStep(TestRef, Index, LOCTEXT("ChooseWidgetTargetTxn", "Choose Probe Widget Target"),
+                                [Selector](FProbeTestStep& Step) { Step.Target = Selector; }, true);
+                            FeedbackMessage = FText::FromString(TEXT("Widget target selected: ") + Selector);
+                        }));
+                })
+                .ButtonContent()
+                [ SNew(STextBlock).Text(LOCTEXT("FindWidgetTargetButton", "Find...")) ]
+            ]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(4, 0, 0, 0)
+            [
+                SNew(SComboButton)
+                .Visibility_Lambda([TestRef, Index, Field]()
+                {
                     const UProbeTestAsset* Asset = TestRef.Get();
                     if (!Asset || !Asset->Steps.IsValidIndex(Index)) { return EVisibility::Collapsed; }
                     const EProbeStepType Type = Asset->Steps[Index].Type;
@@ -2862,6 +3094,40 @@ private:
         ];
     }
 
+    void AddUIWaitTimeoutField(const TSharedRef<SVerticalBox>& Body, TWeakObjectPtr<UProbeTestAsset> TestRef, int32 Index)
+    {
+        Body->AddSlot().AutoHeight().Padding(2, 2)
+        [
+            SNew(SHorizontalBox)
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+            [ SNew(SBox).WidthOverride(134.0f)
+              [ SNew(STextBlock).Text(LOCTEXT("UIWaitTimeout", "Wait Timeout (s)"))
+                .ColorAndOpacity(FSlateColor::UseSubduedForeground()) ] ]
+            + SHorizontalBox::Slot().FillWidth(1.0f).VAlign(VAlign_Center)
+            [
+                SNew(SNumericEntryBox<double>)
+                .MinValue(0.1).MaxValue(30.0).MinSliderValue(0.1).MaxSliderValue(30.0)
+                .AllowSpin(true)
+                .Value_Lambda([TestRef, Index]() -> TOptional<double>
+                {
+                    const UProbeTestAsset* Asset = TestRef.Get();
+                    return Asset && Asset->Steps.IsValidIndex(Index)
+                        ? TOptional<double>(Asset->Steps[Index].UIWaitTimeoutSeconds) : TOptional<double>();
+                })
+                .OnValueCommitted_Lambda([this, TestRef, Index](double Value, ETextCommit::Type)
+                {
+                    if (!FMath::IsFinite(Value)) { return; }
+                    const double Clamped = FMath::Clamp(Value, 0.1, 30.0);
+                    const UProbeTestAsset* Test = TestRef.Get();
+                    if (!Test || !Test->Steps.IsValidIndex(Index)
+                        || Test->Steps[Index].UIWaitTimeoutSeconds == Clamped) { return; }
+                    ChangeStep(TestRef, Index, LOCTEXT("UIWaitTimeoutEdit", "Edit Probe UI Wait Timeout"),
+                        [Clamped](FProbeTestStep& Step) { Step.UIWaitTimeoutSeconds = Clamped; });
+                })
+            ]
+        ];
+    }
+
     FString StepSummary(const FProbeTestStep& Step) const
     {
         const uint8 Fields = Probe::StepFields(Step);
@@ -2875,6 +3141,9 @@ private:
         {
             Summary += FString::Printf(TEXT("  |  class: %s"), *Step.ExpectedClass);
         }
+        if (Step.AssertionId.IsNone() && (Step.Type == EProbeStepType::UIWaitForWidgetVisible
+            || Step.Type == EProbeStepType::UIWaitForWidgetTextEquals))
+        { Summary += FString::Printf(TEXT("  |  wait: %.1f s"), Step.UIWaitTimeoutSeconds); }
         if (Fields & Probe::PropertyField)
         {
             Summary += FString::Printf(TEXT("  |  %s"), *Step.PropertyName);
@@ -3130,7 +3399,11 @@ private:
             const uint8 StepFieldMask = Probe::StepFields(Step);
             if (StepFieldMask & Probe::TargetField)
             {
-                const FText Label = Type == EProbeStepType::FixtureCreateObject ? LOCTEXT("FixtureClassPath", "Object Class")
+                const FText Label = (Step.AssertionId.IsNone() && (Type == EProbeStepType::UIWidgetClick
+                    || Type == EProbeStepType::UIWidgetTypeText
+                    || (Type >= EProbeStepType::UIWidgetExists && Type <= EProbeStepType::UIWaitForWidgetTextEquals)))
+                    ? LOCTEXT("UIWidgetSelectorLabel", "Widget Selector")
+                    : Type == EProbeStepType::FixtureCreateObject ? LOCTEXT("FixtureClassPath", "Object Class")
                     : Type == EProbeStepType::FixtureSetProperty || Type == EProbeStepType::FixturePropertyEquals
                     || Type == EProbeStepType::FixturePropertyNotEquals || Type == EProbeStepType::FixtureObjectExists
                     || Type == EProbeStepType::FixtureDestroyObject ? LOCTEXT("FixtureIdentifier", "Fixture ID")
@@ -3248,6 +3521,10 @@ private:
                       ? LOCTEXT("ActorFixtureLabelPattern", "Outliner Label Text")
                     : Type == EProbeStepType::ActorFixtureFolderNotEquals
                       ? LOCTEXT("ActorFixtureOtherFolder", "Forbidden Outliner Folder")
+                    : Type == EProbeStepType::UIWidgetTypeText ? LOCTEXT("UIInputTextLabel", "Text To Enter")
+                    : Type == EProbeStepType::UIWidgetTextContains || Type == EProbeStepType::UIDetailsSearchTextContains
+                      ? LOCTEXT("UIContainsExpectedLabel", "Contained Text")
+                    : Type == EProbeStepType::UIWaitForWidgetTextEquals ? LOCTEXT("UIWaitExpectedLabel", "Awaited Text")
                     : Type == EProbeStepType::FixtureCreateObject ? LOCTEXT("NewFixtureIdentifier", "New Fixture ID")
                     : Type == EProbeStepType::FixtureSetProperty ? LOCTEXT("FixtureNewPropertyValue", "New Value")
                     : Type == EProbeStepType::ActorFolderEquals || Type == EProbeStepType::AssetPackagePathEquals
@@ -3261,6 +3538,9 @@ private:
                     : LOCTEXT("StepExpected", "Expected Value"));
             }
             if (StepFieldMask & Probe::ToleranceField) { AddToleranceField(Fields, TestRef, Index); }
+            if (Step.AssertionId.IsNone() && (Type == EProbeStepType::UIWaitForWidgetVisible
+                || Type == EProbeStepType::UIWaitForWidgetTextEquals))
+            { AddUIWaitTimeoutField(Fields, TestRef, Index); }
             if (bStepNotesShown)
             {
                 AddStringField(Fields, TestRef, Index, EStepTextField::Description,
@@ -3475,6 +3755,72 @@ private:
                     .ColorAndOpacity(FSlateColor::UseSubduedForeground())
                     .Text(LOCTEXT("WorldPermissionNotice", "These steps create or change test-owned actors in the active Editor level. Cleanup is attempted even on failure, but the level may become dirty. Use a disposable map. This authorization is independent of test readiness."))
                 ]
+            ]
+        ];
+        // UI input permission is independent of world fixtures and is OFF on
+        // legacy tests. Authors can opt in from the actual Probe test editor.
+        Settings->AddSlot().AutoHeight().Padding(0, 2, 0, 5)
+        [
+            SNew(SBorder)
+            .BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
+            .Padding(FMargin(10.0f, 8.0f))
+            .Visibility_Lambda([TestRef]()
+            {
+                const UProbeTestAsset* Test = TestRef.Get();
+                if (!Test) { return EVisibility::Collapsed; }
+                for (const FProbeTestStep& Step : Test->Steps)
+                {
+                    if (Step.AssertionId.IsNone() &&
+                        (Step.Type == EProbeStepType::UIWidgetClick || Step.Type == EProbeStepType::UIWidgetTypeText))
+                    { return EVisibility::Visible; }
+                }
+                return EVisibility::Collapsed;
+            })
+            [
+                SNew(SVerticalBox)
+                + SVerticalBox::Slot().AutoHeight()
+                [
+                    SNew(SHorizontalBox)
+                    + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 8, 0)
+                    [ SNew(SImage).Image(FAppStyle::GetBrush("Icons.Warning")) ]
+                    + SHorizontalBox::Slot().FillWidth(1.0f).VAlign(VAlign_Center)
+                    [
+                        SNew(STextBlock).Font(FAppStyle::GetFontStyle("NormalFontBold"))
+                        .Text_Lambda([TestRef]()
+                        {
+                            const UProbeTestAsset* Test = TestRef.Get();
+                            return Test && Test->bAllowEditorUIInput
+                                ? LOCTEXT("NativeUIAuthorized", "LIVE EDITOR UI  |  Authorized")
+                                : LOCTEXT("NativeUIBlocked", "LIVE EDITOR UI  |  Not Authorized");
+                        })
+                    ]
+                    + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+                    [
+                        SNew(SButton)
+                        .ToolTipText(LOCTEXT("NativeUIPermissionTip", "Allow real simulated mouse and keyboard input in Unreal Editor. Actions on arbitrary plugin controls can have persistent side effects. Use disposable content when testing destructive buttons."))
+                        .Text_Lambda([TestRef]()
+                        {
+                            const UProbeTestAsset* Test = TestRef.Get();
+                            return Test && Test->bAllowEditorUIInput
+                                ? LOCTEXT("RevokeUIPermission", "Revoke Authorization")
+                                : LOCTEXT("GrantUIPermission", "Authorize UI Input");
+                        })
+                        .OnClicked_Lambda([this, TestRef]()
+                        {
+                            const UProbeTestAsset* Test = TestRef.Get();
+                            if (!Test) { return FReply::Handled(); }
+                            const bool bGrant = !Test->bAllowEditorUIInput;
+                            ChangeAsset(TestRef, LOCTEXT("UIPermissionTransaction", "Change Probe Live UI Permission"),
+                                [bGrant](UProbeTestAsset& Asset) { Asset.bAllowEditorUIInput = bGrant; });
+                            RebuildTestEditor();
+                            return FReply::Handled();
+                        })
+                    ]
+                ]
+                + SVerticalBox::Slot().AutoHeight().Padding(25, 5, 0, 0)
+                [ SNew(STextBlock).AutoWrapText(true)
+                  .ColorAndOpacity(FSlateColor::UseSubduedForeground())
+                  .Text(LOCTEXT("NativeUIWarning", "Probe restores the native Details search text and keyboard focus, but cannot undo arbitrary button clicks or edits to other controls.")) ]
             ]
         ];
         Settings->AddSlot().AutoHeight().Padding(0, 7, 0, 0)
@@ -3793,7 +4139,14 @@ private:
 
     void ExecuteAsset(UProbeTestAsset* Asset)
     {
-        Results.Add(Probe::RunTest(Asset));
+        if (!Asset) { return; }
+        Probe::FTestResult Pending;
+        Pending.Name = Asset->GetName();
+        Pending.Id = Asset->TestId.ToString();
+        Pending.AssetPath = Asset->GetPathName();
+        Pending.Status = Probe::EResultStatus::Skipped;
+        Pending.Detail = TEXT("Queued; not yet executed.");
+        QueuedTestResultIndices.Add(Results.Add(MoveTemp(Pending)));
     }
 
     static const FSlateBrush* ResultIcon(Probe::EResultStatus Status)
@@ -4249,6 +4602,11 @@ public:
     void RunPackPath(const FString& PackPath) { ExecutePackPath(PackPath); }
     void RunExplicitTestPaths(const TArray<FString>& Paths)
     {
+        if (bRunInProgress)
+        {
+            FeedbackMessage = LOCTEXT("ProbeRunAlreadyActive", "A Probe run is already in progress. Wait for it to finish before starting another.");
+            return;
+        }
         ActiveResultFilter = EResultFilter::All;
         SelectedResultIndex = INDEX_NONE;
         Results.Reset();
@@ -4277,13 +4635,40 @@ public:
 private:
     void ExecutePackPath(FString PackPath)
     {
+        if (bRunInProgress)
+        {
+            FeedbackMessage = LOCTEXT("ProbeRunAlreadyActive", "A Probe run is already in progress. Wait for it to finish before starting another.");
+            return;
+        }
         UProbeTestPack* Pack = LoadObject<UProbeTestPack>(nullptr, *PackPath);
         if (!Pack)
         {
             FeedbackMessage = LOCTEXT("PackMissing", "The selected Probe Pack could not be loaded.");
             return;
         }
-        Results = Probe::RunPack(Pack);
+        Results.Reset();
+        QueuedTestResultIndices.Reset();
+        for (const TSoftObjectPtr<UProbeTestAsset>& Reference : Pack->Tests)
+        {
+            const Probe::FReferenceHealth Health = Probe::InspectTestReference(Reference.ToSoftObjectPath());
+            if (!Health.IsUsable())
+            {
+                Probe::FTestResult Missing;
+                Missing.Name = Reference.ToString(); Missing.AssetPath = Reference.ToString();
+                Missing.Status = Probe::EResultStatus::Error; Missing.Detail = Health.Explanation;
+                Results.Add(MoveTemp(Missing));
+                continue;
+            }
+            if (UProbeTestAsset* Test = Reference.LoadSynchronous()) { ExecuteAsset(Test); }
+            else
+            {
+                Probe::FTestResult Missing;
+                Missing.Name = Reference.ToString(); Missing.AssetPath = Reference.ToString();
+                Missing.Status = Probe::EResultStatus::Error;
+                Missing.Detail = TEXT("Probe Pack reference could not be loaded.");
+                Results.Add(MoveTemp(Missing));
+            }
+        }
         ActiveResultFilter = EResultFilter::All;
         SelectedResultIndex = INDEX_NONE;
         FeedbackMessage = FText::FromString(FString::Printf(TEXT("Ran pack '%s' (%d tests)"), *Pack->GetName(), Results.Num()));
@@ -4318,6 +4703,11 @@ private:
 
     FReply RunSelected()
     {
+        if (bRunInProgress)
+        {
+            FeedbackMessage = LOCTEXT("ProbeRunAlreadyActive", "A Probe run is already in progress. Wait for it to finish before starting another.");
+            return FReply::Handled();
+        }
         ActiveResultFilter = EResultFilter::All;
         SelectedResultIndex = INDEX_NONE;
         Results.Reset();
@@ -4334,6 +4724,11 @@ private:
 
     FReply RunAll()
     {
+        if (bRunInProgress)
+        {
+            FeedbackMessage = LOCTEXT("ProbeRunAlreadyActive", "A Probe run is already in progress. Wait for it to finish before starting another.");
+            return FReply::Handled();
+        }
         RefreshAssets();
         ActiveResultFilter = EResultFilter::All;
         SelectedResultIndex = INDEX_NONE;
@@ -4350,6 +4745,11 @@ private:
 
     FReply RerunProblems()
     {
+        if (bRunInProgress)
+        {
+            FeedbackMessage = LOCTEXT("ProbeRunAlreadyActive", "A Probe run is already in progress. Wait for it to finish before starting another.");
+            return FReply::Handled();
+        }
         TArray<FString> Paths;
         for (const Probe::FTestResult& Result : Results)
         {
@@ -4387,12 +4787,57 @@ private:
         return FReply::Handled();
     }
 
+    void StartNextQueuedTest()
+    {
+        if (QueuedTestResultIndices.IsEmpty())
+        {
+            bRunInProgress = false;
+            LastRunTime = FDateTime::Now();
+            LastRunDurationMs = 0.0;
+            for (const Probe::FTestResult& Result : Results) { LastRunDurationMs += Result.DurationMs; }
+            FeedbackMessage = LOCTEXT("RunCompleted", "Run complete. Select a result for diagnostics.");
+            ShowResults();
+            return;
+        }
+        const int32 ResultIndex = QueuedTestResultIndices[0];
+        QueuedTestResultIndices.RemoveAt(0);
+        const FString AssetPath = Results[ResultIndex].AssetPath;
+        UProbeTestAsset* Asset = FindObject<UProbeTestAsset>(nullptr, *AssetPath);
+        if (!Asset) { Asset = LoadObject<UProbeTestAsset>(nullptr, *AssetPath); }
+        if (!Asset)
+        {
+            Results[ResultIndex].Status = Probe::EResultStatus::Error;
+            Results[ResultIndex].Detail = TEXT("Queued Probe Test could not be loaded.");
+            StartNextQueuedTest();
+            return;
+        }
+        TWeakPtr<SProbeWorkspace> WeakWorkspace = SharedThis(this);
+        Probe::RunTestAsync(Asset, [WeakWorkspace, ResultIndex](Probe::FTestResult Finished)
+        {
+            if (TSharedPtr<SProbeWorkspace> Workspace = WeakWorkspace.Pin())
+            {
+                if (!Workspace->bRunInProgress || !Workspace->Results.IsValidIndex(ResultIndex)) { return; }
+                Workspace->Results[ResultIndex] = MoveTemp(Finished);
+                Workspace->ShowResults();
+                // Resume on a later Editor tick so synchronous legacy test
+                // packs don't form an unbounded nested callback stack.
+                FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+                    [WeakWorkspace](float)
+                    {
+                        if (TSharedPtr<SProbeWorkspace> Workspace = WeakWorkspace.Pin())
+                        { Workspace->StartNextQueuedTest(); }
+                        return false;
+                    }));
+            }
+        });
+    }
+
     void RecordRunCompleted()
     {
-        LastRunTime = FDateTime::Now();
-        LastRunDurationMs = 0.0;
-        for (const Probe::FTestResult& Result : Results) { LastRunDurationMs += Result.DurationMs; }
-        FeedbackMessage = LOCTEXT("RunCompleted", "Run complete. Select a result for diagnostics.");
+        if (bRunInProgress) { return; }
+        bRunInProgress = true;
+        FeedbackMessage = LOCTEXT("RunInProgress", "Running Probe tests. Native UI steps execute asynchronously; results are shown as they finish.");
+        StartNextQueuedTest();
     }
 
     FReply ExportReport()

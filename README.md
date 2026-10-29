@@ -1,7 +1,51 @@
-# Probe 0.15.3-hotfix4
+# Probe 0.15.4-dev4
 
 Probe is an **Unreal Engine 5.8.3 Editor-only QA plugin** for creating, executing, and organizing QA checks against plugins, Editor UI registrations, assets, actor state, reflection, and properties. Probe also supports safe temporary UObject fixtures, reversible Editor selection actions, and one-click plugin QA Pack generation. This source package targets Windows 64-bit; no engine source modifications.
 
+
+## 0.15.4-dev4: Discoverable native widget targets
+
+**Live Widget Targets** introduces a read-only Slate target browser in the **Test Definition** toolbar, and a context-sensitive **Find...** picker next to **Widget Selector** fields for native click, type, assertion, and wait steps. The browser searches currently visible Slate windows for *explicit* `FDriverIdMetaData` identifiers, showing their owning window, widget type, effective visibility/enabled state, and matching `id:` selector. Search filtering and manual **Refresh** let developers open their plugin UI, find a stable target, and insert it without transcribing widget IDs. The global browser offers **Copy** even without a selected Test Asset. The per-step **Use** button updates the step through Probe's existing undo/redo and dirty-state machinery.
+
+**Safety:** untagged widgets are never presented as selectable targets; duplicate IDs are flagged as ambiguous and cannot be copied/inserted. The browser is strictly observational, does not send input or modify selection, and has bounded traversal. The special native Details selector `details:search` remains directly supported and can be entered manually. This pass adds stable Automation Driver IDs to Probe's own **Run Selected**, **Add Step**, and **Refresh Tests** controls for dogfooding and plugin-author examples. No Test Asset schema or step enum changes.
+
+**Regressions:** `Probe.Editor.WidgetDiscoveryUniqueIds` verifies tagged discovery, selector formation and owning-window identity without counting untagged widgets. `Probe.Editor.WidgetDiscoveryRejectsDuplicates` verifies collisions are reported as unsafe. The native automation suite now contains **27 cases**, compared with **25/25 passing in Dev 3** on the user's UE 5.8.3 Editor on October 28/29, 2026. Dev 4 requires a new build and runtime verification before its own pass status can be claimed.
+
+See [Widget Target Discovery](Docs/WIDGET_TARGET_DISCOVERY_0154_DEV4.md) and [Dev 4 QA checklist](Docs/QA_CHECKLIST_0154_DEV4.md).
+
+## 0.15.4-dev3: Native Widget Inspection and bounded waits
+
+**Twelve new authorable native UI steps** extend Probe from clicking and typing into **read-only Slate widget inspection**: widget exists/does not exist, visible, interactable, text equals/contains/not-equals, wait for widget visibility or exact text, plus Details 1 search contains/not-equals and inactive filter checks. Use stable `id:<automation ID>` or `details:search` selectors. Only the original click/type steps require **Authorize UI Input**; read-only checks do not inject input. Native UI steps remain asynchronous so Slate can keep processing work while the checks run.
+
+**Bounded waits** use a separate, serialized **Wait Timeout (s)** field (default 5, range 0.1–30 seconds) with a native Slate numeric control and validation. Timeout, missing-widget, and observed-text messages are included in per-step results. Existing enum ordinals and Test Asset data are preserved by appending the twelve new enum values and an optional step property. The catalog now has **223 built-in assertions** and retains **154 templates**.
+
+**Native authoring UI** groups new steps into **Native Widget Assertions**, **Native Widget Waits**, and **Details Panel**, with actionable selector labels, suitable initial values and wait-duration summaries. The existing **Native Widget Automation** grouping remains for click/type. A new independent `Probe.Driver.AuthoredWidgetInspection` Automation Framework spec exercises nine read-only steps and a deliberately failing text assertion against disposable native Slate controls. The authored Details spec now verifies six steps. The optional external UI gate requires both new spec cases. Source validation tools have been updated to the Hotfix 2 C++ filename `ProbeTestExecution.cpp`.
+
+**Previously verified baseline:** Dev 2 Hotfix 2 compiled successfully in the user's UE 5.8.3 Editor, passed all **23/23** native tests, and passed saved Test Asset, persistence, repeated execution, multiple-Test Pack, intentional-failure and state-restoration checks on October 28, 2026. **Dev 3 itself has passed static source checks, but has not yet been compiled or executed in UE 5.8.3.** The expanded suite should report **25/25** after runtime verification. The engine is unchanged.
+
+See [Native Widget Inspection](Docs/NATIVE_WIDGET_INSPECTION_0154_DEV3.md) and [Dev 3 QA checklist](Docs/QA_CHECKLIST_0154_DEV3.md). This version is a development build; complete the validation checklist before treating it as a stable release.
+
+## 0.15.4-dev2: Native Details search cleanup correction (validated baseline)
+
+October 28, 2026 UE 5.8.3 results from **0.15.4-dev1**: `Probe.Runner.NativeUIAuthoringSafety` PASS, `Probe.Driver.AuthoredDetailsSearch` PASS, `Probe.Driver.SlateButton` PASS, `Probe.SelfTest` 15/15 PASS with zero oracle mismatches. `Probe.Driver.EditorDetailsSearch` FAILS when the original Details panel had no objects selected: the visible search box returned to empty, but `IDetailsView::HasActiveSearch()` remained true after the 1600 ms cleanup settle.
+
+**Correction:** All three native Details-restoration paths (independent Details spec, Probe-authored async runner, and authored Details spec cleanup) now share `ProbeDetailsSearchRestore.h`. They use `IDetailsView::ClearSearch()` for an originally empty search rather than relying on `SetSearchText(FText::GetEmpty())`, and they restore any test-substituted object set **before** restoring the native search state. The standalone spec also uses `ClearSearch()` when establishing its unfiltered baseline. Result assertions remain strict; unexpected filter-state mismatches still fail, and the runner now emits original/current text and active-state diagnostics.
+
+**The Dev 2 Hotfix 2 baseline was subsequently compiled and runtime-verified in UE 5.8.3.** Its 211 registered steps, 154 templates, the 15 Smoke Self-Test cases, and Automation Driver threading model were retained. See `Docs/QA_CHECKLIST_0154_DEV2.md` for focused regression scenarios. Original editor tab-focus limitation remains.
+
+## 0.15.4-dev1: Authorable native Editor UI automation (development validation)
+
+**New experimental authorable steps in the normal Probe Test editor:** `UI Click Widget`, `UI Type Text Into Widget`, `UI Details Search Is Visible`, `UI Details Search Text Equals`, and `UI Details Filter Is Active`. Inputs use stable selectors: `details:search` identifies the **existing native Level Editor Details 1** search field, while `id:<automation ID>` identifies a widget carrying a Slate Automation Driver ID. No raw screen coordinates or unscoped text search are supported.
+
+UI actions use a new **asynchronous runner**: Automation Driver clicks and types from a worker thread while Editor/Slate continues ticking. A test may mix traditional synchronous assertions with native UI steps. The Probe workspace queues Test and Pack runs serially and only marks them complete once their callback returns. Direct C++ `Probe::RunTest()` deliberately refuses UI steps; use `Probe::RunTestAsync()` for tests containing native UI actions.
+
+**Safety and cleanup:** `Allow Editor UI Input` is a separate, opt-in permission on each Test Asset, exposed in Probe's authoring panel when relevant. The runner saves/restores Details search text, active filter state, and keyboard focus, waiting 1600 ms for deferred Slate search processing. It does not claim to reverse arbitrary button presses or generic `id:` text edits, or to restore a previously active sibling dock tab. Use a disposable Editor session/map for potentially destructive controls. The driver is left enabled if another subsystem had enabled it before the test.
+
+An unattended-safe native regression `Probe.Runner.NativeUIAuthoringSafety` checks permission denial, synchronous runner refusal and invalid selectors. The independent interactive regression `Probe.Driver.AuthoredDetailsSearch` creates an in-memory Probe Test with real authorable steps, verifies four steps executed and passed, and asserts restoration. It is a third interactive UI requirement in the independent release-gate validator. The earlier `Probe.Driver.EditorDetailsSearch` and `Probe.Driver.SlateButton` tests are preserved. The 15-case Smoke suite, 154 templates, and first 206 serialized step ordinals are unchanged; the catalog now has 211 steps.
+
+**Run validation in UE 5.8.3:** `Automation RunTests Probe.Driver.AuthoredDetailsSearch`, then `Automation RunTests Probe.Driver.EditorDetailsSearch`, `Automation RunTests Probe.Driver.SlateButton`, and `Probe.SelfTest`. See [authoring guide](Docs/NATIVE_UI_AUTHORING_0154.md) and [QA checklist](Docs/QA_CHECKLIST_0154.md). Native UI automation requires a visible, interactive Editor and is not part of unattended Gauntlet/command-line validation.
+
+**Current evidence: source consistency and external validator self-tests only.** This development ZIP is **not claimed to compile or pass interactive runtime tests in UE 5.8.3** until user logs confirm it.
 
 ## 0.15.3-hotfix4: UE 5.8.3 compilation correction
 

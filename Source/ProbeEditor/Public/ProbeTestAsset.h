@@ -222,7 +222,27 @@ enum class EProbeStepType : uint8
     ActorFixtureHasRootComponent UMETA(DisplayName="Temporary Actor Has Root Component"),
     ActorFixtureLocationNotNearlyEquals UMETA(DisplayName="Temporary Actor Location Not Nearly Equals"),
     ActorFixtureRotationNotNearlyEquals UMETA(DisplayName="Temporary Actor Rotation Not Nearly Equals"),
-    ActorFixtureScaleNotNearlyEquals UMETA(DisplayName="Temporary Actor Scale Not Nearly Equals")
+    ActorFixtureScaleNotNearlyEquals UMETA(DisplayName="Temporary Actor Scale Not Nearly Equals"),
+    // 0.15.4: append-only UI automation; existing serialized values are untouched.
+    UIWidgetClick UMETA(DisplayName="UI Click Widget"),
+    UIWidgetTypeText UMETA(DisplayName="UI Type Text Into Widget"),
+    UIDetailsSearchVisible UMETA(DisplayName="UI Details Search Is Visible"),
+    UIDetailsSearchTextEquals UMETA(DisplayName="UI Details Search Text Equals"),
+    UIDetailsSearchFilterActive UMETA(DisplayName="UI Details Filter Is Active"),
+    // 0.15.4-dev3: read-only Slate inspection, native Details negative checks,
+    // and bounded explicit waits. Append only to preserve every saved .uasset.
+    UIWidgetExists UMETA(DisplayName="UI Widget Exists"),
+    UIWidgetNotExists UMETA(DisplayName="UI Widget Does Not Exist"),
+    UIWidgetVisible UMETA(DisplayName="UI Widget Is Visible"),
+    UIWidgetInteractable UMETA(DisplayName="UI Widget Is Interactable"),
+    UIWidgetTextEquals UMETA(DisplayName="UI Widget Text Equals"),
+    UIWidgetTextContains UMETA(DisplayName="UI Widget Text Contains"),
+    UIWidgetTextNotEquals UMETA(DisplayName="UI Widget Text Does Not Equal"),
+    UIWaitForWidgetVisible UMETA(DisplayName="UI Wait For Widget Visible"),
+    UIWaitForWidgetTextEquals UMETA(DisplayName="UI Wait For Widget Text Equals"),
+    UIDetailsSearchTextContains UMETA(DisplayName="UI Details Search Text Contains"),
+    UIDetailsSearchTextNotEquals UMETA(DisplayName="UI Details Search Text Does Not Equal"),
+    UIDetailsSearchFilterInactive UMETA(DisplayName="UI Details Filter Is Inactive")
 };
 
 USTRUCT(BlueprintType)
@@ -256,6 +276,11 @@ struct FProbeTestStep
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Step", meta=(ClampMin="0", ToolTip="Absolute numeric tolerance for reflected property comparisons"))
     double NumericTolerance = 0.0001;
 
+    // Used only by the explicit UI Wait steps. Existing tests retain the safe
+    // default, with hard bounds enforced before a background driver operation.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Step", meta=(ClampMin="0.1", ClampMax="30.0", ToolTip="Maximum time in seconds to await a native UI condition, from 0.1 to 30 seconds."))
+    double UIWaitTimeoutSeconds = 5.0;
+
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Step")
     FString Description;
 };
@@ -283,6 +308,11 @@ public:
     // affect the loaded Editor world and may mark its level package dirty.
     UPROPERTY(EditAnywhere, Category="Probe", meta=(ToolTip="Allow this test to spawn transient actors in the active Editor level. Probe only edits its own fixtures and always attempts cleanup. The level can still become dirty."))
     bool bAllowTransientEditorActors = false;
+
+    // Native UI input can trigger real plugin actions. Never infer permission from
+    // a test asset's existence, and never enable this on old tests by default.
+    UPROPERTY(EditAnywhere, Category="Probe", meta=(ToolTip="Explicitly authorize Automation Driver clicks and typing against the live Unreal Editor. Effects of arbitrary plugin buttons cannot be undone by Probe."))
+    bool bAllowEditorUIInput = false;
 
     UPROPERTY(EditAnywhere, Category="Probe")
     TArray<FProbeTestStep> Steps;

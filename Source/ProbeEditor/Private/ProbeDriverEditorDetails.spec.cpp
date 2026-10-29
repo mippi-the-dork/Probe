@@ -1,4 +1,4 @@
-// Probe 0.15.3 hotfix 4: verify deferred Details search restoration.
+// Probe 0.15.4 dev2: verify native Details search restoration using ClearSearch.
 //
 // This is an interactive Automation Driver spec, not a Probe Test Asset step.
 // No actors, assets, selections or persistent settings are modified. The only
@@ -29,6 +29,7 @@
 #include "InputCoreTypes.h"
 #include "Modules/ModuleManager.h"
 #include "ProbeTestAsset.h"
+#include "ProbeDetailsSearchRestore.h"
 #include "UObject/StrongObjectPtr.h"
 #include "UObject/Package.h"
 #include "Async/Async.h"
@@ -244,7 +245,8 @@ void FProbeDriverEditorDetailsSpec::Define()
             // Start from a known empty search, even if the user previously
             // had a filter. Otherwise HasActiveSearch could already be true
             // and could not independently confirm the new filter took effect.
-            DetailsView->SetSearchText(FText::GetEmpty());
+            DetailsView->ClearSearch();
+            SearchBox->SetText(FText::GetEmpty());
             UnfilteredRowCount = DetailsView->CountRows();
             bDriverWasEnabled = IAutomationDriverModule::Get().IsEnabled();
             if (!bDriverWasEnabled)
@@ -308,14 +310,13 @@ void FProbeDriverEditorDetailsSpec::Define()
                 }
                 if (SearchBox.IsValid() && DetailsView.IsValid())
                 {
-                    SearchBox->SetText(OriginalSearchText);
-                    DetailsView->SetSearchText(OriginalSearchText);
                     if (bInstalledTemporaryObject)
                     {
-                        // Restore object display *before* checking whether
-                        // the original search state has settled.
+                        // Restoring the original object set can refresh the
+                        // Details filter; do that *before* clearing the search.
                         DetailsView->SetObjects(OriginalSelectedObjects, true, true);
                     }
+                    ProbeDetailsSearchRestore::Restore(DetailsView, SearchBox, OriginalSearchText);
                 }
                 bRestorationApplied.Store(true);
             });
@@ -388,12 +389,11 @@ void FProbeDriverEditorDetailsSpec::Define()
                     // already allowed the deferred search to settle.
                     if (!bRestorationApplied.Load())
                     {
-                        SearchBox->SetText(OriginalSearchText);
-                        DetailsView->SetSearchText(OriginalSearchText);
                         if (bInstalledTemporaryObject)
                         {
                             DetailsView->SetObjects(OriginalSelectedObjects, true, true);
                         }
+                        ProbeDetailsSearchRestore::Restore(DetailsView, SearchBox, OriginalSearchText);
                         AddError(TEXT("Timed out waiting for the game-thread Details restoration phase. Original state was reapplied, but deferred filter restoration could not be verified."));
                     }
                     TestEqual(TEXT("Native Details search text restored"),
@@ -402,11 +402,12 @@ void FProbeDriverEditorDetailsSpec::Define()
                     if (bRestoredActive != bOriginalSearchActive)
                     {
                         UE_LOG(LogTemp, Error,
-                            TEXT("Probe Details UI restoration mismatch after deferred settle: originally active=%s, restored active=%s, original text='%s', current text='%s', temporary object=%s."),
+                            TEXT("Probe Details UI restoration mismatch after deferred settle and native ClearSearch: originally active=%s, restored active=%s, original text='%s', current text='%s', temporary object=%s, original objects=%d, current objects=%d."),
                             bOriginalSearchActive ? TEXT("yes") : TEXT("no"),
                             bRestoredActive ? TEXT("yes") : TEXT("no"),
                             *OriginalSearchText.ToString(), *SearchBox->GetText().ToString(),
-                            bInstalledTemporaryObject ? TEXT("yes") : TEXT("no"));
+                            bInstalledTemporaryObject ? TEXT("yes") : TEXT("no"),
+                            OriginalSelectedObjects.Num(), DetailsView->GetSelectedObjects().Num());
                     }
                     TestEqual(TEXT("Native Details search active state restored after debounce"),
                         bRestoredActive, bOriginalSearchActive);

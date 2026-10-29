@@ -37,5 +37,9 @@ namespace Probe
 
     PROBEEDITOR_API const TCHAR* StatusName(EResultStatus Status);
     PROBEEDITOR_API FTestResult RunTest(const UProbeTestAsset* Asset);
+    // Completion always runs on the Editor game thread. Required for native
+    // UI steps; synchronous RunTest explicitly refuses live UI input.
+    PROBEEDITOR_API void RunTestAsync(const UProbeTestAsset* Asset,
+        TFunction<void(FTestResult)> OnComplete);
     PROBEEDITOR_API TArray<FTestResult> RunPack(const UProbeTestPack* Pack);
 }

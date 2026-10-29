@@ -28,6 +28,7 @@ bool FProbeStepDuplicationRegressionTest::RunTest(const FString& Parameters)
     Source.ExpectedClass = TEXT("/Script/Engine.StaticMeshActor");
     Source.PropertyName = TEXT("Tags");
     Source.NumericTolerance = 0.125;
+    Source.UIWaitTimeoutSeconds = 7.5;
     Source.MinimumActorCount = 250;
     Source.Description = FString::ChrN(1024, TCHAR('X'));
     Asset->Steps.Add(Source);
@@ -49,6 +50,7 @@ bool FProbeStepDuplicationRegressionTest::RunTest(const FString& Parameters)
         TestEqual(TEXT("Duplicate retains count"), Step.MinimumActorCount, Source.MinimumActorCount);
         TestEqual(TEXT("Duplicate retains tolerance"), Step.NumericTolerance, Source.NumericTolerance);
         TestEqual(TEXT("Duplicate retains description"), Step.Description, Source.Description);
+        TestEqual(TEXT("Duplicate retains UI wait timeout"), Step.UIWaitTimeoutSeconds, Source.UIWaitTimeoutSeconds);
     }
     Asset->Steps[1].Description = TEXT("Edited duplicate");
     TestEqual(TEXT("Editing duplicate does not change original"), Asset->Steps[0].Description, Source.Description);
@@ -80,7 +82,9 @@ bool FProbeCatalogCoverageTest::RunTest(const FString& Parameters)
         }
         TestTrue(FString::Printf(TEXT("Assertion %d category must exist"), Index), bFoundCategory);
     }
-    TestEqual(TEXT("Assertion catalog covers all serialized enum values"), Seen.Num(), 206);
+    TestEqual(TEXT("Assertion catalog covers all serialized enum values"), Seen.Num(), 223);
+    TestEqual(TEXT("0.15.4-dev3 last appended enum value"), static_cast<int32>(EProbeStepType::UIDetailsSearchFilterInactive), 222);
+    TestEqual(TEXT("0.15.4 last appended enum value"), static_cast<int32>(EProbeStepType::UIDetailsSearchFilterActive), 210);
     TestEqual(TEXT("0.14 last enum index"), static_cast<int32>(EProbeStepType::ActorFixtureScaleNotNearlyEquals), 205);
     // These original IDs must never change: Probe Tests are serialized assets.
     TestEqual(TEXT("Original PluginEnabled enum value"), static_cast<int32>(EProbeStepType::PluginEnabled), 0);
@@ -93,6 +97,77 @@ bool FProbeCatalogCoverageTest::RunTest(const FString& Parameters)
     TestEqual(TEXT("0.12 last enum index"), static_cast<int32>(EProbeStepType::ActorFixtureDestroy), 178);
     TestEqual(TEXT("0.13 last enum index"), static_cast<int32>(EProbeStepType::ActorFixtureDistanceAtMost), 194);
     TestEqual(TEXT("0.10 last enum index"), static_cast<int32>(EProbeStepType::SelectedActorIsNotTemporarilyHidden), 158);
+    return true;
+}
+
+// No native input is emitted by denied/invalid authoring configurations.
+// This regression is safe in unattended Automation Framework sessions.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FProbeNativeUIAuthoringSafety,
+    "Probe.Runner.NativeUIAuthoringSafety",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FProbeNativeUIAuthoringSafety::RunTest(const FString& Parameters)
+{
+    UProbeTestAsset* Asset = NewObject<UProbeTestAsset>(GetTransientPackage(), UProbeTestAsset::StaticClass(), NAME_None, RF_Transient);
+    FProbeTestStep Step;
+    Step.Type = EProbeStepType::UIWidgetClick;
+    Step.Target = TEXT("details:search");
+    Asset->Steps.Add(Step);
+
+    TestFalse(TEXT("Live Editor UI permission defaults to opt-out"), Asset->bAllowEditorUIInput);
+    bool bCompleted = false;
+    Probe::FTestResult Denied;
+    Probe::RunTestAsync(Asset, [&bCompleted, &Denied](Probe::FTestResult Result)
+    {
+        bCompleted = true;
+        Denied = MoveTemp(Result);
+    });
+    TestTrue(TEXT("Unauthorized UI step reports a completion"), bCompleted);
+    TestEqual(TEXT("Unauthorized UI input results in Error"), static_cast<int32>(Denied.Status),
+        static_cast<int32>(Probe::EResultStatus::Error));
+    TestEqual(TEXT("One denied UI step is recorded"), Denied.Steps.Num(), 1);
+    TestTrue(TEXT("Denial reports permission requirement"), Denied.Detail.Contains(TEXT("Allow Editor UI Input")));
+
+    Asset->bAllowEditorUIInput = true;
+    const Probe::FTestResult Sync = Probe::RunTest(Asset);
+    TestEqual(TEXT("Synchronous runner refuses native UI instead of blocking Slate"), static_cast<int32>(Sync.Status),
+        static_cast<int32>(Probe::EResultStatus::Error));
+    TestTrue(TEXT("Synchronous refusal directs caller to async API"), Sync.Detail.Contains(TEXT("RunTestAsync")));
+
+    Asset->Steps[0].Target = TEXT("NoCoordinatesOrGlobalTextMatches");
+    bCompleted = false;
+    Probe::FTestResult Invalid;
+    Probe::RunTestAsync(Asset, [&bCompleted, &Invalid](Probe::FTestResult Result)
+    {
+        bCompleted = true;
+        Invalid = MoveTemp(Result);
+    });
+    TestTrue(TEXT("Invalid selector fails immediately without touching Slate"), bCompleted);
+    TestEqual(TEXT("Invalid selector reports Error"), static_cast<int32>(Invalid.Status),
+        static_cast<int32>(Probe::EResultStatus::Error));
+    TestTrue(TEXT("Invalid selector explains stable selector requirement"), Invalid.Detail.Contains(TEXT("details:search")));
+
+    // Dev 3: the wait deadline must be rejected before Slate/Driver access,
+    // even for a read-only step that does not require UI input authorization.
+    Asset->bAllowEditorUIInput = false;
+    Asset->Steps[0].Type = EProbeStepType::UIWaitForWidgetTextEquals;
+    Asset->Steps[0].Target = TEXT("id:Probe.NeverPresent");
+    Asset->Steps[0].ExpectedValue = TEXT("Expected");
+    Asset->Steps[0].UIWaitTimeoutSeconds = 0.0;
+    bCompleted = false;
+    Probe::FTestResult InvalidWait;
+    Probe::RunTestAsync(Asset, [&bCompleted, &InvalidWait](Probe::FTestResult Result)
+    {
+        bCompleted = true;
+        InvalidWait = MoveTemp(Result);
+    });
+    TestTrue(TEXT("Invalid UI wait immediately reports completion"), bCompleted);
+    TestEqual(TEXT("Invalid UI wait is Error"), static_cast<int32>(InvalidWait.Status),
+        static_cast<int32>(Probe::EResultStatus::Error));
+    TestTrue(TEXT("Wait timeout violation is explained"), InvalidWait.Detail.Contains(TEXT("0.1 and 30")));
+    const Probe::FTestResult SyncObservation = Probe::RunTest(Asset);
+    TestEqual(TEXT("Sync runner also refuses read-only native observations"), static_cast<int32>(SyncObservation.Status),
+        static_cast<int32>(Probe::EResultStatus::Error));
     return true;
 }
 
@@ -549,6 +624,12 @@ bool FProbeSubmenuGroupingTest::RunTest(const FString& Parameters)
     TestEqual(TEXT("Functions are grouped together"),
         Probe::MenuSubgroup(TEXT("Classes & Reflection"), TEXT("Class Function Is Pure")),
         FString(TEXT("Functions")));
+    TestEqual(TEXT("Read-only UI checks have their own submenu"),
+        Probe::MenuSubgroup(TEXT("Editor UI"), TEXT("UI Widget Is Visible")), FString(TEXT("Native Widget Assertions")));
+    TestEqual(TEXT("UI waits have their own submenu"),
+        Probe::MenuSubgroup(TEXT("Editor UI"), TEXT("UI Wait For Widget Visible")), FString(TEXT("Native Widget Waits")));
+    TestEqual(TEXT("Native Details assertions grouped together"),
+        Probe::MenuSubgroup(TEXT("Editor UI"), TEXT("UI Details Filter Is Inactive")), FString(TEXT("Details Panel")));
     TSet<int32> Seen;
     for (const Probe::FAssertionInfo& Info : Probe::AssertionCatalog())
     {
@@ -557,7 +638,7 @@ bool FProbeSubmenuGroupingTest::RunTest(const FString& Parameters)
         TestFalse(TEXT("Every built-in assertion has a submenu"),
             Probe::MenuSubgroup(FString(Info.Category), FString(Info.Name)).IsEmpty());
     }
-    TestEqual(TEXT("All 206 assertions are assigned to menus"), Seen.Num(), 206);
+    TestEqual(TEXT("All 223 assertions are assigned to menus"), Seen.Num(), 223);
     return true;
 }
 #endif

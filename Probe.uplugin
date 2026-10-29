@@ -1,9 +1,9 @@
 {
   "FileVersion": 3,
-  "Version": 29,
-  "VersionName": "0.15.3-hotfix4",
+  "Version": 33,
+  "VersionName": "0.15.4-dev4",
   "FriendlyName": "Probe",
-  "Description": "Visual QA tests, Packs, automated Editor checks, and deterministic self-test smoke verification for Unreal Engine.",
+  "Description": "Visual QA Tests and Packs, independent self-test verification, and authorable native Editor UI automation and discoverable Automation Driver widget targets.",
   "Category": "Testing",
   "CreatedBy": "Mippi",
   "CanContainContent": true,

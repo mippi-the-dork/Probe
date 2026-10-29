@@ -1,4 +1,5 @@
 #include "ProbeTestRunner.h"
+#include "ProbeDetailsSearchRestore.h"
 #include "ProbeAssertionCatalog.h"
 #include "ProbeExtensions.h"
 #include "ProbeReferenceValidation.h"
@@ -20,6 +21,7 @@
 #include "Selection.h"
 #include "GameFramework/WorldSettings.h"
 #include "HAL/PlatformTime.h"
+#include "HAL/PlatformProcess.h"
 #include "Interfaces/IPluginManager.h"
 #include "PluginDescriptor.h"
 #include "ModuleDescriptor.h"
@@ -29,6 +31,25 @@
 #include "UObject/UnrealType.h"
 #include "UObject/UObjectIterator.h"
 #include "UObject/UObjectGlobals.h"
+#include "UObject/StrongObjectPtr.h"
+#include "IAutomationDriverModule.h"
+#include "IAutomationDriver.h"
+#include "DriverConfiguration.h"
+#include "AutomationDriverTypeDefs.h"
+#include "IDriverElement.h"
+#include "LocateBy.h"
+#include "InputCoreTypes.h"
+#include "Async/Async.h"
+#include "Containers/Ticker.h"
+#include "PropertyEditorModule.h"
+#include "IDetailsView.h"
+#include "LevelEditor.h"
+#include "Framework/Application/SlateApplication.h"
+#include "Framework/Docking/TabManager.h"
+#include "Widgets/Docking/SDockTab.h"
+#include "Layout/WidgetPath.h"
+#include "Layout/ChildrenBase.h"
+#include "Widgets/Input/SSearchBox.h"
 
 namespace Probe
 {
@@ -2231,10 +2252,591 @@ namespace Probe
             }
             Reason = TEXT("Selected actor not found"); return EResultStatus::Failed;
         }
+        case EProbeStepType::UIWidgetClick:
+        case EProbeStepType::UIWidgetTypeText:
+        case EProbeStepType::UIDetailsSearchVisible:
+        case EProbeStepType::UIDetailsSearchTextEquals:
+        case EProbeStepType::UIDetailsSearchFilterActive:
+        case EProbeStepType::UIWidgetExists:
+        case EProbeStepType::UIWidgetNotExists:
+        case EProbeStepType::UIWidgetVisible:
+        case EProbeStepType::UIWidgetInteractable:
+        case EProbeStepType::UIWidgetTextEquals:
+        case EProbeStepType::UIWidgetTextContains:
+        case EProbeStepType::UIWidgetTextNotEquals:
+        case EProbeStepType::UIWaitForWidgetVisible:
+        case EProbeStepType::UIWaitForWidgetTextEquals:
+        case EProbeStepType::UIDetailsSearchTextContains:
+        case EProbeStepType::UIDetailsSearchTextNotEquals:
+        case EProbeStepType::UIDetailsSearchFilterInactive:
+            Reason = TEXT("Native UI steps require RunTestAsync: synchronous input blocks the Editor game thread. Open and run this test in the Probe workspace.");
+            return EResultStatus::Error;
         default:
             Reason = TEXT("Unsupported step type");
             return EResultStatus::Error;
         }
+    }
+
+    // Native UI automation runs *asynchronously*. Driving Slate input from
+    // RunTest's synchronous game-thread loop would deadlock Automation Driver.
+    static bool IsNativeUIStep(EProbeStepType Type)
+    {
+        return Type == EProbeStepType::UIWidgetClick || Type == EProbeStepType::UIWidgetTypeText
+            || Type == EProbeStepType::UIDetailsSearchVisible
+            || Type == EProbeStepType::UIDetailsSearchTextEquals
+            || Type == EProbeStepType::UIDetailsSearchFilterActive
+            || (Type >= EProbeStepType::UIWidgetExists && Type <= EProbeStepType::UIDetailsSearchFilterInactive);
+    }
+
+    static bool IsUIObservationStep(EProbeStepType Type)
+    {
+        return Type >= EProbeStepType::UIWidgetExists && Type <= EProbeStepType::UIWaitForWidgetTextEquals;
+    }
+
+    static void CollectDetailsSearchBoxes(const TSharedRef<SWidget>& Widget,
+        TArray<TSharedRef<SSearchBox>>& Out, int32 Depth = 0)
+    {
+        if (Depth > 32 || Out.Num() > 4) { return; }
+        if (Widget->GetTypeAsString() == TEXT("SSearchBox"))
+        {
+            Out.Add(StaticCastSharedRef<SSearchBox>(Widget));
+            return;
+        }
+        if (FChildren* Children = Widget->GetChildren())
+        {
+            for (int32 Index = 0; Index < Children->Num(); ++Index)
+            {
+                CollectDetailsSearchBoxes(Children->GetChildAt(Index), Out, Depth + 1);
+                if (Out.Num() > 4) { return; }
+            }
+        }
+    }
+
+    // A named native selector, not a screen coordinate. Unlike an automation
+    // ID, the stock Details search is located inside *one specific* panel.
+    static bool ResolveDetailsSearch(TSharedPtr<IDetailsView>& OutView,
+        TSharedPtr<SSearchBox>& OutSearch, bool bActivateExistingTab, FString& Reason)
+    {
+        if (!FSlateApplication::IsInitialized())
+        {
+            Reason = TEXT("Slate is not initialized."); return false;
+        }
+        FPropertyEditorModule& PropertyEditor = FModuleManager::LoadModuleChecked<FPropertyEditorModule>(TEXT("PropertyEditor"));
+        OutView = PropertyEditor.FindDetailView(LevelEditorTabIds::LevelEditorSelectionDetails);
+        if (!OutView.IsValid())
+        {
+            Reason = TEXT("Level Editor Details 1 does not exist. Open Window > Details > Details 1.");
+            return false;
+        }
+        TArray<TSharedRef<SSearchBox>> Searches;
+        const TSharedPtr<SWidget> Filter = OutView->GetFilterAreaWidget();
+        if (Filter.IsValid()) { CollectDetailsSearchBoxes(Filter.ToSharedRef(), Searches); }
+        if (Searches.Num() == 0)
+        {
+            CollectDetailsSearchBoxes(StaticCastSharedRef<SWidget>(OutView.ToSharedRef()), Searches);
+        }
+        if (Searches.Num() != 1)
+        {
+            Reason = FString::Printf(TEXT("Expected one native Details 1 search widget; found %d."), Searches.Num());
+            return false;
+        }
+        OutSearch = Searches[0];
+        if (bActivateExistingTab)
+        {
+            TSharedPtr<SDockTab> Tab;
+            if (TSharedPtr<FTabManager> Manager = OutView->GetHostTabManager())
+            {
+                Tab = Manager->FindExistingLiveTab(FTabId(LevelEditorTabIds::LevelEditorSelectionDetails));
+            }
+            if (!Tab.IsValid())
+            {
+                Tab = FGlobalTabmanager::Get()->FindExistingLiveTab(
+                    FTabId(LevelEditorTabIds::LevelEditorSelectionDetails));
+            }
+            if (Tab.IsValid() && !Tab->IsForeground())
+            {
+                Tab->ActivateInParent(ETabActivationCause::SetDirectly);
+                if (TSharedPtr<SWindow> Window = Tab->GetParentWindow()) { Window->BringToFront(false); }
+            }
+        }
+        return true;
+    }
+
+    class FAsyncProbeTestRun : public TSharedFromThis<FAsyncProbeTestRun>
+    {
+    public:
+        TStrongObjectPtr<UProbeTestAsset> Test;
+        TArray<FProbeTestStep> Definitions;
+        FProbeRunContext Context;
+        FTestResult Result;
+        TFunction<void(FTestResult)> OnComplete;
+        int32 Index = 0;
+        double StartedAt = 0.0;
+        double StepStartedAt = 0.0;
+        bool bDriverEnabledByProbe = false;
+        bool bSavedSearch = false;
+        bool bSavedFocus = false;
+        FText OriginalSearchText;
+        bool bOriginalSearchActive = false;
+        TWeakPtr<SSearchBox> EditedSearch;
+        TWeakPtr<IDetailsView> EditedView;
+        TWeakPtr<SWidget> PreviousKeyboardFocus;
+
+        void Begin(const UProbeTestAsset* Asset, TFunction<void(FTestResult)> Callback)
+        {
+            check(IsInGameThread());
+            OnComplete = MoveTemp(Callback);
+            StartedAt = FPlatformTime::Seconds();
+            if (!Asset)
+            {
+                Result.Detail = TEXT("Test asset could not be loaded"); Finish(); return;
+            }
+            Test.Reset(const_cast<UProbeTestAsset*>(Asset));
+            Definitions = Asset->Steps; // Don't observe edits made during an in-flight UI test.
+            Result.Name = Asset->GetName();
+            Result.Id = Asset->TestId.ToString();
+            Result.AssetPath = Asset->GetPathName();
+            Context.bAllowTransientEditorActors = Asset->bAllowTransientEditorActors;
+            if (!Asset->bEnabled)
+            {
+                Result.Status = EResultStatus::Skipped;
+                Result.Detail = TEXT("Test disabled"); Finish(); return;
+            }
+            if (Asset->bNeedsConfiguration)
+            {
+                Result.Status = EResultStatus::Skipped;
+                Result.Detail = TEXT("Template needs configuration"); Finish(); return;
+            }
+            if (Definitions.IsEmpty())
+            {
+                Result.Detail = TEXT("Test has no steps"); Finish(); return;
+            }
+            Result.Status = EResultStatus::Passed;
+            NextStep();
+        }
+
+        void NextStep()
+        {
+            check(IsInGameThread());
+            if (Index >= Definitions.Num())
+            {
+                Result.Detail = FString::Printf(TEXT("All %d steps passed"), Definitions.Num());
+                Finish(); return;
+            }
+            const FProbeTestStep& Step = Definitions[Index];
+            StepStartedAt = FPlatformTime::Seconds();
+            if (!Step.AssertionId.IsNone() || !IsNativeUIStep(Step.Type))
+            {
+                FString Reason;
+                const EResultStatus Status = ExecuteStep(Step, Context, Reason);
+                CompleteStep(Status, Reason); return;
+            }
+            const bool bInput = Step.Type == EProbeStepType::UIWidgetClick
+                || Step.Type == EProbeStepType::UIWidgetTypeText;
+            if (bInput && !Test->bAllowEditorUIInput)
+            {
+                CompleteStep(EResultStatus::Error,
+                    TEXT("Live Editor input is not authorized. Enable Allow Editor UI Input on this Test."));
+                return;
+            }
+            if (bInput)
+            {
+                BeginInput(Step); return;
+            }
+            if (IsUIObservationStep(Step.Type))
+            {
+                BeginObservation(Step); return;
+            }
+            TSharedPtr<IDetailsView> View;
+            TSharedPtr<SSearchBox> Search;
+            FString Reason;
+            if (!ResolveDetailsSearch(View, Search, Step.Type == EProbeStepType::UIDetailsSearchVisible, Reason))
+            {
+                CompleteStep(EResultStatus::Error, Reason); return;
+            }
+            if (Step.Type == EProbeStepType::UIDetailsSearchVisible)
+            {
+                // Foregrounding an existing dock tab does not necessarily
+                // arrange its widgets in the current Slate tick. Allow one
+                // short, non-blocking settle before asserting actual visibility.
+                TSharedRef<FAsyncProbeTestRun> Self = AsShared();
+                FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+                    [Self](float)
+                    {
+                        TSharedPtr<IDetailsView> SettledView;
+                        TSharedPtr<SSearchBox> SettledSearch;
+                        FString Message;
+                        if (!ResolveDetailsSearch(SettledView, SettledSearch, false, Message))
+                        {
+                            Self->CompleteStep(EResultStatus::Error, Message);
+                            return false;
+                        }
+                        FWidgetPath Path;
+                        const bool bVisible = SettledSearch->GetVisibility().IsVisible() && SettledSearch->IsEnabled()
+                            && FSlateApplication::Get().FindPathToWidget(
+                                SettledSearch.ToSharedRef(), Path, EVisibility::Visible);
+                        Self->CompleteStep(bVisible ? EResultStatus::Passed : EResultStatus::Failed,
+                            bVisible ? TEXT("Native Details 1 search is arranged, enabled and visible.")
+                                     : TEXT("Native Details 1 search exists but is not in a visible Slate path."));
+                        return false;
+                    }), 0.15f);
+                return;
+            }
+            const FString Actual = Search->GetText().ToString();
+            if (Step.Type == EProbeStepType::UIDetailsSearchTextEquals
+                || Step.Type == EProbeStepType::UIDetailsSearchTextContains
+                || Step.Type == EProbeStepType::UIDetailsSearchTextNotEquals)
+            {
+                const bool bMatch = Step.Type == EProbeStepType::UIDetailsSearchTextEquals
+                    ? Actual == Step.ExpectedValue
+                    : Step.Type == EProbeStepType::UIDetailsSearchTextContains
+                    ? Actual.Contains(Step.ExpectedValue, ESearchCase::CaseSensitive)
+                    : Actual != Step.ExpectedValue;
+                const TCHAR* Operator = Step.Type == EProbeStepType::UIDetailsSearchTextEquals
+                    ? TEXT("equals") : Step.Type == EProbeStepType::UIDetailsSearchTextContains
+                    ? TEXT("contains") : TEXT("does not equal");
+                CompleteStep(bMatch ? EResultStatus::Passed : EResultStatus::Failed,
+                    FString::Printf(TEXT("Details 1 search text='%s'; %s '%s'"), *Actual, Operator, *Step.ExpectedValue));
+                return;
+            }
+            const bool bActive = View->HasActiveSearch();
+            const bool bExpectActive = Step.Type == EProbeStepType::UIDetailsSearchFilterActive;
+            CompleteStep(bActive == bExpectActive ? EResultStatus::Passed : EResultStatus::Failed,
+                FString::Printf(TEXT("Details 1 HasActiveSearch=%s; expected %s."),
+                    bActive ? TEXT("true") : TEXT("false"), bExpectActive ? TEXT("true") : TEXT("false")));
+        }
+
+        // Read-only inspection uses Automation Driver's standard ID discovery and
+        // text/visibility APIs, but NEVER injects a click or key press. All Driver
+        // API calls are off the Editor thread, just like interactive input.
+        void BeginObservation(const FProbeTestStep& Step)
+        {
+            check(IsInGameThread());
+            const FString Selector = Step.Target.TrimStartAndEnd();
+            const bool bNative = Selector.Equals(TEXT("details:search"), ESearchCase::IgnoreCase);
+            const bool bTagged = Selector.StartsWith(TEXT("id:"), ESearchCase::IgnoreCase)
+                && Selector.Len() > 3 && !Selector.RightChop(3).TrimStartAndEnd().IsEmpty();
+            if (!bNative && !bTagged)
+            {
+                CompleteStep(EResultStatus::Error,
+                    TEXT("Invalid selector. Use details:search or id:<Slate automation ID>. Coordinates and global label queries are not supported."));
+                return;
+            }
+            const bool bWait = Step.Type == EProbeStepType::UIWaitForWidgetVisible
+                || Step.Type == EProbeStepType::UIWaitForWidgetTextEquals;
+            if (bWait && (!FMath::IsFinite(Step.UIWaitTimeoutSeconds)
+                || Step.UIWaitTimeoutSeconds < 0.1 || Step.UIWaitTimeoutSeconds > 30.0))
+            {
+                CompleteStep(EResultStatus::Error, TEXT("UI Wait Timeout must be between 0.1 and 30 seconds."));
+                return;
+            }
+            TWeakPtr<SSearchBox> WeakSearch;
+            if (bNative)
+            {
+                TSharedPtr<IDetailsView> View;
+                TSharedPtr<SSearchBox> Search;
+                FString Reason;
+                if (!ResolveDetailsSearch(View, Search, false, Reason))
+                {
+                    if (Step.Type == EProbeStepType::UIWidgetNotExists)
+                    {
+                        CompleteStep(EResultStatus::Passed, TEXT("Native Details 1 search is absent."));
+                    }
+                    else if (Step.Type == EProbeStepType::UIWidgetExists)
+                    {
+                        CompleteStep(EResultStatus::Failed, Reason);
+                    }
+                    else { CompleteStep(EResultStatus::Error, Reason); }
+                    return;
+                }
+                WeakSearch = Search;
+            }
+            if (!bDriverEnabledByProbe && !IAutomationDriverModule::Get().IsEnabled())
+            {
+                IAutomationDriverModule::Get().Enable();
+                bDriverEnabledByProbe = true;
+            }
+            const FString Id = bTagged ? Selector.RightChop(3) : FString();
+            const FString Expected = Step.ExpectedValue;
+            const EProbeStepType Type = Step.Type;
+            const double Timeout = Step.UIWaitTimeoutSeconds;
+            TSharedRef<FAsyncProbeTestRun> Self = AsShared();
+            Async(EAsyncExecution::ThreadPool, [Self, WeakSearch, bNative, Id, Selector, Expected, Type, bWait, Timeout]()
+            {
+                const FAutomationDriverRef Driver = IAutomationDriverModule::Get().CreateDriver();
+                // An observation is a snapshot unless explicitly authored as a wait.
+                // Avoid the implicit 3-second delay for negative assertions.
+                Driver->GetConfiguration()->ImplicitWait = FTimespan::Zero();
+                const FDriverElementRef Element = bNative
+                    ? Driver->FindElement(By::WidgetLambda(
+                        [WeakSearch](TArray<TSharedRef<SWidget>>& Out)
+                        {
+                            if (TSharedPtr<SSearchBox> Search = WeakSearch.Pin())
+                            { Out.Add(StaticCastSharedRef<SWidget>(Search.ToSharedRef())); }
+                        }, TEXT("Probe.Details1.Search.Inspect")))
+                    : Driver->FindElement(By::Id(*Id));
+                EResultStatus Status = EResultStatus::Failed;
+                FString Message;
+                bool bPresent = false;
+                bool bVisible = false;
+                bool bInteractable = false;
+                FString Actual;
+                const double Started = FPlatformTime::Seconds();
+                const double Deadline = Started + (bWait ? Timeout : 0.0);
+                do
+                {
+                    Actual.Empty();
+                    bPresent = Element->Exists();
+                    bVisible = bPresent && Element->IsVisible();
+                    bInteractable = bVisible && Element->IsInteractable();
+                    if (bPresent && (Type == EProbeStepType::UIWidgetTextEquals
+                        || Type == EProbeStepType::UIWidgetTextContains
+                        || Type == EProbeStepType::UIWidgetTextNotEquals
+                        || Type == EProbeStepType::UIWaitForWidgetTextEquals))
+                    { Actual = Element->GetText().ToString(); }
+                    bool bMatches = false;
+                    switch (Type)
+                    {
+                        case EProbeStepType::UIWidgetExists: bMatches = bPresent; break;
+                        case EProbeStepType::UIWidgetNotExists: bMatches = !bPresent; break;
+                        case EProbeStepType::UIWidgetVisible:
+                        case EProbeStepType::UIWaitForWidgetVisible: bMatches = bVisible; break;
+                        case EProbeStepType::UIWidgetInteractable: bMatches = bInteractable; break;
+                        case EProbeStepType::UIWidgetTextEquals:
+                        case EProbeStepType::UIWaitForWidgetTextEquals: bMatches = bPresent && Actual == Expected; break;
+                        case EProbeStepType::UIWidgetTextContains: bMatches = bPresent && Actual.Contains(Expected, ESearchCase::CaseSensitive); break;
+                        case EProbeStepType::UIWidgetTextNotEquals: bMatches = bPresent && Actual != Expected; break;
+                        default: break;
+                    }
+                    if (bMatches)
+                    {
+                        Status = EResultStatus::Passed;
+                        break;
+                    }
+                    if (!bWait || FPlatformTime::Seconds() >= Deadline) { break; }
+                    FPlatformProcess::Sleep(0.1f);
+                }
+                while (true);
+                const bool bText = Type == EProbeStepType::UIWidgetTextEquals
+                    || Type == EProbeStepType::UIWidgetTextContains
+                    || Type == EProbeStepType::UIWidgetTextNotEquals
+                    || Type == EProbeStepType::UIWaitForWidgetTextEquals;
+                Message = bText
+                    ? FString::Printf(TEXT("Widget '%s': exists=%s, actual text='%s', expected='%s'%s"),
+                        *Selector, bPresent ? TEXT("true") : TEXT("false"), *Actual, *Expected,
+                        bWait && Status != EResultStatus::Passed ? TEXT(" (wait timed out)") : TEXT(""))
+                    : FString::Printf(TEXT("Widget '%s': exists=%s, visible=%s, interactable=%s%s"),
+                        *Selector, bPresent ? TEXT("true") : TEXT("false"),
+                        bVisible ? TEXT("true") : TEXT("false"), bInteractable ? TEXT("true") : TEXT("false"),
+                        bWait && Status != EResultStatus::Passed ? TEXT(" (wait timed out)") : TEXT(""));
+                AsyncTask(ENamedThreads::GameThread, [Self, Status, Message]()
+                {
+                    Self->CompleteStep(Status, Message);
+                });
+            });
+        }
+
+        void BeginInput(const FProbeTestStep& Step)
+        {
+            check(IsInGameThread());
+            const FString Selector = Step.Target.TrimStartAndEnd();
+            const bool bNative = Selector.Equals(TEXT("details:search"), ESearchCase::IgnoreCase);
+            const bool bTagged = Selector.StartsWith(TEXT("id:"), ESearchCase::IgnoreCase)
+                && Selector.Len() > 3 && !Selector.RightChop(3).TrimStartAndEnd().IsEmpty();
+            if (!bNative && !bTagged)
+            {
+                CompleteStep(EResultStatus::Error,
+                    TEXT("Invalid selector. Use details:search or id:<Slate automation ID>. Coordinates and unscoped text matching are not supported."));
+                return;
+            }
+            if (!bSavedFocus)
+            {
+                PreviousKeyboardFocus = FSlateApplication::Get().GetKeyboardFocusedWidget();
+                bSavedFocus = true;
+            }
+            TWeakPtr<SSearchBox> WeakSearch;
+            if (bNative)
+            {
+                TSharedPtr<IDetailsView> View;
+                TSharedPtr<SSearchBox> Search;
+                FString Reason;
+                if (!ResolveDetailsSearch(View, Search, true, Reason))
+                {
+                    CompleteStep(EResultStatus::Error, Reason); return;
+                }
+                WeakSearch = Search;
+                if (Step.Type == EProbeStepType::UIWidgetTypeText && !bSavedSearch)
+                {
+                    EditedSearch = Search;
+                    EditedView = View;
+                    OriginalSearchText = Search->GetText();
+                    bOriginalSearchActive = View->HasActiveSearch();
+                    bSavedSearch = true;
+                }
+            }
+            if (!bDriverEnabledByProbe && !IAutomationDriverModule::Get().IsEnabled())
+            {
+                IAutomationDriverModule::Get().Enable();
+                bDriverEnabledByProbe = true;
+            }
+            const FString DriverId = bTagged ? Selector.RightChop(3) : FString();
+            const FString Input = Step.ExpectedValue;
+            const bool bType = Step.Type == EProbeStepType::UIWidgetTypeText;
+            TSharedRef<FAsyncProbeTestRun> Self = AsShared();
+            // NEVER run Click/TypeChord/Type on the Editor thread. The driver
+            // waits for that same thread to pump actual Slate messages.
+            Async(EAsyncExecution::ThreadPool, [Self, WeakSearch, bNative, DriverId, Input, bType]()
+            {
+                bool bSucceeded = false;
+                FString Failure = TEXT("Automation Driver did not complete input.");
+                const FAutomationDriverRef Driver = IAutomationDriverModule::Get().CreateDriver();
+                if (bNative)
+                {
+                    const FDriverElementRef Element = Driver->FindElement(By::WidgetLambda(
+                        [WeakSearch](TArray<TSharedRef<SWidget>>& Out)
+                        {
+                            if (TSharedPtr<SSearchBox> Widget = WeakSearch.Pin())
+                            { Out.Add(StaticCastSharedRef<SWidget>(Widget.ToSharedRef())); }
+                        }, TEXT("Probe.Details1.Search")));
+                    bSucceeded = Element->Click();
+                    if (bSucceeded && bType)
+                    {
+                        bSucceeded = Element->TypeChord(EKeys::LeftControl, EKeys::A)
+                            && Element->Type(Input);
+                        if (bSucceeded) { Driver->Wait(FTimespan::FromMilliseconds(1600)); }
+                    }
+                }
+                else
+                {
+                    const FDriverElementRef Element = Driver->FindElement(By::Id(*DriverId));
+                    bSucceeded = Element->Click();
+                    if (bSucceeded && bType)
+                    {
+                        bSucceeded = Element->TypeChord(EKeys::LeftControl, EKeys::A)
+                            && Element->Type(Input);
+                    }
+                }
+                const FString SelectorName = bNative ? TEXT("details:search") : FString::Printf(TEXT("id:%s"), *DriverId);
+                Failure = bSucceeded
+                    ? FString::Printf(TEXT("Automation Driver %s succeeded on '%s'."), bType ? TEXT("typing") : TEXT("click"), *SelectorName)
+                    : FString::Printf(TEXT("Automation Driver %s failed on selector '%s'. Check visibility, focus, and enabled state."),
+                        bType ? TEXT("typing") : TEXT("click"), *SelectorName);
+                AsyncTask(ENamedThreads::GameThread, [Self, bSucceeded, Failure]()
+                {
+                    Self->CompleteStep(bSucceeded ? EResultStatus::Passed : EResultStatus::Failed, Failure);
+                });
+            });
+        }
+
+        void CompleteStep(EResultStatus Status, const FString& Detail)
+        {
+            check(IsInGameThread());
+            FStepResult StepResult;
+            StepResult.Index = Index + 1;
+            const FProbeTestStep& Definition = Definitions[Index];
+            StepResult.AssertionId = !Definition.AssertionId.IsNone() ? Definition.AssertionId.ToString()
+                : FString::Printf(TEXT("Probe.BuiltIn.%s"),
+                    *StaticEnum<EProbeStepType>()->GetNameStringByValue(static_cast<int64>(Definition.Type)));
+            StepResult.Description = Definition.Description;
+            if (StepResult.Description.IsEmpty())
+            {
+                if (!Definition.AssertionId.IsNone())
+                {
+                    if (const FExtensionAssertion* Extension = FindExtensionAssertion(Definition.AssertionId))
+                    { StepResult.Description = Extension->Name; }
+                    else { StepResult.Description = Definition.AssertionId.ToString(); }
+                }
+                else { StepResult.Description = GetAssertionInfo(Definition.Type).Name; }
+            }
+            StepResult.Status = Status;
+            StepResult.Detail = Detail;
+            StepResult.DurationMs = (FPlatformTime::Seconds() - StepStartedAt) * 1000.0;
+            Result.Steps.Add(MoveTemp(StepResult));
+            if (Status != EResultStatus::Passed)
+            {
+                Result.Status = Status;
+                Result.Detail = FString::Printf(TEXT("Step %d: %s"), Index + 1, *Detail);
+                Finish(); return;
+            }
+            ++Index;
+            NextStep();
+        }
+
+        void Finish()
+        {
+            check(IsInGameThread());
+            // Restore only the native scoped Details search: we cannot safely
+            // reverse an arbitrary button action or edit to another widget.
+            if (bSavedSearch)
+            {
+                ProbeDetailsSearchRestore::Restore(
+                    EditedView.Pin(), EditedSearch.Pin(), OriginalSearchText);
+                // Slate Details search processes a delayed callback. Do not
+                // claim cleanup was verified until it has had time to settle.
+                TSharedRef<FAsyncProbeTestRun> Self = AsShared();
+                FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+                    [Self](float)
+                    {
+                        Self->FinishRestoration();
+                        return false;
+                    }), 1.6f);
+                return;
+            }
+            FinishRestoration();
+        }
+
+        void FinishRestoration()
+        {
+            check(IsInGameThread());
+            if (bSavedSearch)
+            {
+                TSharedPtr<SSearchBox> Search = EditedSearch.Pin();
+                TSharedPtr<IDetailsView> View = EditedView.Pin();
+                const FString ActualText = Search.IsValid() ? Search->GetText().ToString() : TEXT("<widget unavailable>");
+                const bool bActualActive = View.IsValid() && View->HasActiveSearch();
+                if (!Search.IsValid() || !View.IsValid()
+                    || ActualText != OriginalSearchText.ToString()
+                    || bActualActive != bOriginalSearchActive)
+                {
+                    Result.Status = EResultStatus::Error;
+                    Result.Detail += FString::Printf(
+                        TEXT(" Native Details search restoration failed after 1600 ms: original text='%s', current text='%s', original active=%s, current active=%s, view valid=%s, widget valid=%s."),
+                        *OriginalSearchText.ToString(), *ActualText,
+                        bOriginalSearchActive ? TEXT("yes") : TEXT("no"),
+                        bActualActive ? TEXT("yes") : TEXT("no"),
+                        View.IsValid() ? TEXT("yes") : TEXT("no"),
+                        Search.IsValid() ? TEXT("yes") : TEXT("no"));
+                }
+            }
+            if (bSavedFocus && FSlateApplication::IsInitialized())
+            {
+                if (TSharedPtr<SWidget> Focus = PreviousKeyboardFocus.Pin())
+                {
+                    FWidgetPath FocusPath;
+                    if (FSlateApplication::Get().FindPathToWidget(Focus.ToSharedRef(), FocusPath, EVisibility::Visible))
+                    { FSlateApplication::Get().SetKeyboardFocus(Focus.ToSharedRef(), EFocusCause::SetDirectly); }
+                }
+            }
+            if (bDriverEnabledByProbe && IAutomationDriverModule::Get().IsEnabled())
+            { IAutomationDriverModule::Get().Disable(); }
+            Result.DurationMs = (FPlatformTime::Seconds() - StartedAt) * 1000.0;
+            // Editor fixture context stays alive until the completion callback
+            // returns; its RAII cleanup runs before the shared state is freed.
+            if (OnComplete) { OnComplete(MoveTemp(Result)); }
+        }
+    };
+
+    void RunTestAsync(const UProbeTestAsset* Asset, TFunction<void(FTestResult)> Callback)
+    {
+        check(IsInGameThread());
+        if (!Asset || !Asset->Steps.ContainsByPredicate(
+            [](const FProbeTestStep& Step) { return Step.AssertionId.IsNone() && IsNativeUIStep(Step.Type); }))
+        {
+            Callback(RunTest(Asset)); // Existing non-UI runner remains unmodified.
+            return;
+        }
+        TSharedRef<FAsyncProbeTestRun> Run = MakeShared<FAsyncProbeTestRun>();
+        Run->Begin(Asset, MoveTemp(Callback));
     }
 
     FTestResult RunTest(const UProbeTestAsset* Asset)
