@@ -10,6 +10,7 @@
 #include "ProbeDev9Workflow.h"
 #include "ProbeDev10PackPolicy.h"
 #include "ProbeDev10RunHistory.h"
+#include "ProbeDev11RunHistory.h"
 #include "ProbeExtensions.h"
 #include "ProbeSelfTest.h"
 #include "ProbeTestAssetFactory.h"
@@ -2234,6 +2235,11 @@ public:
     {
         GConfig->GetFloat(TEXT("ProbeWorkspace"), TEXT("DefinitionFraction"), DefinitionFraction, GEditorPerProjectIni);
         DefinitionFraction = FMath::Clamp(DefinitionFraction, 0.20f, 0.85f);
+        // Recover only the latest valid stored run as the comparison baseline.
+        // Corrupt/unsupported files are ignored; current results remain empty.
+        ProbeDev11RunHistory::FSnapshot PreviousSnapshot;
+        if (ProbeDev11RunHistory::ReadLatest(ProbeDev11RunHistory::DefaultDirectory(), PreviousSnapshot))
+        { LastCompletedResults = MoveTemp(PreviousSnapshot.Results); }
         RefreshAssets();
         FEditorDelegates::PostUndoRedo.AddSP(this, &SProbeWorkspace::HandleUndoRedo);
         ChildSlot
@@ -2313,6 +2319,14 @@ public:
                             ]
                             // Execution controls read left-to-right Export, Rerun,
                             // Run All, Run Selected. The primary action stays at the edge.
+                            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2, 0, 2, 0)
+                            [
+                                SNew(SComboButton)
+                                .ToolTipText(LOCTEXT("RunHistoryTip", "Inspect previous run results or compare this run against a saved baseline. Keeps up to 30 project-local runs in Saved/Probe/History."))
+                                .OnGetMenuContent(this, &SProbeWorkspace::BuildHistoryMenu)
+                                .ButtonContent()
+                                [ SNew(STextBlock).Text(LOCTEXT("RunHistory", "History")) ]
+                            ]
                             + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
                             [
                                 SNew(SButton)
@@ -2658,6 +2672,8 @@ private:
     double LastRunDurationMs = 0.0;
     TArray<Probe::FTestResult> LastCompletedResults;
     ProbeDev10RunHistory::FComparison LastComparison;
+    FString SelectedHistoryBaselinePath; // session-only selection; never changes Test Assets
+    bool bViewingSavedHistory = false;
 
     void OnDefinitionResized(float NewFraction)
     {
@@ -4745,7 +4761,7 @@ private:
         FString Log;
         if (LastComparison.bHasPreviousRun)
         {
-            Log += FString::Printf(TEXT("Compared with previous session run: %d regression(s), %d recovered, %d still failing, %d new identity(s).\n\n"),
+            Log += FString::Printf(TEXT("Compared with saved run baseline: %d regression(s), %d recovered, %d still failing, %d new identity(s).\n\n"),
                 LastComparison.Regressions, LastComparison.Recovered, LastComparison.StillFailing, LastComparison.NewlyObserved);
         }
         for (const Probe::FTestResult& Result : Results)
@@ -4781,8 +4797,9 @@ private:
     FText RunInfoText() const
     {
         if (Results.IsEmpty()) { return FText::GetEmpty(); }
-        FString Summary = FString::Printf(TEXT("%d test(s) | %.2f ms | %s"),
-            Results.Num(), LastRunDurationMs, *LastRunTime.ToString(TEXT("%H:%M:%S")));
+        FString Summary = FString::Printf(TEXT("%d test(s) | %.2f ms | %s%s"),
+            Results.Num(), LastRunDurationMs, *LastRunTime.ToString(TEXT("%H:%M:%S")),
+            bViewingSavedHistory ? TEXT(" UTC (saved)") : TEXT(""));
         if (LastComparison.bHasPreviousRun)
         {
             Summary += FString::Printf(TEXT(" | Delta: %d regression(s), %d recovered"),
@@ -5385,6 +5402,85 @@ private:
         ShowResults();
     }
 
+    void ViewSavedRun(FString Path)
+    {
+        if (bRunInProgress) { return; }
+        ProbeDev11RunHistory::FSnapshot Saved;
+        if (!ProbeDev11RunHistory::Read(Path, Saved))
+        {
+            FeedbackMessage = LOCTEXT("HistoryLoadFailed", "Saved Probe run is missing or invalid.");
+            return;
+        }
+        Results = MoveTemp(Saved.Results);
+        LastRunTime = Saved.TimestampUtc;
+        LastRunDurationMs = 0.0;
+        for (const Probe::FTestResult& Result : Results) { LastRunDurationMs += Result.DurationMs; }
+        LastComparison = ProbeDev10RunHistory::FComparison();
+        bViewingSavedHistory = true;
+        ActiveResultFilter = EResultFilter::All;
+        SelectedResultIndex = INDEX_NONE;
+        FeedbackMessage = LOCTEXT("HistoryViewed", "Viewing saved results. Running a test creates a new run; saved history is read-only.");
+        ShowResults();
+        return;
+    }
+
+    void CompareToSavedRun(FString Path)
+    {
+        if (bRunInProgress) { return; }
+        ProbeDev11RunHistory::FSnapshot Saved;
+        if (!ProbeDev11RunHistory::Read(Path, Saved))
+        {
+            FeedbackMessage = LOCTEXT("HistoryBaselineFailed", "Comparison baseline is missing or invalid.");
+            return;
+        }
+        SelectedHistoryBaselinePath = MoveTemp(Path);
+        LastComparison = ProbeDev10RunHistory::Compare(Saved.Results, Results);
+        FeedbackMessage = LOCTEXT("HistoryBaselineSet", "Comparison baseline selected for this workspace and future runs.");
+        ShowResults();
+        return;
+    }
+
+    void UseLatestHistoryBaseline()
+    {
+        SelectedHistoryBaselinePath.Reset();
+        FeedbackMessage = LOCTEXT("HistoryBaselineAutomatic", "Future runs will compare against the latest completed run.");
+        return;
+    }
+
+    TSharedRef<SWidget> BuildHistoryMenu()
+    {
+        FMenuBuilder Menu(true, nullptr);
+        const TArray<FString> Paths = ProbeDev11RunHistory::ListPaths(ProbeDev11RunHistory::DefaultDirectory());
+        Menu.AddMenuEntry(LOCTEXT("HistoryAutoBaseline", "Use Latest Run as Baseline"),
+            LOCTEXT("HistoryAutoBaselineTip", "Compare the next run against the last completed run rather than a manually selected history entry."),
+            FSlateIcon(), FUIAction(FExecuteAction::CreateSP(this, &SProbeWorkspace::UseLatestHistoryBaseline)));
+        if (Paths.IsEmpty())
+        {
+            Menu.AddMenuEntry(LOCTEXT("HistoryEmpty", "No Saved Runs"),
+                LOCTEXT("HistoryEmptyTip", "Complete a Probe run to record its results under Saved/Probe/History."),
+                FSlateIcon(), FUIAction());
+        }
+        int32 Listed = 0;
+        for (const FString& Path : Paths)
+        {
+            ProbeDev11RunHistory::FSnapshot Saved;
+            if (!ProbeDev11RunHistory::Read(Path, Saved)) { continue; }
+            const FString Label = ProbeDev11RunHistory::Label(Saved);
+            Menu.AddSubMenu(FText::FromString(Label), FText::FromString(Path),
+                FNewMenuDelegate::CreateLambda([this, Path](FMenuBuilder& SubMenu)
+                {
+                    SubMenu.AddMenuEntry(LOCTEXT("HistoryView", "View Saved Results"),
+                        LOCTEXT("HistoryViewTip", "Open these saved results in the Results Explorer without executing any tests."),
+                        FSlateIcon(), FUIAction(FExecuteAction::CreateSP(this, &SProbeWorkspace::ViewSavedRun, Path)));
+                    SubMenu.AddMenuEntry(LOCTEXT("HistoryCompare", "Compare Against This Run"),
+                        LOCTEXT("HistoryCompareTip", "Compare the currently displayed results and future runs against this saved baseline."),
+                        FSlateIcon(), FUIAction(FExecuteAction::CreateSP(this, &SProbeWorkspace::CompareToSavedRun, Path)));
+                }));
+            if (++Listed >= 12) { break; }
+        }
+        return Menu.MakeWidget();
+    }
+
     TSharedRef<SWidget> BuildPackMenu()
     {
         FMenuBuilder Menu(true, nullptr);
@@ -5600,9 +5696,31 @@ private:
             ActivePackForRun.Reset();
             PackCompletedAttempts.Reset();
             ScopedRunOptions.Reset();
-            LastComparison = ProbeDev10RunHistory::Compare(LastCompletedResults, Results);
+            // Read explicitly chosen history baseline; otherwise use the previous
+            // completed run, including one recovered from a prior Editor session.
+            const TArray<Probe::FTestResult>* Baseline = &LastCompletedResults;
+            ProbeDev11RunHistory::FSnapshot ChosenBaseline;
+            if (!SelectedHistoryBaselinePath.IsEmpty())
+            {
+                if (ProbeDev11RunHistory::Read(SelectedHistoryBaselinePath, ChosenBaseline))
+                { Baseline = &ChosenBaseline.Results; }
+                else
+                { SelectedHistoryBaselinePath.Reset(); }
+            }
+            LastComparison = ProbeDev10RunHistory::Compare(*Baseline, Results);
             LastCompletedResults = Results;
             LastRunTime = FDateTime::Now();
+            bViewingSavedHistory = false;
+            // Persistence errors never turn a valid test run into a failed test.
+            if (!Results.IsEmpty())
+            {
+                ProbeDev11RunHistory::FSnapshot Snapshot;
+                Snapshot.TimestampUtc = FDateTime::UtcNow();
+                Snapshot.EngineVersion = FEngineVersion::Current().ToString();
+                Snapshot.Results = Results;
+                if (!ProbeDev11RunHistory::Save(ProbeDev11RunHistory::DefaultDirectory(), Snapshot))
+                { UE_LOG(LogTemp, Warning, TEXT("Probe could not persist run history under Saved/Probe/History.")); }
+            }
             LastRunDurationMs = 0.0;
             for (const Probe::FTestResult& Result : Results) { LastRunDurationMs += Result.DurationMs; }
             FeedbackMessage = LOCTEXT("RunCompleted", "Run complete. Select a result for diagnostics.");
@@ -5666,6 +5784,7 @@ private:
         bRunInProgress = true;
         bStopAfterCurrentTest = false;
         bStopDueToPackFailure = false;
+        bViewingSavedHistory = false;
         LastComparison = ProbeDev10RunHistory::FComparison();
         FeedbackMessage = LOCTEXT("RunInProgress", "Running Probe tests. Native UI steps execute asynchronously; results are shown as they finish.");
         StartNextQueuedTest();

@@ -1,9 +1,9 @@
 {
   "FileVersion": 3,
-  "Version": 43,
-  "VersionName": "0.15.4-dev10",
+  "Version": 44,
+  "VersionName": "0.15.4-dev11",
   "FriendlyName": "Probe",
-  "Description": "Visual QA Tests and Packs, native Editor UI automation, safe conditional waits, reusable step groups, opt-in cleanup and parameter variations, failure triage, Pack execution policies, dependencies, safe retries, and run comparisons.",
+  "Description": "Visual QA Tests and Packs, native Editor UI automation, safe conditional waits, reusable step groups, opt-in cleanup and parameter variations, failure triage, Pack execution policies, dependencies, safe retries, persistent run history, and historical comparisons.",
   "Category": "Testing",
   "CreatedBy": "Mippi",
   "CanContainContent": true,

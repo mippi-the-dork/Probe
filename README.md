@@ -1,7 +1,15 @@
-# Probe 0.15.4-dev10
+# Probe 0.15.4-dev11
 
 Probe is an **Unreal Engine 5.8.3 Editor-only QA plugin** for creating, executing, and organizing QA checks against plugins, Editor UI registrations, assets, actor state, reflection, and properties. Probe also supports safe temporary UObject fixtures, reversible Editor selection actions, and one-click plugin QA Pack generation. This source package targets Windows 64-bit; no engine source modifications.
 
+
+## Dev 11: persistent run history and historical comparisons
+
+Dev 11 registers **57 native Automation Framework cases** (the 54/54 verified Dev 10 baseline and three new history regressions). Probe now persists **completed run snapshots** under `<Project>/Saved/Probe/History/` in a versioned JSON format. The last **30** runs are retained, and malformed/unsupported snapshots are ignored without affecting test execution. The new **History** toolbar menu lets authors inspect up to 12 recent runs, see their saved step diagnostics, and select an earlier run as the comparison baseline. On Editor restart, Probe recovers the latest valid run automatically for the next regression comparison. History browsing never changes Test Assets, Packs, authorization, or test ordering.
+
+Snapshots include UTC time, Unreal version, Test Asset/variation identity, results, retries, timings, and per-step data. File size is capped at 12 MB, and a persistence error never changes a test outcome. Explicit historical baseline selection applies to the current workspace session only. See [Persistent History](Docs/PERSISTENT_HISTORY_0154_DEV11.md) and [Dev 11 QA](Docs/QA_CHECKLIST_0154_DEV11.md).
+
+**Verification:** Dev 10 passed **54/54 native Probe tests** in UE 5.8.3, based on the user's November 2, 2026 run. Dev 11 awaits UE compilation and native execution.
 
 ## Dev 10: Pack execution policy, prerequisites and run comparisons
 
@@ -9,7 +17,7 @@ Dev 10 registers **54 native Automation Framework cases** (50 verified in Dev 9 
 
 Probe reports compare the latest completed run with the previous run in the current Editor workspace session. Results include attempt counts, setup/cleanup/assertion/infrastructure classification, and JSON export metadata. Comparison history is session-only and does not modify project files. The original full-run success message and every saved assertion ordinal remain unchanged. See [Dev 10 Pack policies](Docs/PACK_EXECUTION_AND_HISTORY_0154_DEV10.md) and [Dev 10 QA](Docs/QA_CHECKLIST_0154_DEV10.md).
 
-**Verification:** Dev 9 Hotfix 1 passed **50/50** Probe native tests in UE 5.8.3 based on the user's November 1, 2026 run. Dev 10 has passed offline source checks; UE compilation and the 54-test runtime suite remain unverified.
+**Verification:** Dev 9 Hotfix 1 passed **50/50** Probe native tests in UE 5.8.3. Dev 10 subsequently passed **54/54** Probe native tests in UE 5.8.3 based on the user's November 2, 2026 run.
 
 ## Dev 9 Hotfix 1: lifecycle regression fixture correction
 
