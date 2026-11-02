@@ -2,7 +2,14 @@
 #include "ProbeTestRunner.h"
 #include "ProbeReferenceValidation.h"
 #include "ProbeAssertionCatalog.h"
+#include "ProbeNativeUIPolicy.h"
 #include "ProbeStepEditing.h"
+#include "ProbeStepGroups.h"
+#include "ProbeQueueControl.h"
+#include "ProbeDev8Workflow.h"
+#include "ProbeDev9Workflow.h"
+#include "ProbeDev10PackPolicy.h"
+#include "ProbeDev10RunHistory.h"
 #include "ProbeExtensions.h"
 #include "ProbeSelfTest.h"
 #include "ProbeTestAssetFactory.h"
@@ -10,6 +17,7 @@
 #include "ProbeTestPackFactory.h"
 #include "ProbeEditorNavigation.h"
 #include "ProbeWidgetDiscovery.h"
+#include "ProbeWidgetTargetAuthoring.h"
 #include "AssetDefinition.h"
 #include "Modules/ModuleManager.h"
 #include "Interfaces/IPluginManager.h"
@@ -65,6 +73,7 @@
 #include "ScopedTransaction.h"
 #include "Misc/TransactionObjectEvent.h"
 #include "UObject/UObjectGlobals.h"
+#include "UObject/StrongObjectPtr.h"
 #include "Styling/SlateStyle.h"
 #include "Styling/SlateStyleRegistry.h"
 #include "Brushes/SlateImageBrush.h"
@@ -143,6 +152,7 @@ namespace Probe
     // accidentally run with an omitted class/path/comparison field.
     static FString StepConfigurationIssue(const FProbeTestStep& Step)
     {
+        if (!Step.bEnabled) { return FString(); }
         if (!Step.AssertionId.IsNone() && !FindExtensionAssertion(Step.AssertionId))
         { return FString::Printf(TEXT("Required assertion provider '%s' is unavailable"), *Step.AssertionId.ToString()); }
         const uint8 Fields = StepFields(Step);
@@ -151,12 +161,8 @@ namespace Probe
         if ((Fields & PropertyField) && Step.PropertyName.TrimStartAndEnd().IsEmpty()) { return TEXT("Enter a Property, Function, or Tag name"); }
         // Empty text is a legitimate expected value for equality/inequality
         // on text widgets, including an intentionally cleared Details search.
-        const bool bEmptyExpectedIsValid = Step.AssertionId.IsNone() &&
-            (Step.Type == EProbeStepType::UIWidgetTextEquals
-            || Step.Type == EProbeStepType::UIWidgetTextNotEquals
-            || Step.Type == EProbeStepType::UIWaitForWidgetTextEquals
-            || Step.Type == EProbeStepType::UIDetailsSearchTextEquals
-            || Step.Type == EProbeStepType::UIDetailsSearchTextNotEquals);
+        const bool bEmptyExpectedIsValid = Step.AssertionId.IsNone()
+            && ProbeNativeUIPolicy::AllowsEmptyValue(Step.Type);
         if ((Fields & ValueField) && Step.ExpectedValue.TrimStartAndEnd().IsEmpty() && !bEmptyExpectedIsValid)
         { return TEXT("Enter an expected value or search text"); }
         if (Step.AssertionId.IsNone() &&
@@ -182,14 +188,13 @@ namespace Probe
             }
         }
         if (Step.AssertionId.IsNone() &&
-            ((Step.Type == EProbeStepType::UIWidgetClick || Step.Type == EProbeStepType::UIWidgetTypeText)
-            || (Step.Type >= EProbeStepType::UIWidgetExists && Step.Type <= EProbeStepType::UIWaitForWidgetTextEquals))
+            ProbeNativeUIPolicy::HasTarget(Step.Type)
             && !Step.Target.Equals(TEXT("details:search"), ESearchCase::IgnoreCase)
             && !(Step.Target.StartsWith(TEXT("id:"), ESearchCase::IgnoreCase)
                 && Step.Target.Len() > 3 && !Step.Target.RightChop(3).TrimStartAndEnd().IsEmpty()))
         { return TEXT("Use details:search or id:<Slate automation ID>, not screen coordinates"); }
         if (Step.AssertionId.IsNone() &&
-            (Step.Type == EProbeStepType::UIWaitForWidgetVisible || Step.Type == EProbeStepType::UIWaitForWidgetTextEquals)
+            ProbeNativeUIPolicy::IsWait(Step.Type)
             && (!FMath::IsFinite(Step.UIWaitTimeoutSeconds)
                 || Step.UIWaitTimeoutSeconds < 0.1 || Step.UIWaitTimeoutSeconds > 30.0))
         { return TEXT("Wait Timeout must be between 0.1 and 30 seconds"); }
@@ -210,6 +215,7 @@ namespace Probe
         for (int32 Index = 0; Index < Asset.Steps.Num(); ++Index)
         {
             const FProbeTestStep& Step = Asset.Steps[Index];
+            if (!Step.bEnabled) { continue; }
             if (Step.AssertionId.IsNone()
                 && Step.Type >= EProbeStepType::ActorFixtureSpawn
                 && Step.Type <= EProbeStepType::ActorFixtureScaleNotNearlyEquals
@@ -218,8 +224,7 @@ namespace Probe
                 return FString::Printf(TEXT("Step %d: Enable 'Allow Transient Editor Actors' to authorize temporary level actors."), Index + 1);
             }
             if (Step.AssertionId.IsNone() &&
-                (Step.Type == EProbeStepType::UIWidgetClick || Step.Type == EProbeStepType::UIWidgetTypeText)
-                && !Asset.bAllowEditorUIInput)
+                ProbeNativeUIPolicy::IsInput(Step.Type) && !Asset.bAllowEditorUIInput)
             {
                 return FString::Printf(TEXT("Step %d: Enable 'Allow Editor UI Input' to authorize live Editor interactions."), Index + 1);
             }
@@ -731,8 +736,10 @@ namespace Probe
         case EProbeStepType::ActorFixtureScaleNotNearlyEquals:
             Step.Target = TEXT("ActorA"); Step.ExpectedValue = TEXT("2,1,1"); break;
         case EProbeStepType::UIWidgetClick:
+        case EProbeStepType::UIWidgetClearText:
             Step.Target = TEXT("details:search"); break;
         case EProbeStepType::UIWidgetTypeText:
+        case EProbeStepType::UIWidgetAppendText:
             Step.Target = TEXT("details:search"); Step.ExpectedValue = TEXT("ProbeTemporarySearch"); break;
         case EProbeStepType::UIDetailsSearchVisible:
         case EProbeStepType::UIDetailsSearchFilterActive:
@@ -745,12 +752,20 @@ namespace Probe
         case EProbeStepType::UIWidgetNotExists:
         case EProbeStepType::UIWidgetVisible:
         case EProbeStepType::UIWidgetInteractable:
+        case EProbeStepType::UIWidgetNotVisible:
+        case EProbeStepType::UIWidgetNotInteractable:
         case EProbeStepType::UIWaitForWidgetVisible:
+        case EProbeStepType::UIWaitForWidgetExists:
+        case EProbeStepType::UIWaitForWidgetGone:
+        case EProbeStepType::UIWaitForWidgetInteractable:
+        case EProbeStepType::UIWaitForWidgetNotVisible:
             Step.Target = TEXT("details:search"); break;
         case EProbeStepType::UIWidgetTextEquals:
         case EProbeStepType::UIWidgetTextContains:
         case EProbeStepType::UIWidgetTextNotEquals:
         case EProbeStepType::UIWaitForWidgetTextEquals:
+        case EProbeStepType::UIWaitForWidgetTextContains:
+        case EProbeStepType::UIWaitForWidgetTextNotEquals:
             Step.Target = TEXT("details:search"); Step.ExpectedValue = TEXT("ProbeTemporarySearch"); break;
         case EProbeStepType::UIDetailsSearchFilterInactive:
             break;
@@ -1989,19 +2004,24 @@ private:
 // Discovery surface shared by the top-level browser and the per-step Target picker.
 // Only explicit Automation Driver IDs are offered; duplicate IDs cannot be applied.
 DECLARE_DELEGATE_OneParam(FOnProbeWidgetTargetChosen, const FString&);
+DECLARE_DELEGATE_ThreeParams(FOnProbeWidgetTargetCreateStep, EProbeStepType, const FString&, const FString&);
 
 class SProbeWidgetTargetPicker : public SCompoundWidget
 {
 public:
     SLATE_BEGIN_ARGS(SProbeWidgetTargetPicker) {}
         SLATE_EVENT(FOnProbeWidgetTargetChosen, OnChosen)
+        SLATE_EVENT(FOnProbeWidgetTargetCreateStep, OnCreateStep)
+        SLATE_ARGUMENT(bool, CanCreateSteps)
     SLATE_END_ARGS()
 
     void Construct(const FArguments& Args)
     {
         OnChosen = Args._OnChosen;
+        OnCreateStep = Args._OnCreateStep;
+        bCanCreateSteps = Args._CanCreateSteps;
         ChildSlot
-        [ SNew(SBox).WidthOverride(560.0f)
+        [ SNew(SBox).WidthOverride(690.0f)
           [ SNew(SVerticalBox)
             + SVerticalBox::Slot().AutoHeight().Padding(8, 7, 8, 4)
             [ SNew(STextBlock).Text(LOCTEXT("WidgetTargetPickerTitle", "Live Widget Targets"))
@@ -2022,6 +2042,16 @@ public:
                   .OnClicked(this, &SProbeWidgetTargetPicker::Rescan)
                   [ SNew(SImage).Image(FAppStyle::GetBrush("Icons.Refresh")) ] ] ]
             + SVerticalBox::Slot().AutoHeight().Padding(8, 0, 8, 5)
+            [ SNew(SHorizontalBox)
+                + SHorizontalBox::Slot().AutoWidth().Padding(0, 0, 14, 0)
+                [ SNew(SCheckBox).OnCheckStateChanged_Lambda([this](ECheckBoxState State)
+                  { bOnlyUnique = State == ECheckBoxState::Checked; Rebuild(); })
+                  [ SNew(STextBlock).Text(LOCTEXT("WidgetTargetOnlyUnique", "Unique only")) ] ]
+                + SHorizontalBox::Slot().AutoWidth().Padding(0, 0, 12, 0)
+                [ SNew(SCheckBox).OnCheckStateChanged_Lambda([this](ECheckBoxState State)
+                  { bOnlyAmbiguous = State == ECheckBoxState::Checked; Rebuild(); })
+                  [ SNew(STextBlock).Text(LOCTEXT("WidgetTargetOnlyAmbiguous", "Duplicates only")) ] ] ]
+            + SVerticalBox::Slot().AutoHeight().Padding(8, 0, 8, 5)
             [ SAssignNew(SummaryText, STextBlock).ColorAndOpacity(FSlateColor::UseSubduedForeground()) ]
             + SVerticalBox::Slot().FillHeight(1).Padding(6, 0, 6, 4)
             [ SNew(SBox).HeightOverride(345.0f)
@@ -2030,7 +2060,7 @@ public:
             + SVerticalBox::Slot().AutoHeight().Padding(8, 1, 8, 8)
             [ SNew(STextBlock).AutoWrapText(true)
               .ColorAndOpacity(FSlateColor::UseSubduedForeground())
-              .Text(LOCTEXT("WidgetTargetPickerFooter", "Red 'duplicate' targets are ambiguous and cannot be inserted. For the native Level Editor Details search, use details:search manually.")) ]
+              .Text(LOCTEXT("WidgetTargetPickerFooter", "Snapshots are read-only and refresh on demand. Preview text is provided only for directly tagged text widgets. Duplicate IDs cannot be used. Native Details uses details:search.")) ]
           ] ];
         Scan();
     }
@@ -2040,7 +2070,11 @@ private:
     TSharedPtr<SVerticalBox> Rows;
     TSharedPtr<STextBlock> SummaryText;
     FOnProbeWidgetTargetChosen OnChosen;
+    FOnProbeWidgetTargetCreateStep OnCreateStep;
     FString Filter;
+    bool bCanCreateSteps = false;
+    bool bOnlyUnique = false;
+    bool bOnlyAmbiguous = false;
 
     void FilterChanged(const FText& NewText) { Filter = NewText.ToString(); Rebuild(); }
     FReply Rescan() { Scan(); return FReply::Handled(); }
@@ -2059,14 +2093,17 @@ private:
         int32 Shown = 0;
         for (const auto& Candidate : Candidates)
         {
-            const FString Searchable = Candidate.Id + TEXT(" ") + Candidate.WindowTitle + TEXT(" ") + Candidate.WidgetType;
-            if (!Filter.IsEmpty() && !Searchable.Contains(Filter, ESearchCase::IgnoreCase)) { continue; }
+            if (!ProbeWidgetTargetAuthoring::MatchesBrowserFilters(
+                Candidate, Filter, bOnlyUnique, bOnlyAmbiguous)) { continue; }
             if (Shown++ >= 250) { break; }
             const FString Selector = Candidate.Selector();
             const bool bUnique = Candidate.IsUnique();
             const FString Status = bUnique
                 ? (Candidate.bVisible ? (Candidate.bEnabled ? TEXT("Visible / Enabled") : TEXT("Visible / Disabled")) : TEXT("Hidden"))
                 : FString::Printf(TEXT("DUPLICATE x%d"), Candidate.Matches);
+            const FString Preview = Candidate.bHasReadableText
+                ? TEXT("Text: ") + Candidate.ReadableText.Left(180).Replace(TEXT("\n"), TEXT(" ")).Replace(TEXT("\r"), TEXT(" "))
+                : TEXT("Text: not exposed by this widget type");
             Rows->AddSlot().AutoHeight().Padding(1, 2)
             [ SNew(SBorder).BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder")).Padding(5)
               [ SNew(SHorizontalBox)
@@ -2082,7 +2119,12 @@ private:
                     + SVerticalBox::Slot().AutoHeight()
                     [ SNew(STextBlock).Text(FText::FromString(Status))
                       .Font(FAppStyle::GetFontStyle("SmallFont"))
-                      .ColorAndOpacity(bUnique ? FSlateColor::UseSubduedForeground() : FSlateColor(FLinearColor(1.0f, 0.45f, 0.38f))) ] ]
+                      .ColorAndOpacity(bUnique ? FSlateColor::UseSubduedForeground() : FSlateColor(FLinearColor(1.0f, 0.45f, 0.38f))) ]
+                    + SVerticalBox::Slot().AutoHeight()
+                    [ SNew(STextBlock).Text(FText::FromString(Preview))
+                      .Font(FAppStyle::GetFontStyle("SmallFont"))
+                      .ToolTipText(FText::FromString(Candidate.bHasReadableText ? Candidate.ReadableText : Preview))
+                      .ColorAndOpacity(FSlateColor::UseSubduedForeground()) ] ]
                 + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(5, 0)
                 [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
                   .IsEnabled(bUnique)
@@ -2103,6 +2145,40 @@ private:
                       return FReply::Handled();
                   })
                   [ SNew(STextBlock).Text(LOCTEXT("WidgetTargetUse", "Use")) ] ]
+                + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(4, 0, 0, 0)
+                [ SNew(SComboButton)
+                  .IsEnabled(bUnique && bCanCreateSteps && OnCreateStep.IsBound())
+                  .ToolTipText(LOCTEXT("WidgetCreateStepTip", "Create an assertion in the currently selected Probe Test. This does not click or modify the target widget."))
+                  .OnGetMenuContent_Lambda([this, Selector, PreviewValue = Candidate.ReadableText, bTextReadable = Candidate.bHasReadableText]() -> TSharedRef<SWidget>
+                  {
+                      FMenuBuilder Menu(true, nullptr);
+                      const FOnProbeWidgetTargetCreateStep Callback = OnCreateStep;
+                      auto AddAction = [&Menu, Callback, Selector, PreviewValue](const FText& Label, EProbeStepType Type)
+                      {
+                          Menu.AddMenuEntry(Label, FText::GetEmpty(), FSlateIcon(),
+                              FUIAction(FExecuteAction::CreateLambda([Callback, Type, Selector, PreviewValue]()
+                              {
+                                  FSlateApplication::Get().DismissAllMenus();
+                                  Callback.ExecuteIfBound(Type, Selector, PreviewValue);
+                              })));
+                      };
+                      AddAction(LOCTEXT("QuickWidgetExists", "Widget Exists"), EProbeStepType::UIWidgetExists);
+                      AddAction(LOCTEXT("QuickWidgetVisible", "Widget Is Visible"), EProbeStepType::UIWidgetVisible);
+                      AddAction(LOCTEXT("QuickWidgetInteractable", "Widget Is Interactable"), EProbeStepType::UIWidgetInteractable);
+                      AddAction(LOCTEXT("QuickWaitVisible", "Wait For Widget Visible"), EProbeStepType::UIWaitForWidgetVisible);
+                      AddAction(LOCTEXT("QuickWaitInteractable", "Wait For Widget Interactable"), EProbeStepType::UIWaitForWidgetInteractable);
+                      AddAction(LOCTEXT("QuickWaitGone", "Wait For Widget Gone"), EProbeStepType::UIWaitForWidgetGone);
+                      if (bTextReadable)
+                      {
+                          Menu.AddMenuSeparator();
+                          AddAction(LOCTEXT("QuickWidgetTextEquals", "Widget Text Equals Current Text"), EProbeStepType::UIWidgetTextEquals);
+                          AddAction(LOCTEXT("QuickWaitWidgetText", "Wait For Current Text"), EProbeStepType::UIWaitForWidgetTextEquals);
+                          AddAction(LOCTEXT("QuickWaitWidgetTextChange", "Wait For Text To Change"), EProbeStepType::UIWaitForWidgetTextNotEquals);
+                      }
+                      return Menu.MakeWidget();
+                  })
+                  .ButtonContent()
+                  [ SNew(STextBlock).Text(LOCTEXT("WidgetTargetAddStep", "+ Step")) ] ]
               ] ];
         }
         if (Shown == 0)
@@ -2266,6 +2342,15 @@ public:
                             + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(4, 0, 3, 0)
                             [
                                 SNew(SButton)
+                                .ButtonStyle(FAppStyle::Get(), "SimpleButton")
+                                .ToolTipText(LOCTEXT("StopAfterCurrentTip", "Finish the currently executing test safely, then skip remaining queued tests. Does not interrupt an in-flight Automation Driver action."))
+                                .IsEnabled_Lambda([this]() { return bRunInProgress && !bStopAfterCurrentTest; })
+                                .OnClicked(this, &SProbeWorkspace::StopAfterCurrentTest)
+                                [ SNew(STextBlock).Text(LOCTEXT("StopAfterCurrent", "Stop After Test")) ]
+                            ]
+                            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(4, 0, 3, 0)
+                            [
+                                SNew(SButton)
                                 .ToolTipText(LOCTEXT("RunAllTip", "Run every discovered Probe test"))
                                 .OnClicked(this, &SProbeWorkspace::RunAll)
                                 [ SNew(STextBlock).Text(LOCTEXT("RunAll", "Run All")) ]
@@ -2330,10 +2415,23 @@ public:
                         [
                             SNew(SComboButton)
                             .ToolTipText(LOCTEXT("OpenWidgetTargetBrowser", "Find explicitly tagged widgets in currently visible Unreal Editor windows. Copy stable id: selectors for your UI steps."))
-                            .OnGetMenuContent_Lambda([]() -> TSharedRef<SWidget>
-                            { return SNew(SProbeWidgetTargetPicker); })
+                            .OnGetMenuContent_Lambda([this]() -> TSharedRef<SWidget>
+                            {
+                                return SNew(SProbeWidgetTargetPicker)
+                                    .CanCreateSteps(HasSelectedAsset())
+                                    .OnCreateStep(FOnProbeWidgetTargetCreateStep::CreateSP(this, &SProbeWorkspace::AddWidgetTargetStep));
+                            })
                             .ButtonContent()
                             [ SNew(STextBlock).Text(LOCTEXT("WidgetTargets", "Widget Targets")) ]
+                        ]
+                        + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 6, 0)
+                        [
+                            SNew(SComboButton)
+                            .IsEnabled(this, &SProbeWorkspace::HasSelectedAsset)
+                            .ToolTipText(LOCTEXT("CheckTargetsTip", "Read-only live preflight for every native UI selector in this Test Asset"))
+                            .OnGetMenuContent(this, &SProbeWorkspace::BuildWidgetTargetPreflight)
+                            .ButtonContent()
+                            [ SNew(STextBlock).Text(LOCTEXT("CheckTargets", "Check Targets")) ]
                         ]
                         + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
                         [
@@ -2537,11 +2635,17 @@ private:
     TSharedPtr<SHorizontalBox> ResultTabs;
     TArray<Probe::FTestResult> Results;
     TArray<int32> QueuedTestResultIndices;
+    TMap<int32, Probe::FRunOptions> ScopedRunOptions;
     bool bRunInProgress = false;
+    bool bStopAfterCurrentTest = false;
+    bool bStopDueToPackFailure = false;
+    TStrongObjectPtr<UProbeTestPack> ActivePackForRun; // Retain policy asset until async queue drains.
+    TMap<int32, int32> PackCompletedAttempts;
     enum class EResultFilter : uint8 { All, Passed, Failed, Skipped, Error };
     EResultFilter ActiveResultFilter = EResultFilter::All;
     int32 SelectedResultIndex = INDEX_NONE;
     bool bProblemsFirst = true;
+    bool bProblemStepsOnly = false;
     bool bShowLog = false;
     bool bResultsFocused = false;
     float DefinitionFraction = 0.64f;
@@ -2552,6 +2656,8 @@ private:
     bool bStepNotesShown = false;
     FDateTime LastRunTime;
     double LastRunDurationMs = 0.0;
+    TArray<Probe::FTestResult> LastCompletedResults;
+    ProbeDev10RunHistory::FComparison LastComparison;
 
     void OnDefinitionResized(float NewFraction)
     {
@@ -2850,6 +2956,122 @@ private:
             }));
     }
 
+    TSharedRef<SWidget> BuildWidgetTargetPreflight()
+    {
+        TSharedRef<SVerticalBox> Body = SNew(SVerticalBox);
+        Body->AddSlot().AutoHeight().Padding(8, 6, 8, 3)
+        [ SNew(STextBlock).Text(LOCTEXT("PreflightTitle", "Native UI Target Preflight"))
+          .Font(FAppStyle::GetFontStyle("HeadingExtraSmall")) ];
+        const UProbeTestAsset* Asset = SelectedAsset();
+        if (!Asset) { return SNullWidget::NullWidget; }
+        const ProbeWidgetTargetAuthoring::FPreflightReport Report =
+            ProbeWidgetTargetAuthoring::AnalyzeTargets(*Asset, ProbeWidgetDiscovery::Collect());
+        TSharedRef<SVerticalBox> Items = SNew(SVerticalBox);
+        for (const ProbeWidgetTargetAuthoring::FPreflightItem& Item : Report.Items)
+        {
+            Items->AddSlot().AutoHeight().Padding(8, 3)
+            [ SNew(SVerticalBox)
+              + SVerticalBox::Slot().AutoHeight()
+              [ SNew(STextBlock).Text(FText::FromString(FString::Printf(TEXT("%d. %s"), Item.StepIndex + 1, *Item.Selector))) ]
+              + SVerticalBox::Slot().AutoHeight()
+              [ SNew(STextBlock).AutoWrapText(true).Text(FText::FromString(Item.Resolution.Description()
+                    + (Item.bMissingIsExpected ? TEXT(" (absence satisfies this condition)") : TEXT(""))))
+                .Font(FAppStyle::GetFontStyle("SmallFont"))
+                .ColorAndOpacity(FSlateColor::UseSubduedForeground()) ] ];
+        }
+        Body->AddSlot().AutoHeight().Padding(8, 3, 8, 5)
+        [ SNew(STextBlock).Text(FText::FromString(FString::Printf(
+            TEXT("%d targets | %d unique | %d missing | %d expected absent | %d ambiguous | %d native Details (deferred) | %d unsupported"),
+            Report.Total(), Report.Unique, Report.Missing, Report.ExpectedAbsent, Report.Ambiguous,
+            Report.DeferredNativeDetails, Report.Unsupported))) ];
+        if (Report.Total() == 0)
+        {
+            Body->AddSlot().AutoHeight().Padding(8)
+            [ SNew(STextBlock).Text(LOCTEXT("PreflightEmpty", "This Test has no native UI widget-selector steps.")) ];
+        }
+        Body->AddSlot().FillHeight(1).Padding(3)
+        [ SNew(SScrollBox) + SScrollBox::Slot()[ Items ] ];
+        Body->AddSlot().AutoHeight().Padding(8, 5)
+        [ SNew(STextBlock).AutoWrapText(true)
+          .Text(LOCTEXT("PreflightHelp", "Read-only snapshot, not a test result. Missing targets may appear after you open their panels; details:search resolves at execution time."))
+          .ColorAndOpacity(FSlateColor::UseSubduedForeground()) ];
+        return SNew(SBox).WidthOverride(520.0f).HeightOverride(360.0f)[ Body ];
+    }
+
+    // Diagnostic snapshots never modify a Test Asset or invoke Automation Driver
+    // input. Missing windows are hints, not permanent configuration failures.
+    TSharedRef<SWidget> BuildWidgetTargetDiagnostics(TWeakObjectPtr<UProbeTestAsset> TestRef, int32 Index)
+    {
+        const UProbeTestAsset* Test = TestRef.Get();
+        if (!Test || !Test->Steps.IsValidIndex(Index)) { return SNullWidget::NullWidget; }
+        const FProbeTestStep& Step = Test->Steps[Index];
+        const ProbeWidgetDiscovery::FResolution Result =
+            ProbeWidgetDiscovery::Resolve(ProbeWidgetDiscovery::Collect(), Step.Target);
+        TSharedRef<SVerticalBox> Body = SNew(SVerticalBox);
+        Body->AddSlot().AutoHeight().Padding(8, 6, 8, 3)
+        [ SNew(STextBlock).Text(LOCTEXT("TargetDiagnosticTitle", "Live Target Inspector"))
+          .Font(FAppStyle::GetFontStyle("HeadingExtraSmall")) ];
+        Body->AddSlot().AutoHeight().Padding(8, 2)
+        [ SNew(STextBlock).Text(FText::FromString(Step.Target)) ];
+        Body->AddSlot().AutoHeight().Padding(8, 2)
+        [ SNew(STextBlock).AutoWrapText(true)
+          .Text(FText::FromString(Result.Description()))
+          .ColorAndOpacity(Result.State == ProbeWidgetDiscovery::EResolution::Ambiguous
+              || Result.State == ProbeWidgetDiscovery::EResolution::Unsupported
+              ? FSlateColor(FLinearColor(1.0f, 0.50f, 0.35f))
+              : FSlateColor::UseSubduedForeground()) ];
+        if (Result.CanUse())
+        {
+            const ProbeWidgetDiscovery::FCandidate& Candidate = Result.Candidate;
+            Body->AddSlot().AutoHeight().Padding(8, 2)
+            [ SNew(STextBlock).AutoWrapText(true)
+              .Text(FText::FromString(Candidate.bHasReadableText
+                  ? TEXT("Readable text: ") + Candidate.ReadableText : TEXT("Direct text: unavailable for this widget type"))) ];
+            if (Candidate.bHasReadableText)
+            {
+                Body->AddSlot().AutoHeight().Padding(8, 4)
+                [ SNew(SHorizontalBox)
+                  + SHorizontalBox::Slot().AutoWidth()
+                  [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
+                    .OnClicked_Lambda([Text = Candidate.ReadableText]()
+                    { FPlatformApplicationMisc::ClipboardCopy(*Text); return FReply::Handled(); })
+                    [ SNew(STextBlock).Text(LOCTEXT("TargetCopyObservedText", "Copy Observed Text")) ] ]
+                  + SHorizontalBox::Slot().AutoWidth().Padding(8, 0, 0, 0)
+                  [ SNew(SButton)
+                    .IsEnabled(Step.Type == EProbeStepType::UIWidgetTextEquals
+                        || Step.Type == EProbeStepType::UIWidgetTextContains
+                        || Step.Type == EProbeStepType::UIWidgetTextNotEquals
+                        || Step.Type == EProbeStepType::UIWaitForWidgetTextEquals
+                        || Step.Type == EProbeStepType::UIWaitForWidgetTextContains
+                        || Step.Type == EProbeStepType::UIWaitForWidgetTextNotEquals)
+                    .ToolTipText(LOCTEXT("CaptureObservedTextHelp", "Replace Expected Value with the observed text. This is an undoable asset change."))
+                    .OnClicked_Lambda([this, TestRef, Index, Selector = Step.Target]()
+                    {
+                        FSlateApplication::Get().DismissAllMenus();
+                        // Re-check that this selector is still unique before committing.
+                        const auto Latest = ProbeWidgetDiscovery::Resolve(ProbeWidgetDiscovery::Collect(), Selector);
+                        if (!Latest.CanUse() || !Latest.Candidate.bHasReadableText)
+                        {
+                            FeedbackMessage = LOCTEXT("CaptureTargetStale", "Widget changed or disappeared; inspect it again.");
+                        }
+                        else
+                        {
+                            ChangeStep(TestRef, Index, LOCTEXT("CaptureObservedWidgetText", "Capture Probe Widget Text"),
+                                [Text = Latest.Candidate.ReadableText](FProbeTestStep& Mutable) { Mutable.ExpectedValue = Text; }, true);
+                            FeedbackMessage = LOCTEXT("CapturedWidgetText", "Expected text captured from current widget.");
+                        }
+                        return FReply::Handled();
+                    })
+                    [ SNew(STextBlock).Text(LOCTEXT("CaptureObservedText", "Set as Expected")) ] ] ];
+            }
+        }
+        Body->AddSlot().AutoHeight().Padding(8, 4, 8, 7)
+        [ SNew(STextBlock).AutoWrapText(true)
+          .Text(LOCTEXT("TargetInspectorCaveat", "Snapshot only. Reopen Inspect to refresh. A target may be unavailable until its owning panel is opened. This does not run a test."))
+          .ColorAndOpacity(FSlateColor::UseSubduedForeground()) ];
+        return SNew(SBox).WidthOverride(460.0f)[ Body ];
+    }
+
     void AddStringField(const TSharedRef<SVerticalBox>& Body, TWeakObjectPtr<UProbeTestAsset> TestRef,
         int32 Index, EStepTextField Field, const FText& Label, const FString& Hint = FString())
     {
@@ -2899,8 +3121,7 @@ private:
                     if (!Test || !Test->Steps.IsValidIndex(Index) || !Test->Steps[Index].AssertionId.IsNone())
                     { return EVisibility::Collapsed; }
                     const EProbeStepType Type = Test->Steps[Index].Type;
-                    return Type == EProbeStepType::UIWidgetClick || Type == EProbeStepType::UIWidgetTypeText
-                        || (Type >= EProbeStepType::UIWidgetExists && Type <= EProbeStepType::UIWaitForWidgetTextEquals)
+                    return ProbeNativeUIPolicy::HasTarget(Type)
                         ? EVisibility::Visible : EVisibility::Collapsed;
                 })
                 .ToolTipText(LOCTEXT("FindWidgetTargetTip", "Discover live Automation Driver IDs and insert a unique widget target"))
@@ -2916,6 +3137,25 @@ private:
                 })
                 .ButtonContent()
                 [ SNew(STextBlock).Text(LOCTEXT("FindWidgetTargetButton", "Find...")) ]
+            ]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(4, 0, 0, 0)
+            [
+                SNew(SComboButton)
+                .Visibility_Lambda([TestRef, Index, Field]()
+                {
+                    if (Field != EStepTextField::Target) { return EVisibility::Collapsed; }
+                    const UProbeTestAsset* Test = TestRef.Get();
+                    if (!Test || !Test->Steps.IsValidIndex(Index) || !Test->Steps[Index].AssertionId.IsNone())
+                    { return EVisibility::Collapsed; }
+                    const EProbeStepType Type = Test->Steps[Index].Type;
+                    return ProbeNativeUIPolicy::HasTarget(Type)
+                        ? EVisibility::Visible : EVisibility::Collapsed;
+                })
+                .ToolTipText(LOCTEXT("InspectTargetTip", "Inspect the current live widget without running the test or modifying the Editor"))
+                .OnGetMenuContent_Lambda([this, TestRef, Index]() -> TSharedRef<SWidget>
+                { return BuildWidgetTargetDiagnostics(TestRef, Index); })
+                .ButtonContent()
+                [ SNew(STextBlock).Text(LOCTEXT("InspectTargetButton", "Inspect")) ]
             ]
             + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(4, 0, 0, 0)
             [
@@ -3141,8 +3381,7 @@ private:
         {
             Summary += FString::Printf(TEXT("  |  class: %s"), *Step.ExpectedClass);
         }
-        if (Step.AssertionId.IsNone() && (Step.Type == EProbeStepType::UIWaitForWidgetVisible
-            || Step.Type == EProbeStepType::UIWaitForWidgetTextEquals))
+        if (Step.AssertionId.IsNone() && (ProbeNativeUIPolicy::IsWait(Step.Type)))
         { Summary += FString::Printf(TEXT("  |  wait: %.1f s"), Step.UIWaitTimeoutSeconds); }
         if (Fields & Probe::PropertyField)
         {
@@ -3291,6 +3530,35 @@ private:
         return FReply::Handled();
     }
 
+    FReply DuplicateStepGroup(TWeakObjectPtr<UProbeTestAsset> TestRef, int32 Index)
+    {
+        UProbeTestAsset* Test = TestRef.Get();
+        if (!Test || !Test->Steps.IsValidIndex(Index)) { return FReply::Handled(); }
+        const ProbeStepGroups::FRange Original = ProbeStepGroups::FindContiguous(Test->Steps, Index);
+        if (!Original.IsValid() || Original.Num() > 256 || Test->Steps.Num() + Original.Num() > 4096)
+        {
+            FeedbackMessage = LOCTEXT("DuplicateGroupLimit", "Group cannot be duplicated (256 steps per group; 4096 total).");
+            return FReply::Handled();
+        }
+        ProbeStepGroups::FRange Copied;
+        ChangeAsset(TestRef, LOCTEXT("DuplicateGroupTransaction", "Duplicate Probe Step Group"),
+            [Index, &Copied](UProbeTestAsset& Asset)
+            { ProbeDev8Workflow::DuplicateGroup(Asset, Index, Copied); });
+        if (!Copied.IsValid())
+        {
+            FeedbackMessage = LOCTEXT("DuplicateGroupFailed", "Could not duplicate the group.");
+            return FReply::Handled();
+        }
+        TSet<int32> Shifted;
+        for (const int32 Expanded : ExpandedStepIndices)
+        { Shifted.Add(Expanded >= Copied.First ? Expanded + Copied.Num() : Expanded); }
+        ExpandedStepIndices = MoveTemp(Shifted);
+        for (int32 I = Copied.First; I <= Copied.Last; ++I) { ExpandedStepIndices.Add(I); }
+        RebuildTestEditor();
+        FeedbackMessage = FText::FromString(FString::Printf(TEXT("Duplicated %d step(s) into a separate group."), Copied.Num()));
+        return FReply::Handled();
+    }
+
     FReply DeleteStep(TWeakObjectPtr<UProbeTestAsset> TestRef, int32 Index)
     {
         UProbeTestAsset* Asset = TestRef.Get();
@@ -3317,6 +3585,15 @@ private:
         const int32 StepCount = Asset->Steps.Num();
         const bool bExpanded = ExpandedStepIndices.Contains(Index);
         TSharedRef<SVerticalBox> Card = SNew(SVerticalBox);
+        if (!Step.GroupName.TrimStartAndEnd().IsEmpty() && (Index == 0
+            || Asset->Steps[Index - 1].GroupName.TrimStartAndEnd() != Step.GroupName.TrimStartAndEnd()))
+        {
+            const ProbeStepGroups::FRange Range = ProbeStepGroups::FindContiguous(Asset->Steps, Index);
+            Card->AddSlot().AutoHeight().Padding(6, 6, 4, 3)
+            [ SNew(STextBlock).Font(FAppStyle::GetFontStyle("NormalFontBold"))
+              .Text(FText::FromString(FString::Printf(TEXT("Group: %s  (%d steps)"),
+                  *Step.GroupName, Range.Num()))) ];
+        }
         Card->AddSlot().AutoHeight()
         [
             SNew(SBorder)
@@ -3335,6 +3612,16 @@ private:
                               bExpanded ? TEXT("Probe.DisclosureExpanded") : TEXT("Probe.DisclosureCollapsed"))
                           : FAppStyle::GetBrush(TEXT("Icons.ChevronRight"))) ]
                 ]
+                + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 7, 0)
+                [ SNew(SCheckBox)
+                  .IsChecked(Step.bEnabled ? ECheckBoxState::Checked : ECheckBoxState::Unchecked)
+                  .ToolTipText(LOCTEXT("StepEnabledTip", "Enable or disable this step without deleting it. Disabled steps report Skipped and never perform actions."))
+                  .OnCheckStateChanged_Lambda([this, TestRef, Index](ECheckBoxState State)
+                  {
+                      ChangeStep(TestRef, Index, LOCTEXT("ToggleStepTransaction", "Toggle Probe Test Step"),
+                          [bEnabled = State == ECheckBoxState::Checked](FProbeTestStep& Item) { Item.bEnabled = bEnabled; });
+                      RebuildTestEditor();
+                  }) ]
                 + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 8, 0)
                 [ SNew(STextBlock).Text(FText::AsNumber(Index + 1)).ColorAndOpacity(FSlateColor::UseSubduedForeground()) ]
                 + SHorizontalBox::Slot().FillWidth(1.0f).VAlign(VAlign_Center)
@@ -3378,6 +3665,21 @@ private:
                     [ SNew(SImage).Image(FAppStyle::GetBrush("Icons.Duplicate")) ]
                 ]
                 + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+                [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
+                  .ToolTipText(LOCTEXT("CopyStepGroupTip", "Copy this step or its adjacent named group to the clipboard as a reusable Probe step group."))
+                  .OnClicked_Lambda([this, TestRef, Index]() { return CopyStepGroup(TestRef, Index); })
+                  [ SNew(STextBlock).Text(LOCTEXT("CopyStepGroup", "Copy Group")) ] ]
+                + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+                [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
+                  .ToolTipText(LOCTEXT("DuplicateGroupTip", "Duplicate this step or its contiguous named group directly after itself. Named copies receive a distinct group name. Undoable."))
+                  .OnClicked_Lambda([this, TestRef, Index]() { return DuplicateStepGroup(TestRef, Index); })
+                  [ SNew(STextBlock).Text(LOCTEXT("DuplicateGroupButton", "Duplicate Group")) ] ]
+                + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+                [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
+                  .ToolTipText(LOCTEXT("RunStepGroupTip", "Run just this step or its adjacent named group. Earlier setup steps are NOT executed."))
+                  .OnClicked_Lambda([this, TestRef, Index]() { return RunStepGroup(TestRef, Index); })
+                  [ SNew(STextBlock).Text(LOCTEXT("RunStepGroup", "Run Group")) ] ]
+                + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
                 [
                     SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
                     .ToolTipText(LOCTEXT("DeleteStepTip", "Remove this step"))
@@ -3396,12 +3698,24 @@ private:
         if (bExpanded)
         {
             TSharedRef<SVerticalBox> Fields = SNew(SVerticalBox);
+            Fields->AddSlot().AutoHeight().Padding(4, 4)
+            [ SNew(SHorizontalBox)
+              + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 10, 0)
+              [ SNew(STextBlock).Text(LOCTEXT("GroupNameLabel", "Group")) ]
+              + SHorizontalBox::Slot().FillWidth(1.0f)
+              [ SNew(SEditableTextBox)
+                .HintText(LOCTEXT("GroupNameHint", "Optional name; adjacent matches form a group"))
+                .Text(FText::FromString(Step.GroupName))
+                .OnTextCommitted_Lambda([this, TestRef, Index](const FText& Value, ETextCommit::Type)
+                {
+                    ChangeStep(TestRef, Index, LOCTEXT("GroupNameTransaction", "Name Probe Step Group"),
+                        [Name = Value.ToString().TrimStartAndEnd()](FProbeTestStep& Item) { Item.GroupName = Name.Left(96); });
+                    RebuildTestEditor();
+                }) ] ];
             const uint8 StepFieldMask = Probe::StepFields(Step);
             if (StepFieldMask & Probe::TargetField)
             {
-                const FText Label = (Step.AssertionId.IsNone() && (Type == EProbeStepType::UIWidgetClick
-                    || Type == EProbeStepType::UIWidgetTypeText
-                    || (Type >= EProbeStepType::UIWidgetExists && Type <= EProbeStepType::UIWaitForWidgetTextEquals)))
+                const FText Label = (Step.AssertionId.IsNone() && ProbeNativeUIPolicy::HasTarget(Type))
                     ? LOCTEXT("UIWidgetSelectorLabel", "Widget Selector")
                     : Type == EProbeStepType::FixtureCreateObject ? LOCTEXT("FixtureClassPath", "Object Class")
                     : Type == EProbeStepType::FixtureSetProperty || Type == EProbeStepType::FixturePropertyEquals
@@ -3521,10 +3835,11 @@ private:
                       ? LOCTEXT("ActorFixtureLabelPattern", "Outliner Label Text")
                     : Type == EProbeStepType::ActorFixtureFolderNotEquals
                       ? LOCTEXT("ActorFixtureOtherFolder", "Forbidden Outliner Folder")
-                    : Type == EProbeStepType::UIWidgetTypeText ? LOCTEXT("UIInputTextLabel", "Text To Enter")
-                    : Type == EProbeStepType::UIWidgetTextContains || Type == EProbeStepType::UIDetailsSearchTextContains
+                    : (Type == EProbeStepType::UIWidgetTypeText || Type == EProbeStepType::UIWidgetAppendText) ? LOCTEXT("UIInputTextLabel", "Text To Enter")
+                    : Type == EProbeStepType::UIWidgetTextContains || Type == EProbeStepType::UIWaitForWidgetTextContains
+                      || Type == EProbeStepType::UIDetailsSearchTextContains
                       ? LOCTEXT("UIContainsExpectedLabel", "Contained Text")
-                    : Type == EProbeStepType::UIWaitForWidgetTextEquals ? LOCTEXT("UIWaitExpectedLabel", "Awaited Text")
+                    : (Type == EProbeStepType::UIWaitForWidgetTextEquals || Type == EProbeStepType::UIWaitForWidgetTextNotEquals) ? LOCTEXT("UIWaitExpectedLabel", "Awaited Text")
                     : Type == EProbeStepType::FixtureCreateObject ? LOCTEXT("NewFixtureIdentifier", "New Fixture ID")
                     : Type == EProbeStepType::FixtureSetProperty ? LOCTEXT("FixtureNewPropertyValue", "New Value")
                     : Type == EProbeStepType::ActorFolderEquals || Type == EProbeStepType::AssetPackagePathEquals
@@ -3538,8 +3853,7 @@ private:
                     : LOCTEXT("StepExpected", "Expected Value"));
             }
             if (StepFieldMask & Probe::ToleranceField) { AddToleranceField(Fields, TestRef, Index); }
-            if (Step.AssertionId.IsNone() && (Type == EProbeStepType::UIWaitForWidgetVisible
-                || Type == EProbeStepType::UIWaitForWidgetTextEquals))
+            if (Step.AssertionId.IsNone() && ProbeNativeUIPolicy::IsWait(Type))
             { AddUIWaitTimeoutField(Fields, TestRef, Index); }
             if (bStepNotesShown)
             {
@@ -3621,6 +3935,7 @@ private:
                     + SHorizontalBox::Slot().FillWidth(1.0f).VAlign(VAlign_Center)
                     [
                         SNew(STextBlock)
+                        .AddMetaData(MakeShared<FDriverIdMetaData>(FName(TEXT("Probe.Workspace.TestReadiness"))))
                         .Font(FAppStyle::GetFontStyle("NormalFontBold"))
                         .Text_Lambda([TestRef]()
                         {
@@ -3757,6 +4072,27 @@ private:
                 ]
             ]
         ];
+        // Avoid suggesting that a read-only widget assertion needs simulated
+        // input permission. This unobtrusive hint only appears when all native
+        // UI steps in the asset are non-input observations or waits.
+        Settings->AddSlot().AutoHeight().Padding(10, 3, 10, 5)
+        [ SNew(STextBlock)
+          .Visibility_Lambda([TestRef]()
+          {
+              const UProbeTestAsset* Test = TestRef.Get();
+              if (!Test) { return EVisibility::Collapsed; }
+              bool bReadOnlyUI = false;
+              for (const FProbeTestStep& Step : Test->Steps)
+              {
+                  if (!Step.AssertionId.IsNone()) { continue; }
+                  if (Step.bEnabled && ProbeNativeUIPolicy::IsInput(Step.Type))
+                  { return EVisibility::Collapsed; }
+                  bReadOnlyUI |= Step.bEnabled && ProbeNativeUIPolicy::IsObservation(Step.Type);
+              }
+              return bReadOnlyUI ? EVisibility::Visible : EVisibility::Collapsed;
+          })
+          .ColorAndOpacity(FSlateColor::UseSubduedForeground())
+          .Text(LOCTEXT("UIReadOnlyPermissionHint", "Native widget observations and waits are read-only. Authorize UI Input is not required.")) ];
         // UI input permission is independent of world fixtures and is OFF on
         // legacy tests. Authors can opt in from the actual Probe test editor.
         Settings->AddSlot().AutoHeight().Padding(0, 2, 0, 5)
@@ -3770,8 +4106,8 @@ private:
                 if (!Test) { return EVisibility::Collapsed; }
                 for (const FProbeTestStep& Step : Test->Steps)
                 {
-                    if (Step.AssertionId.IsNone() &&
-                        (Step.Type == EProbeStepType::UIWidgetClick || Step.Type == EProbeStepType::UIWidgetTypeText))
+                    if (Step.AssertionId.IsNone() && Step.bEnabled &&
+                        ProbeNativeUIPolicy::IsInput(Step.Type))
                     { return EVisibility::Visible; }
                 }
                 return EVisibility::Collapsed;
@@ -3848,6 +4184,109 @@ private:
                 })
             ]
         ];
+        // Dev 9 scenario authoring: settings are stored on the existing Test Asset,
+        // with undo transactions. No external fixture or copied permission assets.
+        TSharedRef<SVerticalBox> Scenario = SNew(SVerticalBox);
+        Scenario->AddSlot().AutoHeight().Padding(0, 0, 0, 5)
+        [ SNew(STextBlock).Text(LOCTEXT("ScenarioTitle", "WORKFLOW & VARIATIONS"))
+          .Font(FAppStyle::GetFontStyle("NormalFontBold")) ];
+        Scenario->AddSlot().AutoHeight().Padding(0, 0, 0, 5)
+        [ SNew(STextBlock).AutoWrapText(true)
+          .ColorAndOpacity(FSlateColor::UseSubduedForeground())
+          .Text(LOCTEXT("ScenarioDescription", "Optional: name the first step group as Setup and the last as Cleanup. Cleanup runs after a failed full test. Add variations using ${Key} placeholders and one Key=Value binding per line.")) ];
+        Scenario->AddSlot().AutoHeight().Padding(0, 2, 0, 5)
+        [ SNew(SHorizontalBox)
+          + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 5, 0)
+          [ SNew(STextBlock).Text(LOCTEXT("SetupGroupName", "Setup Group")) ]
+          + SHorizontalBox::Slot().FillWidth(1).Padding(0, 0, 14, 0)
+          [ SNew(SEditableTextBox)
+            .HintText(LOCTEXT("SetupGroupHint", "First group name (optional)"))
+            .Text_Lambda([TestRef]() { const UProbeTestAsset* A=TestRef.Get(); return A ? FText::FromString(A->SetupGroupName) : FText::GetEmpty(); })
+            .OnTextCommitted_Lambda([this, TestRef](const FText& Value, ETextCommit::Type)
+            { ChangeAsset(TestRef, LOCTEXT("SetSetupGroupTransaction", "Set Probe Setup Group"),
+                [Name=Value.ToString().TrimStartAndEnd()](UProbeTestAsset& A) { A.SetupGroupName=Name.Left(96); }); }) ]
+          + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 5, 0)
+          [ SNew(STextBlock).Text(LOCTEXT("CleanupGroupName", "Cleanup Group")) ]
+          + SHorizontalBox::Slot().FillWidth(1)
+          [ SNew(SEditableTextBox)
+            .HintText(LOCTEXT("CleanupGroupHint", "Last group name (optional)"))
+            .Text_Lambda([TestRef]() { const UProbeTestAsset* A=TestRef.Get(); return A ? FText::FromString(A->CleanupGroupName) : FText::GetEmpty(); })
+            .OnTextCommitted_Lambda([this, TestRef](const FText& Value, ETextCommit::Type)
+            { ChangeAsset(TestRef, LOCTEXT("SetCleanupGroupTransaction", "Set Probe Cleanup Group"),
+                [Name=Value.ToString().TrimStartAndEnd()](UProbeTestAsset& A) { A.CleanupGroupName=Name.Left(96); }); }) ] ];
+        Scenario->AddSlot().AutoHeight().Padding(0, 3, 0, 5)
+        [ SNew(SHorizontalBox)
+          + SHorizontalBox::Slot().FillWidth(1).VAlign(VAlign_Center)
+          [ SNew(STextBlock).Text(LOCTEXT("VariationsHeading", "Named parameter variations")) ]
+          + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(4, 0)
+          [ SNew(SCheckBox)
+            .IsChecked_Lambda([TestRef]() { const UProbeTestAsset* A=TestRef.Get(); return A && A->bRunVariationsInBulk ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+            .OnCheckStateChanged_Lambda([this, TestRef](ECheckBoxState State)
+            { ChangeAsset(TestRef, LOCTEXT("BulkVariationTransaction", "Toggle Probe Bulk Variations"),
+                [State](UProbeTestAsset& A) { A.bRunVariationsInBulk=State==ECheckBoxState::Checked; }); })
+            [ SNew(STextBlock).Text(LOCTEXT("ExpandVariationsBulk", "Expand in Run All / Packs")) ] ]
+          + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(4, 0)
+          [ SNew(SButton).IsEnabled_Lambda([this, TestRef]() { const UProbeTestAsset* A=TestRef.Get(); return !bRunInProgress && A && !A->Variations.IsEmpty(); })
+            .OnClicked(this, &SProbeWorkspace::RunSelectedVariations)
+            [ SNew(STextBlock).Text(LOCTEXT("RunSelectedVariations", "Run Variations")) ] ]
+          + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(4, 0)
+          [ SNew(SButton)
+            .OnClicked_Lambda([this, TestRef]()
+            {
+                ChangeAsset(TestRef, LOCTEXT("AddVariationTransaction", "Add Probe Variation"),
+                    [](UProbeTestAsset& A)
+                    {
+                        TSet<FString> Existing;
+                        for (const FProbeTestVariation& V : A.Variations) { Existing.Add(V.Name); }
+                        FString Name;
+                        for (int32 N=1; N<1000; ++N)
+                        { Name=FString::Printf(TEXT("Case %d"), N); if (!Existing.Contains(Name)) { break; } }
+                        FProbeTestVariation V; V.Name=Name; A.Variations.Add(MoveTemp(V));
+                    });
+                RebuildTestEditor(); return FReply::Handled();
+            })
+            [ SNew(STextBlock).Text(LOCTEXT("AddVariation", "+ Variation")) ] ] ];
+        for (int32 VariationIndex=0; VariationIndex<Asset->Variations.Num(); ++VariationIndex)
+        {
+            Scenario->AddSlot().AutoHeight().Padding(0, 2, 0, 2)
+            [ SNew(SHorizontalBox)
+              + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 5, 0)
+              [ SNew(SCheckBox)
+                .IsChecked_Lambda([TestRef, VariationIndex]()
+                { const UProbeTestAsset* A=TestRef.Get(); return A && A->Variations.IsValidIndex(VariationIndex) && A->Variations[VariationIndex].bEnabled ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+                .OnCheckStateChanged_Lambda([this, TestRef, VariationIndex](ECheckBoxState State)
+                { ChangeAsset(TestRef, LOCTEXT("EnableVariationTransaction", "Toggle Probe Variation"),
+                    [VariationIndex, State](UProbeTestAsset& A) { if (A.Variations.IsValidIndex(VariationIndex)) { A.Variations[VariationIndex].bEnabled=State==ECheckBoxState::Checked; } }); }) ]
+              + SHorizontalBox::Slot().FillWidth(0.26f).VAlign(VAlign_Center).Padding(0, 0, 5, 0)
+              [ SNew(SEditableTextBox).HintText(LOCTEXT("VariationNameHint", "Variation name"))
+                .Text_Lambda([TestRef, VariationIndex]()
+                { const UProbeTestAsset* A=TestRef.Get(); return A && A->Variations.IsValidIndex(VariationIndex) ? FText::FromString(A->Variations[VariationIndex].Name) : FText::GetEmpty(); })
+                .OnTextCommitted_Lambda([this, TestRef, VariationIndex](const FText& Value, ETextCommit::Type)
+                { ChangeAsset(TestRef, LOCTEXT("RenameVariationTransaction", "Rename Probe Variation"),
+                    [VariationIndex, Name=Value.ToString().TrimStartAndEnd()](UProbeTestAsset& A)
+                    { if (A.Variations.IsValidIndex(VariationIndex)) { A.Variations[VariationIndex].Name=Name.Left(96); } }); }) ]
+              + SHorizontalBox::Slot().FillWidth(0.74f).VAlign(VAlign_Center).Padding(0, 0, 5, 0)
+              [ SNew(SEditableTextBox).HintText(LOCTEXT("VariationBindingsHint", "Key=Value (separate entries with semicolons)"))
+                .ToolTipText(LOCTEXT("VariationBindingsTip", "Separate Key=Value bindings with semicolons; multiline is also accepted in asset data."))
+                .Text_Lambda([TestRef, VariationIndex]()
+                { const UProbeTestAsset* A=TestRef.Get(); return A && A->Variations.IsValidIndex(VariationIndex) ? FText::FromString(A->Variations[VariationIndex].Bindings) : FText::GetEmpty(); })
+                .OnTextCommitted_Lambda([this, TestRef, VariationIndex](const FText& Value, ETextCommit::Type)
+                { ChangeAsset(TestRef, LOCTEXT("SetBindingsTransaction", "Edit Probe Variation Bindings"),
+                    [VariationIndex, Bindings=Value.ToString()](UProbeTestAsset& A)
+                    { if (A.Variations.IsValidIndex(VariationIndex)) { A.Variations[VariationIndex].Bindings=Bindings; } }); }) ]
+              + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+              [ SNew(SButton)
+                .OnClicked_Lambda([this, TestRef, VariationIndex]()
+                {
+                    ChangeAsset(TestRef, LOCTEXT("DeleteVariationTransaction", "Remove Probe Variation"),
+                        [VariationIndex](UProbeTestAsset& A) { if (A.Variations.IsValidIndex(VariationIndex)) { A.Variations.RemoveAt(VariationIndex); } });
+                    RebuildTestEditor(); return FReply::Handled();
+                })
+                [ SNew(STextBlock).Text(LOCTEXT("RemoveVariation", "Remove")) ] ] ];
+        }
+        Settings->AddSlot().AutoHeight().Padding(0, 8, 0, 3)
+        [ SNew(SBorder).BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
+          .Padding(FMargin(10.0f, 8.0f)) [ Scenario ] ];
         EditorRows->AddSlot().AutoHeight().Padding(3, 3, 3, 7)
         [
             SNew(SBorder)
@@ -3860,6 +4299,11 @@ private:
             SNew(SHorizontalBox)
             + SHorizontalBox::Slot().FillWidth(1.0f).VAlign(VAlign_Center)
             [ SNew(STextBlock).Text(FText::FromString(FString::Printf(TEXT("Test Steps (%d)"), Asset->Steps.Num()))) ]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 7, 0)
+            [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
+              .ToolTipText(LOCTEXT("PasteGroupTip", "Append a copied Probe step group to this Test Asset. Permission settings are never copied."))
+              .OnClicked(this, &SProbeWorkspace::PasteStepGroup)
+              [ SNew(STextBlock).Text(LOCTEXT("PasteGroup", "Paste Steps")) ] ]
             + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
             [
                 SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
@@ -4038,6 +4482,35 @@ private:
         return Menu.MakeWidget();
     }
 
+    // Dev 5: one transaction creates a ready-to-run inspection step directly
+    // from a discovered, unique target. Current text is a snapshot, not a bind.
+    void AddWidgetTargetStep(EProbeStepType Type, const FString& Selector, const FString& /*PreviewText*/)
+    {
+        UProbeTestAsset* Asset = SelectedAsset();
+        if (!Asset) { return; }
+        // Never trust stale picker state: rescan just before applying.
+        const ProbeWidgetDiscovery::FResolution Resolution =
+            ProbeWidgetDiscovery::Resolve(ProbeWidgetDiscovery::Collect(), Selector);
+        if (!Resolution.CanUse())
+        {
+            FeedbackMessage = FText::FromString(TEXT("Widget target changed: ") + Resolution.Description());
+            return;
+        }
+        FProbeTestStep Step = Probe::MakeStep(Type, Asset->GetPathName());
+        if (!ProbeWidgetTargetAuthoring::ConfigureQuickStep(Step, Type, Resolution.Candidate))
+        {
+            FeedbackMessage = LOCTEXT("QuickWidgetUnsupported", "That assertion cannot be created from this widget snapshot.");
+            return;
+        }
+        const FScopedTransaction Transaction(LOCTEXT("AddWidgetTargetTransaction", "Add Probe Widget Assertion"));
+        Asset->Modify();
+        Asset->Steps.Add(MoveTemp(Step));
+        Asset->MarkPackageDirty();
+        ExpandedStepIndices.Add(Asset->Steps.Num() - 1);
+        RebuildTestEditor();
+        FeedbackMessage = FText::FromString(TEXT("Added widget assertion: ") + Selector);
+    }
+
     void AddStep(EProbeStepType Type)
     {
         UProbeTestAsset* Asset = SelectedAsset();
@@ -4109,6 +4582,64 @@ private:
         return Menu.MakeWidget();
     }
 
+    FReply CopyStepGroup(TWeakObjectPtr<UProbeTestAsset> TestRef, int32 Index)
+    {
+        const UProbeTestAsset* Test = TestRef.Get();
+        if (!Test) { return FReply::Handled(); }
+        const ProbeStepGroups::FRange Range = ProbeStepGroups::FindContiguous(Test->Steps, Index);
+        FString Json, Error;
+        if (!ProbeStepGroups::Encode(Test->Steps, Range, Json, Error))
+        { FeedbackMessage = FText::FromString(Error); return FReply::Handled(); }
+        FPlatformApplicationMisc::ClipboardCopy(*Json);
+        FeedbackMessage = FText::FromString(FString::Printf(TEXT("Copied %d Probe step(s)."), Range.Num()));
+        return FReply::Handled();
+    }
+
+    FReply PasteStepGroup()
+    {
+        UProbeTestAsset* Test = SelectedAsset();
+        if (!Test) { return FReply::Handled(); }
+        FString Clipboard;
+        FPlatformApplicationMisc::ClipboardPaste(Clipboard);
+        TArray<FProbeTestStep> Pending;
+        FString Error;
+        if (!ProbeStepGroups::Decode(Clipboard, Pending, Error))
+        { FeedbackMessage = FText::FromString(Error); return FReply::Handled(); }
+        const int32 First = Test->Steps.Num();
+        const int32 Count = Pending.Num();
+        ChangeAsset(Test, LOCTEXT("PasteGroupTransaction", "Paste Probe Step Group"),
+            [Steps = MoveTemp(Pending)](UProbeTestAsset& Asset)
+            { Asset.Steps.Append(Steps); });
+        for (int32 I = First; I < First + Count; ++I) { ExpandedStepIndices.Add(I); }
+        RebuildTestEditor();
+        FeedbackMessage = FText::FromString(FString::Printf(TEXT("Pasted %d steps. Review targets and permissions before running."), Count));
+        return FReply::Handled();
+    }
+
+    FReply RunStepGroup(TWeakObjectPtr<UProbeTestAsset> TestRef, int32 Index)
+    {
+        UProbeTestAsset* Test = TestRef.Get();
+        if (!Test || bRunInProgress) { return FReply::Handled(); }
+        const ProbeStepGroups::FRange Range = ProbeStepGroups::FindContiguous(Test->Steps, Index);
+        if (!Range.IsValid()) { return FReply::Handled(); }
+        ActiveResultFilter = EResultFilter::All;
+        SelectedResultIndex = INDEX_NONE;
+        Results.Reset();
+        QueuedTestResultIndices.Reset();
+        ScopedRunOptions.Reset();
+        ExecuteAsset(Test);
+        if (!QueuedTestResultIndices.IsEmpty())
+        {
+            Probe::FRunOptions Options;
+            Options.FirstStepIndex = Range.First;
+            Options.LastStepIndex = Range.Last;
+            ScopedRunOptions.Add(QueuedTestResultIndices.Last(), Options);
+        }
+        RecordRunCompleted();
+        ShowResults();
+        return FReply::Handled();
+    }
+
     bool SaveSelected()
     {
         UProbeTestAsset* Asset = SelectedAsset();
@@ -4137,7 +4668,7 @@ private:
         return FReply::Handled();
     }
 
-    void ExecuteAsset(UProbeTestAsset* Asset)
+    void ExecuteAsset(UProbeTestAsset* Asset, const Probe::FRunOptions& Options = Probe::FRunOptions())
     {
         if (!Asset) { return; }
         Probe::FTestResult Pending;
@@ -4146,7 +4677,38 @@ private:
         Pending.AssetPath = Asset->GetPathName();
         Pending.Status = Probe::EResultStatus::Skipped;
         Pending.Detail = TEXT("Queued; not yet executed.");
-        QueuedTestResultIndices.Add(Results.Add(MoveTemp(Pending)));
+        Pending.VariationIndex = Options.VariationIndex;
+        if (Asset->Variations.IsValidIndex(Options.VariationIndex))
+        {
+            Pending.VariationName = Asset->Variations[Options.VariationIndex].Name;
+            Pending.Name += TEXT(" [") + Pending.VariationName + TEXT("]");
+        }
+        const int32 ResultIndex = Results.Add(MoveTemp(Pending));
+        QueuedTestResultIndices.Add(ResultIndex);
+        if (Options.VariationIndex != INDEX_NONE || Options.FirstStepIndex != 0 || Options.LastStepIndex != MAX_int32)
+        { ScopedRunOptions.Add(ResultIndex, Options); }
+    }
+
+    void QueueAssetForBulk(UProbeTestAsset* Asset)
+    {
+        if (!Asset) { return; }
+        if (Asset->bRunVariationsInBulk && !Asset->Variations.IsEmpty())
+        {
+            const TArray<int32> Enabled = ProbeDev9Workflow::EnabledVariationIndices(*Asset);
+            if (Enabled.IsEmpty())
+            {
+                Probe::FTestResult Skipped;
+                Skipped.Name = Asset->GetName();
+                Skipped.Id = Asset->TestId.ToString();
+                Skipped.AssetPath = Asset->GetPathName();
+                Skipped.Status = Probe::EResultStatus::Skipped;
+                Skipped.Detail = TEXT("Bulk variation run enabled but all variations are disabled.");
+                Results.Add(MoveTemp(Skipped));
+            }
+            for (int32 I : Enabled)
+            { Probe::FRunOptions Options; Options.VariationIndex=I; ExecuteAsset(Asset, Options); }
+        }
+        else { ExecuteAsset(Asset); }
     }
 
     static const FSlateBrush* ResultIcon(Probe::EResultStatus Status)
@@ -4181,18 +4743,27 @@ private:
         }
 
         FString Log;
+        if (LastComparison.bHasPreviousRun)
+        {
+            Log += FString::Printf(TEXT("Compared with previous session run: %d regression(s), %d recovered, %d still failing, %d new identity(s).\n\n"),
+                LastComparison.Regressions, LastComparison.Recovered, LastComparison.StillFailing, LastComparison.NewlyObserved);
+        }
         for (const Probe::FTestResult& Result : Results)
         {
             if (!Log.IsEmpty()) { Log += TEXT("\n\n"); }
-            Log += FString::Printf(TEXT("[%s] %s  (%.2f ms)\n%s"),
-                Probe::StatusName(Result.Status), *Result.Name, Result.DurationMs, *Result.Detail);
+            const UProbeTestAsset* Source = FindObject<UProbeTestAsset>(nullptr, *Result.AssetPath);
+            Log += FString::Printf(TEXT("[%s] %s  (%.2f ms, %d attempt(s), %s)\n%s"),
+                Probe::StatusName(Result.Status), *Result.Name, Result.DurationMs, Result.Attempts,
+                *ProbeDev10RunHistory::Category(Result, Source), *Result.Detail);
             for (const Probe::FStepResult& Step : Result.Steps)
             {
                 const FString StepLabel = Step.Description.IsEmpty()
                     ? FString::Printf(TEXT("Step %d"), Step.Index)
                     : FString::Printf(TEXT("Step %d: %s"), Step.Index, *Step.Description);
-                Log += FString::Printf(TEXT("\n  [%s] %s  (%.2f ms)\n    %s"),
-                    Probe::StatusName(Step.Status), *StepLabel, Step.DurationMs, *Step.Detail);
+                Log += FString::Printf(TEXT("\n  [%s] %s%s  (%.2f ms)\n    %s"),
+                    Probe::StatusName(Step.Status), *StepLabel,
+                    Step.GroupName.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(" [Group: %s]"), *Step.GroupName),
+                    Step.DurationMs, *Step.Detail);
             }
         }
         return Log;
@@ -4210,8 +4781,14 @@ private:
     FText RunInfoText() const
     {
         if (Results.IsEmpty()) { return FText::GetEmpty(); }
-        return FText::FromString(FString::Printf(TEXT("%d test(s) | %.2f ms | %s"),
-            Results.Num(), LastRunDurationMs, *LastRunTime.ToString(TEXT("%H:%M:%S"))));
+        FString Summary = FString::Printf(TEXT("%d test(s) | %.2f ms | %s"),
+            Results.Num(), LastRunDurationMs, *LastRunTime.ToString(TEXT("%H:%M:%S")));
+        if (LastComparison.bHasPreviousRun)
+        {
+            Summary += FString::Printf(TEXT(" | Delta: %d regression(s), %d recovered"),
+                LastComparison.Regressions, LastComparison.Recovered);
+        }
+        return FText::FromString(Summary);
     }
 
     static int32 ResultSortPriority(Probe::EResultStatus Status)
@@ -4335,6 +4912,14 @@ private:
               .ColorAndOpacity(bShowLog ? FSlateColor::UseForeground() : FSlateColor::UseSubduedForeground()) ]
         ];
         ResultTabs->AddSlot().FillWidth(1.0f) [ SNullWidget::NullWidget ];
+        ResultTabs->AddSlot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 6, 0)
+        [
+            SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
+            .ToolTipText(LOCTEXT("CopyFailureSummaryTip", "Copy a concise list of failed/error tests and their failed steps, including asset paths and diagnostics."))
+            .IsEnabled_Lambda([this]() { return HasProblemResults(); })
+            .OnClicked(this, &SProbeWorkspace::CopyFailureSummary)
+            [ SNew(STextBlock).Text(LOCTEXT("CopyFailureSummary", "Copy Failures")) ]
+        ];
         ResultTabs->AddSlot().AutoWidth().VAlign(VAlign_Center)
         [
             SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
@@ -4485,6 +5070,81 @@ private:
         return FReply::Handled();
     }
 
+    FReply CopyFailureSummary()
+    {
+        FPlatformApplicationMisc::ClipboardCopy(*ProbeDev8Workflow::BuildFailureSummary(Results));
+        FeedbackMessage = LOCTEXT("CopiedFailures", "Failure summary copied. Use Export for complete JSON results.");
+        return FReply::Handled();
+    }
+
+    bool CanRetrySelectedFailedGroup() const
+    {
+        if (bRunInProgress || !Results.IsValidIndex(SelectedResultIndex)) { return false; }
+        const Probe::FTestResult& Result = Results[SelectedResultIndex];
+        if (!ProbeDev8Workflow::IsProblem(Result.Status) || Result.AssetPath.IsEmpty()) { return false; }
+        // Results come from an already-loaded asset. Do not synchronously load
+        // packages during Slate's frequent IsEnabled attribute evaluations.
+        const UProbeTestAsset* Asset = FindObject<UProbeTestAsset>(nullptr, *Result.AssetPath);
+        return ProbeDev8Workflow::FirstFailedGroup(Result, Asset).bValid;
+    }
+
+    bool CanRerunSelectedResult() const
+    {
+        return !bRunInProgress && Results.IsValidIndex(SelectedResultIndex)
+            && !Results[SelectedResultIndex].AssetPath.IsEmpty();
+    }
+
+    FReply RerunSelectedResult()
+    {
+        if (!CanRerunSelectedResult()) { return FReply::Handled(); }
+        const FString AssetPath = Results[SelectedResultIndex].AssetPath;
+        const int32 PreviousVariationIndex = Results[SelectedResultIndex].VariationIndex;
+        UProbeTestAsset* Asset = FindObject<UProbeTestAsset>(nullptr, *AssetPath);
+        if (!Asset) { Asset = LoadObject<UProbeTestAsset>(nullptr, *AssetPath); }
+        if (!Asset)
+        {
+            FeedbackMessage = LOCTEXT("RerunResultMissing", "Cannot rerun: original Test Asset could not be loaded.");
+            return FReply::Handled();
+        }
+        Results.Reset();
+        QueuedTestResultIndices.Reset();
+        ScopedRunOptions.Reset();
+        SelectedResultIndex = INDEX_NONE;
+        ActiveResultFilter = EResultFilter::All;
+        Probe::FRunOptions Options;
+        Options.VariationIndex = PreviousVariationIndex;
+        ExecuteAsset(Asset, Options);
+        RecordRunCompleted();
+        ShowResults();
+        return FReply::Handled();
+    }
+
+    FReply RetrySelectedFailedGroup()
+    {
+        if (bRunInProgress || !Results.IsValidIndex(SelectedResultIndex)) { return FReply::Handled(); }
+        const Probe::FTestResult Previous = Results[SelectedResultIndex];
+        UProbeTestAsset* Asset = FindObject<UProbeTestAsset>(nullptr, *Previous.AssetPath);
+        if (!Asset) { Asset = LoadObject<UProbeTestAsset>(nullptr, *Previous.AssetPath); }
+        const ProbeDev8Workflow::FFailureScope Retry = ProbeDev8Workflow::FirstFailedGroup(Previous, Asset);
+        if (!Retry.bValid)
+        {
+            FeedbackMessage = FText::FromString(Retry.Explanation);
+            return FReply::Handled();
+        }
+        Results.Reset();
+        QueuedTestResultIndices.Reset();
+        ScopedRunOptions.Reset();
+        SelectedResultIndex = INDEX_NONE;
+        ActiveResultFilter = EResultFilter::All;
+        Probe::FRunOptions Options = Retry.Options;
+        Options.VariationIndex = Previous.VariationIndex;
+        ExecuteAsset(Asset, Options);
+        RecordRunCompleted();
+        ShowResults();
+        FeedbackMessage = FText::FromString(Retry.Explanation);
+        return FReply::Handled();
+    }
+
     void RebuildResultDetails()
     {
         if (!ResultDetails.IsValid()) { return; }
@@ -4516,6 +5176,32 @@ private:
             [ SNew(STextBlock).Text(FText::FromString(Result.Name))
               .Font(FAppStyle::GetFontStyle("NormalFontBold")).AutoWrapText(true) ]
             + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 4, 0)
+            [ SNew(SComboButton)
+              .ToolTipText(LOCTEXT("RetryResultTip", "Choose between rerunning the full Test Asset or only the first failed step's contiguous group."))
+              .IsEnabled_Lambda([this]() { return CanRerunSelectedResult() || CanRetrySelectedFailedGroup(); })
+              .OnGetMenuContent_Lambda([this]() -> TSharedRef<SWidget>
+              {
+                  FMenuBuilder Menu(true, nullptr);
+                  Menu.AddMenuEntry(LOCTEXT("RerunResultFull", "Rerun Full Test"),
+                      LOCTEXT("RerunResultFullTip", "Rerun this complete Test Asset including its setup steps; existing input authorization still applies."),
+                      FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { RerunSelectedResult(); }),
+                          FCanExecuteAction::CreateLambda([this]() { return CanRerunSelectedResult(); })));
+                  Menu.AddMenuEntry(LOCTEXT("RetryFailedGroup", "Retry Failed Group"),
+                      LOCTEXT("RetryFailedGroupTip", "Rerun ONLY the group containing the first failed step. Earlier setup steps do not run and current asset permissions still apply."),
+                      FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { RetrySelectedFailedGroup(); }),
+                          FCanExecuteAction::CreateLambda([this]() { return CanRetrySelectedFailedGroup(); })));
+                  return Menu.MakeWidget();
+              })
+              .ButtonContent()
+              [ SNew(STextBlock).Text(LOCTEXT("RetryMenuLabel", "Retry")) ] ]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 4, 0)
+            [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
+              .ToolTipText(LOCTEXT("ProblemStepsTip", "Toggle between all recorded steps and only Failed/Error steps."))
+              .OnClicked_Lambda([this]()
+              { bProblemStepsOnly = !bProblemStepsOnly; RebuildResultDetails(); return FReply::Handled(); })
+              [ SNew(STextBlock).Text_Lambda([this]()
+                { return bProblemStepsOnly ? LOCTEXT("AllStepsView", "All Steps") : LOCTEXT("ProblemsOnlyView", "Problems Only"); }) ] ]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 4, 0)
             [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
               .ToolTipText(LOCTEXT("EditResultTip", "Select this test in the Test Definition editor"))
               .OnClicked(this, &SProbeWorkspace::EditSelectedResultTest)
@@ -4538,8 +5224,21 @@ private:
         ];
         ResultDetails->AddSlot().AutoHeight().Padding(3, 0, 3, 8)
         [ SNew(STextBlock).Text(FText::FromString(Result.Detail)).AutoWrapText(true) ];
+        if (bProblemStepsOnly)
+        {
+            bool bAnyProblemStep = false;
+            for (const Probe::FStepResult& Step : Result.Steps)
+            { if (ProbeDev8Workflow::IsProblem(Step.Status)) { bAnyProblemStep = true; break; } }
+            if (!bAnyProblemStep)
+            {
+                ResultDetails->AddSlot().AutoHeight().Padding(5)
+                [ SNew(STextBlock).Text(LOCTEXT("NoProblemSteps", "No failed or errored steps recorded for this test."))
+                  .ColorAndOpacity(FSlateColor::UseSubduedForeground()) ];
+            }
+        }
         for (const Probe::FStepResult& Step : Result.Steps)
         {
+            if (bProblemStepsOnly && !ProbeDev8Workflow::IsProblem(Step.Status)) { continue; }
             const bool bExpanded = ExpandedDiagnosticIndices.Contains(Step.Index);
             const int32 StepIndex = Step.Index;
             ResultDetails->AddSlot().AutoHeight().Padding(2, 0, 2, 4)
@@ -4572,7 +5271,8 @@ private:
                             [ SNew(STextBlock).Text(FText::FromString(Probe::StatusName(Step.Status)))
                               .ColorAndOpacity(ResultColor(Step.Status)) ]
                             + SHorizontalBox::Slot().FillWidth(1.0f)
-                            [ SNew(STextBlock).Text(FText::FromString(FString::Printf(TEXT("Step %d: %s"), Step.Index, *Step.Description)))
+                            [ SNew(STextBlock).Text(FText::FromString(FString::Printf(TEXT("Step %d: %s%s (%.1f ms)"), Step.Index,
+                                *Step.Description, Step.GroupName.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(" [%s]"), *Step.GroupName), Step.DurationMs)))
                               .AutoWrapText(true) ] ] ]
                         + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
                         [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
@@ -4646,8 +5346,17 @@ private:
             FeedbackMessage = LOCTEXT("PackMissing", "The selected Probe Pack could not be loaded.");
             return;
         }
+        FString PolicyError;
+        if (!ProbeDev10PackPolicy::Validate(*Pack, PolicyError))
+        {
+            FeedbackMessage = FText::FromString(TEXT("Pack cannot run: ") + PolicyError);
+            return;
+        }
+        ActivePackForRun.Reset(Pack);
+        PackCompletedAttempts.Reset();
         Results.Reset();
         QueuedTestResultIndices.Reset();
+        ScopedRunOptions.Reset();
         for (const TSoftObjectPtr<UProbeTestAsset>& Reference : Pack->Tests)
         {
             const Probe::FReferenceHealth Health = Probe::InspectTestReference(Reference.ToSoftObjectPath());
@@ -4659,7 +5368,7 @@ private:
                 Results.Add(MoveTemp(Missing));
                 continue;
             }
-            if (UProbeTestAsset* Test = Reference.LoadSynchronous()) { ExecuteAsset(Test); }
+            if (UProbeTestAsset* Test = Reference.LoadSynchronous()) { QueueAssetForBulk(Test); }
             else
             {
                 Probe::FTestResult Missing;
@@ -4701,6 +5410,26 @@ private:
         return Menu.MakeWidget();
     }
 
+    FReply RunSelectedVariations()
+    {
+        if (bRunInProgress) { return FReply::Handled(); }
+        UProbeTestAsset* Asset = SelectedAsset();
+        if (!Asset) { FeedbackMessage = LOCTEXT("NoVariationTest", "Select a Test Asset first."); return FReply::Handled(); }
+        const TArray<int32> Indices = ProbeDev9Workflow::EnabledVariationIndices(*Asset);
+        if (Indices.IsEmpty()) { FeedbackMessage = LOCTEXT("NoEnabledVariations", "No enabled variations in this test."); return FReply::Handled(); }
+        Results.Reset(); QueuedTestResultIndices.Reset(); ScopedRunOptions.Reset();
+        ActiveResultFilter = EResultFilter::All;
+        SelectedResultIndex = INDEX_NONE;
+        for (int32 VariationIndex : Indices)
+        {
+            Probe::FRunOptions Options;
+            Options.VariationIndex = VariationIndex;
+            ExecuteAsset(Asset, Options);
+        }
+        RecordRunCompleted(); ShowResults();
+        return FReply::Handled();
+    }
+
     FReply RunSelected()
     {
         if (bRunInProgress)
@@ -4733,9 +5462,11 @@ private:
         ActiveResultFilter = EResultFilter::All;
         SelectedResultIndex = INDEX_NONE;
         Results.Reset();
+        QueuedTestResultIndices.Reset();
+        ScopedRunOptions.Reset();
         for (const TSharedPtr<FAssetData>& Entry : Assets)
         {
-            if (Entry.IsValid()) { ExecuteAsset(Cast<UProbeTestAsset>(Entry->GetAsset())); }
+            if (Entry.IsValid()) { QueueAssetForBulk(Cast<UProbeTestAsset>(Entry->GetAsset())); }
         }
         FeedbackMessage = LOCTEXT("AllExecuted", "Test run complete. See Results below.");
         RecordRunCompleted();
@@ -4787,11 +5518,90 @@ private:
         return FReply::Handled();
     }
 
+    FReply StopAfterCurrentTest()
+    {
+        if (bRunInProgress)
+        {
+            bStopAfterCurrentTest = true;
+            bStopDueToPackFailure = false;
+            FeedbackMessage = LOCTEXT("StopRequested", "Stop requested. Current test will finish, and remaining tests will be skipped.");
+        }
+        return FReply::Handled();
+    }
+
+    void ExecuteQueuedResult(int32 ResultIndex, UProbeTestAsset* Asset, const Probe::FRunOptions Options)
+    {
+        TWeakPtr<SProbeWorkspace> WeakWorkspace = SharedThis(this);
+        const TWeakObjectPtr<UProbeTestAsset> WeakAsset(Asset);
+        Probe::RunTestAsync(Asset, [WeakWorkspace, WeakAsset, ResultIndex, Options](Probe::FTestResult Finished)
+        {
+            TSharedPtr<SProbeWorkspace> Workspace = WeakWorkspace.Pin();
+            if (!Workspace.IsValid() || !Workspace->bRunInProgress || !Workspace->Results.IsValidIndex(ResultIndex)) { return; }
+            const int32 CompletedAttempts = Workspace->PackCompletedAttempts.FindRef(ResultIndex) + 1;
+            const UProbeTestPack* Pack = Workspace->ActivePackForRun.Get();
+            const UProbeTestAsset* Test = WeakAsset.Get();
+            if (Pack && Test && !Workspace->bStopAfterCurrentTest
+                && ProbeDev10PackPolicy::ShouldRetry(*Pack, *Test, Finished.Status, CompletedAttempts))
+            {
+                Workspace->PackCompletedAttempts.Add(ResultIndex, CompletedAttempts);
+                // Retry on a later tick; never recursively reenter the Automation Driver.
+                FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+                    [WeakWorkspace, WeakAsset, ResultIndex, Options](float)
+                    {
+                        if (TSharedPtr<SProbeWorkspace> Owner = WeakWorkspace.Pin())
+                        {
+                            if (Owner->bRunInProgress && Owner->Results.IsValidIndex(ResultIndex))
+                            {
+                                if (UProbeTestAsset* RetryAsset = WeakAsset.Get())
+                                { Owner->ExecuteQueuedResult(ResultIndex, RetryAsset, Options); }
+                                else
+                                {
+                                    Owner->Results[ResultIndex].Status = Probe::EResultStatus::Error;
+                                    Owner->Results[ResultIndex].Detail = TEXT("Read-only retry unavailable: Test Asset was unloaded.");
+                                    Owner->StartNextQueuedTest();
+                                }
+                            }
+                        }
+                        return false;
+                    }));
+                return;
+            }
+            Finished.Attempts = CompletedAttempts;
+            if (CompletedAttempts > 1) { Finished.Detail += TEXT(" | Retried once (read-only Pack policy)."); }
+            const Probe::EResultStatus CompletedStatus = Finished.Status;
+            Workspace->Results[ResultIndex] = MoveTemp(Finished);
+            if (Pack && ProbeDev10PackPolicy::ShouldStop(*Pack, CompletedStatus))
+            { Workspace->bStopAfterCurrentTest = true; Workspace->bStopDueToPackFailure = true; }
+            Workspace->ShowResults();
+            FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+                [WeakWorkspace](float)
+                {
+                    if (TSharedPtr<SProbeWorkspace> Owner = WeakWorkspace.Pin())
+                    { Owner->StartNextQueuedTest(); }
+                    return false;
+                }));
+        }, Options);
+    }
+
     void StartNextQueuedTest()
     {
+        if (bStopAfterCurrentTest)
+        {
+            ProbeQueueControl::SkipPending(QueuedTestResultIndices, Results,
+                bStopDueToPackFailure ? TEXT("Skipped by Pack Stop on Failure policy after a failed/errored test.")
+                    : TEXT("Stopped before execution at user request."));
+            ScopedRunOptions.Reset();
+        }
         if (QueuedTestResultIndices.IsEmpty())
         {
             bRunInProgress = false;
+            bStopAfterCurrentTest = false;
+            bStopDueToPackFailure = false;
+            ActivePackForRun.Reset();
+            PackCompletedAttempts.Reset();
+            ScopedRunOptions.Reset();
+            LastComparison = ProbeDev10RunHistory::Compare(LastCompletedResults, Results);
+            LastCompletedResults = Results;
             LastRunTime = FDateTime::Now();
             LastRunDurationMs = 0.0;
             for (const Probe::FTestResult& Result : Results) { LastRunDurationMs += Result.DurationMs; }
@@ -4800,42 +5610,63 @@ private:
             return;
         }
         const int32 ResultIndex = QueuedTestResultIndices[0];
+        if (const UProbeTestPack* Pack = ActivePackForRun.Get())
+        {
+            if (Pack->FailurePolicy == EProbePackFailurePolicy::StopOnFailure)
+            {
+                // Invalid/unloadable Pack references may already have an Error
+                // result without a queued execution. Respect their Pack order.
+                for (int32 Previous = 0; Previous < ResultIndex; ++Previous)
+                {
+                    if (ProbeDev10PackPolicy::IsProblem(Results[Previous].Status))
+                    { bStopAfterCurrentTest = true; bStopDueToPackFailure = true; break; }
+                }
+                if (bStopAfterCurrentTest)
+                {
+                    ProbeQueueControl::SkipPending(QueuedTestResultIndices, Results,
+                        TEXT("Skipped by Pack Stop on Failure policy after a failed/errored test."));
+                    StartNextQueuedTest();
+                    return;
+                }
+            }
+        }
         QueuedTestResultIndices.RemoveAt(0);
         const FString AssetPath = Results[ResultIndex].AssetPath;
+        if (const UProbeTestPack* Pack = ActivePackForRun.Get())
+        {
+            FString Reason;
+            if (!ProbeDev10PackPolicy::DependenciesPassed(*Pack, AssetPath, Results, Reason))
+            {
+                Results[ResultIndex].Status = Probe::EResultStatus::Skipped;
+                Results[ResultIndex].Detail = Reason;
+                StartNextQueuedTest();
+                return;
+            }
+        }
         UProbeTestAsset* Asset = FindObject<UProbeTestAsset>(nullptr, *AssetPath);
         if (!Asset) { Asset = LoadObject<UProbeTestAsset>(nullptr, *AssetPath); }
         if (!Asset)
         {
             Results[ResultIndex].Status = Probe::EResultStatus::Error;
             Results[ResultIndex].Detail = TEXT("Queued Probe Test could not be loaded.");
+            if (const UProbeTestPack* Pack = ActivePackForRun.Get())
+            { if (ProbeDev10PackPolicy::ShouldStop(*Pack, Probe::EResultStatus::Error))
+              { bStopAfterCurrentTest = true; bStopDueToPackFailure = true; } }
             StartNextQueuedTest();
             return;
         }
-        TWeakPtr<SProbeWorkspace> WeakWorkspace = SharedThis(this);
-        Probe::RunTestAsync(Asset, [WeakWorkspace, ResultIndex](Probe::FTestResult Finished)
-        {
-            if (TSharedPtr<SProbeWorkspace> Workspace = WeakWorkspace.Pin())
-            {
-                if (!Workspace->bRunInProgress || !Workspace->Results.IsValidIndex(ResultIndex)) { return; }
-                Workspace->Results[ResultIndex] = MoveTemp(Finished);
-                Workspace->ShowResults();
-                // Resume on a later Editor tick so synchronous legacy test
-                // packs don't form an unbounded nested callback stack.
-                FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
-                    [WeakWorkspace](float)
-                    {
-                        if (TSharedPtr<SProbeWorkspace> Workspace = WeakWorkspace.Pin())
-                        { Workspace->StartNextQueuedTest(); }
-                        return false;
-                    }));
-            }
-        });
+        const Probe::FRunOptions Options = ScopedRunOptions.FindRef(ResultIndex);
+        ScopedRunOptions.Remove(ResultIndex);
+        ExecuteQueuedResult(ResultIndex, Asset, Options);
     }
 
     void RecordRunCompleted()
     {
         if (bRunInProgress) { return; }
         bRunInProgress = true;
+        bStopAfterCurrentTest = false;
+        bStopDueToPackFailure = false;
+        LastComparison = ProbeDev10RunHistory::FComparison();
         FeedbackMessage = LOCTEXT("RunInProgress", "Running Probe tests. Native UI steps execute asynchronously; results are shown as they finish.");
         StartNextQueuedTest();
     }
@@ -4854,9 +5685,14 @@ private:
             TestJson->SetStringField(TEXT("test_id"), Test.Id);
             TestJson->SetStringField(TEXT("name"), Test.Name);
             TestJson->SetStringField(TEXT("asset_path"), Test.AssetPath);
+            TestJson->SetStringField(TEXT("variation"), Test.VariationName);
+            TestJson->SetNumberField(TEXT("variation_index"), Test.VariationIndex);
             TestJson->SetStringField(TEXT("status"), Probe::StatusName(Test.Status));
             TestJson->SetStringField(TEXT("detail"), Test.Detail);
             TestJson->SetNumberField(TEXT("duration_ms"), Test.DurationMs);
+            TestJson->SetNumberField(TEXT("attempts"), Test.Attempts);
+            const UProbeTestAsset* SourceAsset = FindObject<UProbeTestAsset>(nullptr, *Test.AssetPath);
+            TestJson->SetStringField(TEXT("failure_category"), ProbeDev10RunHistory::Category(Test, SourceAsset));
             TArray<TSharedPtr<FJsonValue>> Steps;
             for (const Probe::FStepResult& Step : Test.Steps)
             {
@@ -4865,6 +5701,7 @@ private:
                 StepJson->SetStringField(TEXT("assertion_id"), Step.AssertionId);
                 StepJson->SetStringField(TEXT("status"), Probe::StatusName(Step.Status));
                 StepJson->SetStringField(TEXT("description"), Step.Description);
+                StepJson->SetStringField(TEXT("group"), Step.GroupName);
                 StepJson->SetStringField(TEXT("detail"), Step.Detail);
                 StepJson->SetNumberField(TEXT("duration_ms"), Step.DurationMs);
                 Steps.Add(MakeShared<FJsonValueObject>(StepJson));
@@ -4873,6 +5710,15 @@ private:
             Tests.Add(MakeShared<FJsonValueObject>(TestJson));
         }
         Root->SetArrayField(TEXT("tests"), Tests);
+        if (LastComparison.bHasPreviousRun)
+        {
+            TSharedRef<FJsonObject> Delta = MakeShared<FJsonObject>();
+            Delta->SetNumberField(TEXT("regressions"), LastComparison.Regressions);
+            Delta->SetNumberField(TEXT("recovered"), LastComparison.Recovered);
+            Delta->SetNumberField(TEXT("still_failing"), LastComparison.StillFailing);
+            Delta->SetNumberField(TEXT("newly_observed"), LastComparison.NewlyObserved);
+            Root->SetObjectField(TEXT("previous_run_comparison"), Delta);
+        }
         FString Json;
         const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Json);
         if (!FJsonSerializer::Serialize(Root, Writer))
@@ -4932,6 +5778,36 @@ public:
                   [ SNew(SImage).Image(FAppStyle::GetBrush("Icons.Save")) ]
                   + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
                   [ SNew(STextBlock).Text(LOCTEXT("SaveCurrentPack", "Save")) ] ] ]
+              + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0,0,8,0)
+              [ SNew(SCheckBox)
+                .ToolTipText(LOCTEXT("PackStopPolicyHelp", "Stop a Pack after a failed/errored test. Pending tests are skipped; the current test always finishes."))
+                .IsEnabled_Lambda([this]() { return GetPack() != nullptr; })
+                .IsChecked_Lambda([this]() { const UProbeTestPack* Pack = GetPack(); return Pack && Pack->FailurePolicy == EProbePackFailurePolicy::StopOnFailure ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+                .OnCheckStateChanged_Lambda([this](ECheckBoxState State)
+                {
+                    if (UProbeTestPack* Pack = GetPack())
+                    {
+                        const FScopedTransaction Transaction(LOCTEXT("PackStopPolicyTransaction", "Set Probe Pack Failure Policy"));
+                        Pack->Modify(); Pack->FailurePolicy = State == ECheckBoxState::Checked ? EProbePackFailurePolicy::StopOnFailure : EProbePackFailurePolicy::Continue;
+                        Pack->MarkPackageDirty(); InvalidateAudit();
+                    }
+                })
+                [ SNew(STextBlock).Text(LOCTEXT("PackStopAfterFailure", "Stop on Failure")) ] ]
+              + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0,0,8,0)
+              [ SNew(SCheckBox)
+                .ToolTipText(LOCTEXT("PackRetryReadOnlyHelp", "Retry a failure once only for strictly read-only tests. Does not repeat UI input, fixture actions, selection changes, or provider assertions."))
+                .IsEnabled_Lambda([this]() { return GetPack() != nullptr; })
+                .IsChecked_Lambda([this]() { const UProbeTestPack* Pack = GetPack(); return Pack && Pack->bRetryReadOnlyFailuresOnce ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+                .OnCheckStateChanged_Lambda([this](ECheckBoxState State)
+                {
+                    if (UProbeTestPack* Pack = GetPack())
+                    {
+                        const FScopedTransaction Transaction(LOCTEXT("PackRetryReadOnlyTransaction", "Set Probe Pack Read-Only Retry"));
+                        Pack->Modify(); Pack->bRetryReadOnlyFailuresOnce = State == ECheckBoxState::Checked;
+                        Pack->MarkPackageDirty(); InvalidateAudit();
+                    }
+                })
+                [ SNew(STextBlock).Text(LOCTEXT("PackRetryReadOnly", "Retry Read-Only Once")) ] ]
               + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0,0,6,0)
               [ SNew(SButton).OnClicked(this, &SProbePackWorkspace::RunPack)
                 .ToolTipText(LOCTEXT("RunPackTooltip", "Run the tests in this Pack in their listed order, and show results in Probe."))
@@ -5166,9 +6042,13 @@ private:
         const UProbeTestPack* Pack = GetPack();
         if (!Pack) { return FReply::Handled(); }
         const Probe::FReferenceAudit Report = Probe::AuditPackReferences(Pack);
-        if (AuditOutput.IsValid()) { AuditOutput->SetText(FText::FromString(Report.ToText())); }
+        FString PolicyIssue;
+        const bool bPolicyValid = ProbeDev10PackPolicy::Validate(*Pack, PolicyIssue);
+        const FString Combined = Report.ToText() + (bPolicyValid ? TEXT("\nPack execution policy: Valid") : TEXT("\nPack execution policy: INVALID - ") + PolicyIssue);
+        if (AuditOutput.IsValid()) { AuditOutput->SetText(FText::FromString(Combined)); }
         bHasAudit = true;
-        Message = FString::Printf(TEXT("Validated Pack: %d reference(s), %d issue(s)."), Report.ReferencesChecked, Report.Problems);
+        Message = FString::Printf(TEXT("Validated Pack: %d reference(s), %d issue(s). %s"), Report.ReferencesChecked, Report.Problems,
+            bPolicyValid ? TEXT("Execution policy valid.") : *PolicyIssue);
         RebuildMembers();
         return FReply::Handled();
     }
@@ -5596,6 +6476,14 @@ private:
         Pack->Modify();
         const FString PreviousPath = Pack->Tests[Index].ToString();
         Pack->Tests[Index] = TSoftObjectPtr<UProbeTestAsset>(FSoftObjectPath(NewPath));
+        // Preserve dependency intent when a missing/moved Pack member is replaced.
+        for (FProbePackPrerequisite& Rule : Pack->Prerequisites)
+        {
+            if (Rule.Test.ToString() == PreviousPath)
+            { Rule.Test = TSoftObjectPtr<UProbeTestAsset>(FSoftObjectPath(NewPath)); }
+            if (Rule.Requires.ToString() == PreviousPath)
+            { Rule.Requires = TSoftObjectPtr<UProbeTestAsset>(FSoftObjectPath(NewPath)); }
+        }
         SelectedMemberPaths.Remove(PreviousPath);
         Pack->MarkPackageDirty(); InvalidateAudit();
         Message = TEXT("Reference replaced. Save Pack to persist this change.");
@@ -5608,7 +6496,10 @@ private:
         if (!Pack || !Pack->Tests.IsValidIndex(Index)) { return FReply::Handled(); }
         const FString Path = Pack->Tests[Index].ToString();
         const FScopedTransaction Transaction(LOCTEXT("RemoveTestFromPackTransaction", "Remove Test From Probe Pack"));
-        Pack->Modify(); Pack->Tests.RemoveAt(Index); Pack->MarkPackageDirty();
+        Pack->Modify(); Pack->Tests.RemoveAt(Index);
+        Pack->Prerequisites.RemoveAll([&Path](const FProbePackPrerequisite& Rule)
+        { return Rule.Test.ToString() == Path || Rule.Requires.ToString() == Path; });
+        Pack->MarkPackageDirty();
         SelectedMemberPaths.Remove(Path); InvalidateAudit();
         Message = TEXT("Removed from Pack. The original Test Asset was not deleted.");
         RebuildMembers();
@@ -5622,7 +6513,12 @@ private:
         Pack->Modify();
         const int32 Removed = Pack->Tests.RemoveAll([this](const TSoftObjectPtr<UProbeTestAsset>& Ref)
         { return SelectedMemberPaths.Contains(Ref.ToString()); });
-        if (Removed > 0) { Pack->MarkPackageDirty(); InvalidateAudit(); }
+        if (Removed > 0)
+        {
+            Pack->Prerequisites.RemoveAll([this](const FProbePackPrerequisite& Rule)
+            { return SelectedMemberPaths.Contains(Rule.Test.ToString()) || SelectedMemberPaths.Contains(Rule.Requires.ToString()); });
+            Pack->MarkPackageDirty(); InvalidateAudit();
+        }
         SelectedMemberPaths.Reset();
         Message = FString::Printf(TEXT("Removed %d reference(s). Original Test Assets were not deleted."), Removed);
         RebuildMembers(); return FReply::Handled();
@@ -5642,6 +6538,46 @@ private:
         { TArray<FString> Paths; Paths.Add(Path); Probe::OpenTestAssetsInWorkspace(Paths); }
         return FReply::Handled();
     }
+    void TogglePrerequisite(const FString TestPath, const FString RequiredPath)
+    {
+        UProbeTestPack* Pack = GetPack();
+        if (!Pack) { return; }
+        const FScopedTransaction Transaction(LOCTEXT("PackDependencyTransaction", "Toggle Probe Pack Prerequisite"));
+        Pack->Modify();
+        const int32 Removed = Pack->Prerequisites.RemoveAll([&](const FProbePackPrerequisite& Dependency)
+        { return Dependency.Test.ToString() == TestPath && Dependency.Requires.ToString() == RequiredPath; });
+        if (!Removed)
+        {
+            FProbePackPrerequisite Dependency;
+            Dependency.Test = TSoftObjectPtr<UProbeTestAsset>(FSoftObjectPath(TestPath));
+            Dependency.Requires = TSoftObjectPtr<UProbeTestAsset>(FSoftObjectPath(RequiredPath));
+            Pack->Prerequisites.Add(MoveTemp(Dependency));
+        }
+        Pack->MarkPackageDirty();
+        InvalidateAudit();
+        RebuildMembers();
+    }
+
+    TSharedRef<SWidget> BuildPrerequisiteMenu(int32 DependentIndex)
+    {
+        FMenuBuilder Menu(true, nullptr);
+        const UProbeTestPack* Pack = GetPack();
+        if (!Pack || !Pack->Tests.IsValidIndex(DependentIndex)) { return Menu.MakeWidget(); }
+        const FString DependentPath = Pack->Tests[DependentIndex].ToString();
+        for (int32 Prior = 0; Prior < DependentIndex; ++Prior)
+        {
+            const FString RequiredPath = Pack->Tests[Prior].ToString();
+            const bool bAlreadyRequired = Pack->Prerequisites.ContainsByPredicate([&](const FProbePackPrerequisite& Item)
+            { return Item.Test.ToString() == DependentPath && Item.Requires.ToString() == RequiredPath; });
+            const FString Label = FPackageName::GetShortName(RequiredPath) + (bAlreadyRequired ? TEXT(" [Required]") : FString());
+            Menu.AddMenuEntry(FText::FromString(Label),
+                FText::FromString(TEXT("Require this earlier Pack test to pass before running ") + DependentPath),
+                FSlateIcon(), FUIAction(FExecuteAction::CreateSP(this,
+                    &SProbePackWorkspace::TogglePrerequisite, DependentPath, RequiredPath)));
+        }
+        return Menu.MakeWidget();
+    }
+
     void RebuildMembers()
     {
         if (!MemberRows.IsValid()) { return; }
@@ -5723,6 +6659,12 @@ private:
                 + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0,0,10,0)
                 [ SNew(STextBlock).Text_Lambda([Path]() { return FText::FromString(Probe::RecentResultName(Path)); })
                   .ColorAndOpacity(FSlateColor::UseSubduedForeground()) ]
+                + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0,0,5,0)
+                [ SNew(SComboButton)
+                  .IsEnabled(Index > 0)
+                  .ToolTipText(LOCTEXT("PackPrerequisitesTip", "Choose earlier Pack tests that must pass first. Checked entries show [Required]. Save the Pack to persist changes."))
+                  .OnGetMenuContent_Lambda([this, Index]() { return BuildPrerequisiteMenu(Index); })
+                  .ButtonContent()[ SNew(STextBlock).Text(LOCTEXT("PackPrerequisitesButton", "Requires")) ] ]
                 + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
                 [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
                   .ToolTipText(LOCTEXT("MovePackTestUp", "Move earlier in execution order"))

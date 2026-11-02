@@ -82,7 +82,7 @@ bool FProbeCatalogCoverageTest::RunTest(const FString& Parameters)
         }
         TestTrue(FString::Printf(TEXT("Assertion %d category must exist"), Index), bFoundCategory);
     }
-    TestEqual(TEXT("Assertion catalog covers all serialized enum values"), Seen.Num(), 223);
+    TestEqual(TEXT("Assertion catalog covers all serialized enum values"), Seen.Num(), 233);
     TestEqual(TEXT("0.15.4-dev3 last appended enum value"), static_cast<int32>(EProbeStepType::UIDetailsSearchFilterInactive), 222);
     TestEqual(TEXT("0.15.4 last appended enum value"), static_cast<int32>(EProbeStepType::UIDetailsSearchFilterActive), 210);
     TestEqual(TEXT("0.14 last enum index"), static_cast<int32>(EProbeStepType::ActorFixtureScaleNotNearlyEquals), 205);
@@ -638,7 +638,7 @@ bool FProbeSubmenuGroupingTest::RunTest(const FString& Parameters)
         TestFalse(TEXT("Every built-in assertion has a submenu"),
             Probe::MenuSubgroup(FString(Info.Category), FString(Info.Name)).IsEmpty());
     }
-    TestEqual(TEXT("All 223 assertions are assigned to menus"), Seen.Num(), 223);
+    TestEqual(TEXT("All 233 assertions are assigned to menus"), Seen.Num(), 233);
     return true;
 }
 #endif

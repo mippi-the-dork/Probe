@@ -1,9 +1,9 @@
 {
   "FileVersion": 3,
-  "Version": 33,
-  "VersionName": "0.15.4-dev4",
+  "Version": 43,
+  "VersionName": "0.15.4-dev10",
   "FriendlyName": "Probe",
-  "Description": "Visual QA Tests and Packs, independent self-test verification, and authorable native Editor UI automation and discoverable Automation Driver widget targets.",
+  "Description": "Visual QA Tests and Packs, native Editor UI automation, safe conditional waits, reusable step groups, opt-in cleanup and parameter variations, failure triage, Pack execution policies, dependencies, safe retries, and run comparisons.",
   "Category": "Testing",
   "CreatedBy": "Mippi",
   "CanContainContent": true,

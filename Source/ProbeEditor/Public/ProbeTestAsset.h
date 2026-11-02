@@ -242,7 +242,18 @@ enum class EProbeStepType : uint8
     UIWaitForWidgetTextEquals UMETA(DisplayName="UI Wait For Widget Text Equals"),
     UIDetailsSearchTextContains UMETA(DisplayName="UI Details Search Text Contains"),
     UIDetailsSearchTextNotEquals UMETA(DisplayName="UI Details Search Text Does Not Equal"),
-    UIDetailsSearchFilterInactive UMETA(DisplayName="UI Details Filter Is Inactive")
+    UIDetailsSearchFilterInactive UMETA(DisplayName="UI Details Filter Is Inactive"),
+    // Dev 6: append-only interaction and conditional UI observation extensions.
+    UIWidgetNotVisible UMETA(DisplayName="UI Widget Is Not Visible"),
+    UIWidgetNotInteractable UMETA(DisplayName="UI Widget Is Not Interactable"),
+    UIWaitForWidgetExists UMETA(DisplayName="UI Wait For Widget Exists"),
+    UIWaitForWidgetGone UMETA(DisplayName="UI Wait For Widget Gone"),
+    UIWaitForWidgetInteractable UMETA(DisplayName="UI Wait For Widget Interactable"),
+    UIWaitForWidgetNotVisible UMETA(DisplayName="UI Wait For Widget Not Visible"),
+    UIWaitForWidgetTextContains UMETA(DisplayName="UI Wait For Widget Text Contains"),
+    UIWaitForWidgetTextNotEquals UMETA(DisplayName="UI Wait For Widget Text Changes From"),
+    UIWidgetAppendText UMETA(DisplayName="UI Append Text To Widget"),
+    UIWidgetClearText UMETA(DisplayName="UI Clear Widget Text")
 };
 
 USTRUCT(BlueprintType)
@@ -281,8 +292,34 @@ struct FProbeTestStep
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Step", meta=(ClampMin="0.1", ClampMax="30.0", ToolTip="Maximum time in seconds to await a native UI condition, from 0.1 to 30 seconds."))
     double UIWaitTimeoutSeconds = 5.0;
 
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Step", meta=(ToolTip="Disable this step without deleting it. Disabled steps appear as Skipped in results and never perform input or actions."))
+    bool bEnabled = true;
+
+    // Consecutive steps with the same nonempty group name form one reusable block.
+    // Stored per-step so reordering/duplicate/clipboard workflows preserve the metadata.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Step", meta=(ToolTip="Optional reusable group name. Adjacent steps with the same name form a single block."))
+    FString GroupName;
+
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Step")
     FString Description;
+};
+
+// Dev 9: one named test variation. Bindings are UTF-8 independent, newline-separated
+// Key=Value pairs; authors insert ${Key} into supported step string fields.
+// No variation grants permissions or mutates saved step definitions.
+USTRUCT(BlueprintType)
+struct FProbeTestVariation
+{
+    GENERATED_BODY()
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Variation")
+    FString Name;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Variation", meta=(MultiLine="true", ToolTip="One Key=Value per line. Reference a key as ${Key} in step fields."))
+    FString Bindings;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Variation")
+    bool bEnabled = true;
 };
 
 UCLASS(BlueprintType)
@@ -313,6 +350,21 @@ public:
     // a test asset's existence, and never enable this on old tests by default.
     UPROPERTY(EditAnywhere, Category="Probe", meta=(ToolTip="Explicitly authorize Automation Driver clicks and typing against the live Unreal Editor. Effects of arbitrary plugin buttons cannot be undone by Probe."))
     bool bAllowEditorUIInput = false;
+
+    // Opt-in reusable lifecycle: Setup is the first contiguous group and Cleanup
+    // is the last. On a failed full run, Cleanup still executes in the SAME
+    // fixture context. Scoped group runs never implicitly enter these phases.
+    UPROPERTY(EditAnywhere, Category="Probe|Workflow", meta=(ToolTip="Optional name of the contiguous group at the start of this Test Asset."))
+    FString SetupGroupName;
+
+    UPROPERTY(EditAnywhere, Category="Probe|Workflow", meta=(ToolTip="Optional name of the contiguous group at the end; executes even when an earlier assertion fails."))
+    FString CleanupGroupName;
+
+    UPROPERTY(EditAnywhere, Category="Probe|Workflow")
+    TArray<FProbeTestVariation> Variations;
+
+    UPROPERTY(EditAnywhere, Category="Probe|Workflow", meta=(ToolTip="Expand enabled variations when running all tests or a Probe Pack. Run Selected remains the unparameterized baseline."))
+    bool bRunVariationsInBulk = false;
 
     UPROPERTY(EditAnywhere, Category="Probe")
     TArray<FProbeTestStep> Steps;

@@ -1,4 +1,7 @@
 #include "ProbeTestRunner.h"
+#include "ProbeDev9Workflow.h"
+#include "ProbeDev10PackPolicy.h"
+#include "ProbeNativeUIPolicy.h"
 #include "ProbeDetailsSearchRestore.h"
 #include "ProbeAssertionCatalog.h"
 #include "ProbeExtensions.h"
@@ -62,6 +65,28 @@ namespace Probe
         case EResultStatus::Skipped: return TEXT("SKIPPED");
         default: return TEXT("ERROR");
         }
+    }
+
+    // Preserve the pre-Dev 7 full-run success contract for consumers (including
+    // the independent Smoke oracle). Scoped and partially-disabled runs have
+    // additional information, but a complete all-passed run still reports
+    // exactly "All N steps passed". Keep async and sync reports identical.
+    static FString SuccessfulRunDetail(const FRunOptions& Options, int32 TotalSteps,
+        int32 LastIndex, int32 PassedCount, int32 RecordedStepCount)
+    {
+        const int32 DisabledCount = RecordedStepCount - PassedCount;
+        const bool bEntireTest = Options.FirstStepIndex == 0 && LastIndex == TotalSteps - 1;
+        if (bEntireTest && DisabledCount == 0)
+        {
+            return FString::Printf(TEXT("All %d steps passed"), TotalSteps);
+        }
+        if (bEntireTest)
+        {
+            return FString::Printf(TEXT("All %d steps complete: %d passed, %d disabled"),
+                TotalSteps, PassedCount, DisabledCount);
+        }
+        return FString::Printf(TEXT("Scoped steps %d-%d: %d passed, %d disabled"),
+            Options.FirstStepIndex + 1, LastIndex + 1, PassedCount, DisabledCount);
     }
 
     static UWorld* GetEditorWorld()
@@ -2269,6 +2294,16 @@ namespace Probe
         case EProbeStepType::UIDetailsSearchTextContains:
         case EProbeStepType::UIDetailsSearchTextNotEquals:
         case EProbeStepType::UIDetailsSearchFilterInactive:
+        case EProbeStepType::UIWidgetNotVisible:
+        case EProbeStepType::UIWidgetNotInteractable:
+        case EProbeStepType::UIWaitForWidgetExists:
+        case EProbeStepType::UIWaitForWidgetGone:
+        case EProbeStepType::UIWaitForWidgetInteractable:
+        case EProbeStepType::UIWaitForWidgetNotVisible:
+        case EProbeStepType::UIWaitForWidgetTextContains:
+        case EProbeStepType::UIWaitForWidgetTextNotEquals:
+        case EProbeStepType::UIWidgetAppendText:
+        case EProbeStepType::UIWidgetClearText:
             Reason = TEXT("Native UI steps require RunTestAsync: synchronous input blocks the Editor game thread. Open and run this test in the Probe workspace.");
             return EResultStatus::Error;
         default:
@@ -2281,16 +2316,18 @@ namespace Probe
     // RunTest's synchronous game-thread loop would deadlock Automation Driver.
     static bool IsNativeUIStep(EProbeStepType Type)
     {
-        return Type == EProbeStepType::UIWidgetClick || Type == EProbeStepType::UIWidgetTypeText
+        return ProbeNativeUIPolicy::HasTarget(Type)
             || Type == EProbeStepType::UIDetailsSearchVisible
             || Type == EProbeStepType::UIDetailsSearchTextEquals
             || Type == EProbeStepType::UIDetailsSearchFilterActive
-            || (Type >= EProbeStepType::UIWidgetExists && Type <= EProbeStepType::UIDetailsSearchFilterInactive);
+            || Type == EProbeStepType::UIDetailsSearchTextContains
+            || Type == EProbeStepType::UIDetailsSearchTextNotEquals
+            || Type == EProbeStepType::UIDetailsSearchFilterInactive;
     }
 
     static bool IsUIObservationStep(EProbeStepType Type)
     {
-        return Type >= EProbeStepType::UIWidgetExists && Type <= EProbeStepType::UIWaitForWidgetTextEquals;
+        return ProbeNativeUIPolicy::IsObservation(Type);
     }
 
     static void CollectDetailsSearchBoxes(const TSharedRef<SWidget>& Widget,
@@ -2367,6 +2404,9 @@ namespace Probe
     public:
         TStrongObjectPtr<UProbeTestAsset> Test;
         TArray<FProbeTestStep> Definitions;
+        FRunOptions RunOptions;
+        ProbeDev9Workflow::FLifecycle Lifecycle;
+        int32 LastIndex = INDEX_NONE;
         FProbeRunContext Context;
         FTestResult Result;
         TFunction<void(FTestResult)> OnComplete;
@@ -2382,7 +2422,7 @@ namespace Probe
         TWeakPtr<IDetailsView> EditedView;
         TWeakPtr<SWidget> PreviousKeyboardFocus;
 
-        void Begin(const UProbeTestAsset* Asset, TFunction<void(FTestResult)> Callback)
+        void Begin(const UProbeTestAsset* Asset, TFunction<void(FTestResult)> Callback, const FRunOptions& Options)
         {
             check(IsInGameThread());
             OnComplete = MoveTemp(Callback);
@@ -2392,11 +2432,18 @@ namespace Probe
                 Result.Detail = TEXT("Test asset could not be loaded"); Finish(); return;
             }
             Test.Reset(const_cast<UProbeTestAsset*>(Asset));
-            Definitions = Asset->Steps; // Don't observe edits made during an in-flight UI test.
+            RunOptions = Options;
             Result.Name = Asset->GetName();
             Result.Id = Asset->TestId.ToString();
             Result.AssetPath = Asset->GetPathName();
+            Result.VariationIndex = Options.VariationIndex;
             Context.bAllowTransientEditorActors = Asset->bAllowTransientEditorActors;
+            FString WorkflowError;
+            if (!ProbeDev9Workflow::Resolve(*Asset, Options.VariationIndex, Definitions, Result.VariationName, WorkflowError))
+            { Result.Status = EResultStatus::Error; Result.Detail = WorkflowError; Finish(); return; }
+            if (!ProbeDev9Workflow::ValidateLifecycle(*Asset, Options, Lifecycle, WorkflowError))
+            { Result.Status = EResultStatus::Error; Result.Detail = WorkflowError; Finish(); return; }
+            if (!Result.VariationName.IsEmpty()) { Result.Name += TEXT(" [") + Result.VariationName + TEXT("]"); }
             if (!Asset->bEnabled)
             {
                 Result.Status = EResultStatus::Skipped;
@@ -2411,6 +2458,14 @@ namespace Probe
             {
                 Result.Detail = TEXT("Test has no steps"); Finish(); return;
             }
+            if (RunOptions.FirstStepIndex < 0 || RunOptions.FirstStepIndex >= Definitions.Num()
+                || RunOptions.LastStepIndex < RunOptions.FirstStepIndex)
+            {
+                Result.Status = EResultStatus::Error;
+                Result.Detail = TEXT("Invalid scoped step range."); Finish(); return;
+            }
+            Index = RunOptions.FirstStepIndex;
+            LastIndex = FMath::Min(RunOptions.LastStepIndex, Definitions.Num() - 1);
             Result.Status = EResultStatus::Passed;
             NextStep();
         }
@@ -2418,12 +2473,24 @@ namespace Probe
         void NextStep()
         {
             check(IsInGameThread());
-            if (Index >= Definitions.Num())
+            if (Index > LastIndex)
             {
-                Result.Detail = FString::Printf(TEXT("All %d steps passed"), Definitions.Num());
+                if (Result.Status != EResultStatus::Passed)
+                { Finish(); return; }
+                const int32 PassedCount = Result.Steps.FilterByPredicate([](const FStepResult& Step)
+                    { return Step.Status == EResultStatus::Passed; }).Num();
+                if (PassedCount == 0) { Result.Status = EResultStatus::Skipped; }
+                Result.Detail = SuccessfulRunDetail(RunOptions, Definitions.Num(),
+                    LastIndex, PassedCount, Result.Steps.Num());
                 Finish(); return;
             }
             const FProbeTestStep& Step = Definitions[Index];
+            if (!Step.bEnabled)
+            {
+                StepStartedAt = FPlatformTime::Seconds();
+                CompleteStep(EResultStatus::Skipped, TEXT("Step disabled by author; no action executed."));
+                return;
+            }
             StepStartedAt = FPlatformTime::Seconds();
             if (!Step.AssertionId.IsNone() || !IsNativeUIStep(Step.Type))
             {
@@ -2431,8 +2498,7 @@ namespace Probe
                 const EResultStatus Status = ExecuteStep(Step, Context, Reason);
                 CompleteStep(Status, Reason); return;
             }
-            const bool bInput = Step.Type == EProbeStepType::UIWidgetClick
-                || Step.Type == EProbeStepType::UIWidgetTypeText;
+            const bool bInput = ProbeNativeUIPolicy::IsInput(Step.Type);
             if (bInput && !Test->bAllowEditorUIInput)
             {
                 CompleteStep(EResultStatus::Error,
@@ -2522,8 +2588,7 @@ namespace Probe
                     TEXT("Invalid selector. Use details:search or id:<Slate automation ID>. Coordinates and global label queries are not supported."));
                 return;
             }
-            const bool bWait = Step.Type == EProbeStepType::UIWaitForWidgetVisible
-                || Step.Type == EProbeStepType::UIWaitForWidgetTextEquals;
+            const bool bWait = ProbeNativeUIPolicy::IsWait(Step.Type);
             if (bWait && (!FMath::IsFinite(Step.UIWaitTimeoutSeconds)
                 || Step.UIWaitTimeoutSeconds < 0.1 || Step.UIWaitTimeoutSeconds > 30.0))
             {
@@ -2538,7 +2603,11 @@ namespace Probe
                 FString Reason;
                 if (!ResolveDetailsSearch(View, Search, false, Reason))
                 {
-                    if (Step.Type == EProbeStepType::UIWidgetNotExists)
+                    if (Step.Type == EProbeStepType::UIWidgetNotExists
+                        || Step.Type == EProbeStepType::UIWidgetNotVisible
+                        || Step.Type == EProbeStepType::UIWidgetNotInteractable
+                        || Step.Type == EProbeStepType::UIWaitForWidgetGone
+                        || Step.Type == EProbeStepType::UIWaitForWidgetNotVisible)
                     {
                         CompleteStep(EResultStatus::Passed, TEXT("Native Details 1 search is absent."));
                     }
@@ -2589,23 +2658,29 @@ namespace Probe
                     bPresent = Element->Exists();
                     bVisible = bPresent && Element->IsVisible();
                     bInteractable = bVisible && Element->IsInteractable();
-                    if (bPresent && (Type == EProbeStepType::UIWidgetTextEquals
-                        || Type == EProbeStepType::UIWidgetTextContains
-                        || Type == EProbeStepType::UIWidgetTextNotEquals
-                        || Type == EProbeStepType::UIWaitForWidgetTextEquals))
+                    if (bPresent && ProbeNativeUIPolicy::ReadsText(Type))
                     { Actual = Element->GetText().ToString(); }
                     bool bMatches = false;
                     switch (Type)
                     {
-                        case EProbeStepType::UIWidgetExists: bMatches = bPresent; break;
-                        case EProbeStepType::UIWidgetNotExists: bMatches = !bPresent; break;
+                        case EProbeStepType::UIWidgetExists:
+                        case EProbeStepType::UIWaitForWidgetExists: bMatches = bPresent; break;
+                        case EProbeStepType::UIWidgetNotExists:
+                        case EProbeStepType::UIWaitForWidgetGone: bMatches = !bPresent; break;
                         case EProbeStepType::UIWidgetVisible:
                         case EProbeStepType::UIWaitForWidgetVisible: bMatches = bVisible; break;
-                        case EProbeStepType::UIWidgetInteractable: bMatches = bInteractable; break;
+                        case EProbeStepType::UIWidgetNotVisible:
+                        case EProbeStepType::UIWaitForWidgetNotVisible: bMatches = !bVisible; break;
+                        case EProbeStepType::UIWidgetInteractable:
+                        case EProbeStepType::UIWaitForWidgetInteractable: bMatches = bInteractable; break;
+                        case EProbeStepType::UIWidgetNotInteractable: bMatches = !bInteractable; break;
                         case EProbeStepType::UIWidgetTextEquals:
                         case EProbeStepType::UIWaitForWidgetTextEquals: bMatches = bPresent && Actual == Expected; break;
-                        case EProbeStepType::UIWidgetTextContains: bMatches = bPresent && Actual.Contains(Expected, ESearchCase::CaseSensitive); break;
-                        case EProbeStepType::UIWidgetTextNotEquals: bMatches = bPresent && Actual != Expected; break;
+                        case EProbeStepType::UIWidgetTextContains:
+                        case EProbeStepType::UIWaitForWidgetTextContains:
+                            bMatches = bPresent && Actual.Contains(Expected, ESearchCase::CaseSensitive); break;
+                        case EProbeStepType::UIWidgetTextNotEquals:
+                        case EProbeStepType::UIWaitForWidgetTextNotEquals: bMatches = bPresent && Actual != Expected; break;
                         default: break;
                     }
                     if (bMatches)
@@ -2617,18 +2692,21 @@ namespace Probe
                     FPlatformProcess::Sleep(0.1f);
                 }
                 while (true);
-                const bool bText = Type == EProbeStepType::UIWidgetTextEquals
-                    || Type == EProbeStepType::UIWidgetTextContains
-                    || Type == EProbeStepType::UIWidgetTextNotEquals
-                    || Type == EProbeStepType::UIWaitForWidgetTextEquals;
-                Message = bText
-                    ? FString::Printf(TEXT("Widget '%s': exists=%s, actual text='%s', expected='%s'%s"),
-                        *Selector, bPresent ? TEXT("true") : TEXT("false"), *Actual, *Expected,
-                        bWait && Status != EResultStatus::Passed ? TEXT(" (wait timed out)") : TEXT(""))
-                    : FString::Printf(TEXT("Widget '%s': exists=%s, visible=%s, interactable=%s%s"),
-                        *Selector, bPresent ? TEXT("true") : TEXT("false"),
-                        bVisible ? TEXT("true") : TEXT("false"), bInteractable ? TEXT("true") : TEXT("false"),
-                        bWait && Status != EResultStatus::Passed ? TEXT(" (wait timed out)") : TEXT(""));
+                const double Elapsed = FPlatformTime::Seconds() - Started;
+                const FString Observed = Actual.Left(180).Replace(TEXT("\n"), TEXT("\\n"));
+                const FString Wanted = Expected.Left(180).Replace(TEXT("\n"), TEXT("\\n"));
+                const FString Snapshot = ProbeNativeUIPolicy::ReadsText(Type)
+                    ? FString::Printf(TEXT("exists=%s, visible=%s, interactable=%s, observed='%s', expected='%s'"),
+                        bPresent ? TEXT("true") : TEXT("false"), bVisible ? TEXT("true") : TEXT("false"),
+                        bInteractable ? TEXT("true") : TEXT("false"), *Observed, *Wanted)
+                    : FString::Printf(TEXT("exists=%s, visible=%s, interactable=%s"),
+                        bPresent ? TEXT("true") : TEXT("false"), bVisible ? TEXT("true") : TEXT("false"),
+                        bInteractable ? TEXT("true") : TEXT("false"));
+                Message = FString::Printf(TEXT("%s '%s' after %.2fs (limit %.2fs): %s. %s"),
+                    bWait ? (Status == EResultStatus::Passed ? TEXT("Wait satisfied for") : TEXT("Wait timed out for"))
+                          : (Status == EResultStatus::Passed ? TEXT("Assertion passed for") : TEXT("Assertion failed for")),
+                    *Selector, Elapsed, bWait ? Timeout : 0.0, *Snapshot,
+                    bWait && Status != EResultStatus::Passed ? TEXT("Condition never became true.") : TEXT(""));
                 AsyncTask(ENamedThreads::GameThread, [Self, Status, Message]()
                 {
                     Self->CompleteStep(Status, Message);
@@ -2665,7 +2743,7 @@ namespace Probe
                     CompleteStep(EResultStatus::Error, Reason); return;
                 }
                 WeakSearch = Search;
-                if (Step.Type == EProbeStepType::UIWidgetTypeText && !bSavedSearch)
+                if (Step.Type != EProbeStepType::UIWidgetClick && !bSavedSearch)
                 {
                     EditedSearch = Search;
                     EditedView = View;
@@ -2681,46 +2759,59 @@ namespace Probe
             }
             const FString DriverId = bTagged ? Selector.RightChop(3) : FString();
             const FString Input = Step.ExpectedValue;
-            const bool bType = Step.Type == EProbeStepType::UIWidgetTypeText;
+            const EProbeStepType InputAction = Step.Type;
             TSharedRef<FAsyncProbeTestRun> Self = AsShared();
             // NEVER run Click/TypeChord/Type on the Editor thread. The driver
             // waits for that same thread to pump actual Slate messages.
-            Async(EAsyncExecution::ThreadPool, [Self, WeakSearch, bNative, DriverId, Input, bType]()
+            Async(EAsyncExecution::ThreadPool, [Self, WeakSearch, bNative, DriverId, Input, InputAction]()
             {
                 bool bSucceeded = false;
                 FString Failure = TEXT("Automation Driver did not complete input.");
                 const FAutomationDriverRef Driver = IAutomationDriverModule::Get().CreateDriver();
-                if (bNative)
-                {
-                    const FDriverElementRef Element = Driver->FindElement(By::WidgetLambda(
+                // Drive *both* widget selector forms through the same keyboard path.
+                // Ctrl+End is more reliable than a bare End key for editable Slate
+                // controls; the click first grants focus and the short settle lets
+                // Slate process it before a navigation chord is dispatched.
+                const FDriverElementRef Element = bNative
+                    ? Driver->FindElement(By::WidgetLambda(
                         [WeakSearch](TArray<TSharedRef<SWidget>>& Out)
                         {
                             if (TSharedPtr<SSearchBox> Widget = WeakSearch.Pin())
                             { Out.Add(StaticCastSharedRef<SWidget>(Widget.ToSharedRef())); }
-                        }, TEXT("Probe.Details1.Search")));
-                    bSucceeded = Element->Click();
-                    if (bSucceeded && bType)
-                    {
-                        bSucceeded = Element->TypeChord(EKeys::LeftControl, EKeys::A)
-                            && Element->Type(Input);
-                        if (bSucceeded) { Driver->Wait(FTimespan::FromMilliseconds(1600)); }
-                    }
-                }
-                else
+                        }, TEXT("Probe.Details1.Search")))
+                    : Driver->FindElement(By::Id(*DriverId));
+                FString FailedOperation = TEXT("click/focus");
+                bSucceeded = Element->Click();
+                if (bSucceeded && InputAction != EProbeStepType::UIWidgetClick)
                 {
-                    const FDriverElementRef Element = Driver->FindElement(By::Id(*DriverId));
-                    bSucceeded = Element->Click();
-                    if (bSucceeded && bType)
+                    Driver->Wait(FTimespan::FromMilliseconds(75));
+                    const bool bAppend = InputAction == EProbeStepType::UIWidgetAppendText;
+                    FailedOperation = bAppend ? TEXT("Ctrl+End (move caret to end)")
+                        : TEXT("Ctrl+A (select all)");
+                    bSucceeded = bAppend
+                        ? Element->TypeChord(EKeys::LeftControl, EKeys::End)
+                        : Element->TypeChord(EKeys::LeftControl, EKeys::A);
+                    if (bSucceeded)
                     {
-                        bSucceeded = Element->TypeChord(EKeys::LeftControl, EKeys::A)
-                            && Element->Type(Input);
+                        Driver->Wait(FTimespan::FromMilliseconds(40));
+                        FailedOperation = InputAction == EProbeStepType::UIWidgetClearText
+                            ? TEXT("Backspace (delete selection)") : TEXT("type text");
+                        bSucceeded = InputAction == EProbeStepType::UIWidgetClearText
+                            ? Element->Type(EKeys::BackSpace) : Element->Type(Input);
+                    }
+                    if (bSucceeded)
+                    {
+                        Driver->Wait(FTimespan::FromMilliseconds(bNative ? 1600 : 75));
                     }
                 }
                 const FString SelectorName = bNative ? TEXT("details:search") : FString::Printf(TEXT("id:%s"), *DriverId);
+                const TCHAR* ActionName = InputAction == EProbeStepType::UIWidgetClick ? TEXT("click")
+                    : InputAction == EProbeStepType::UIWidgetClearText ? TEXT("clear")
+                    : InputAction == EProbeStepType::UIWidgetAppendText ? TEXT("append") : TEXT("replace text");
                 Failure = bSucceeded
-                    ? FString::Printf(TEXT("Automation Driver %s succeeded on '%s'."), bType ? TEXT("typing") : TEXT("click"), *SelectorName)
-                    : FString::Printf(TEXT("Automation Driver %s failed on selector '%s'. Check visibility, focus, and enabled state."),
-                        bType ? TEXT("typing") : TEXT("click"), *SelectorName);
+                    ? FString::Printf(TEXT("Automation Driver %s succeeded on '%s'."), ActionName, *SelectorName)
+                    : FString::Printf(TEXT("Automation Driver %s failed on '%s' during %s. Check the target is editable, visible, and enabled; arbitrary input effects are not reversible."),
+                        ActionName, *SelectorName, *FailedOperation);
                 AsyncTask(ENamedThreads::GameThread, [Self, bSucceeded, Failure]()
                 {
                     Self->CompleteStep(bSucceeded ? EResultStatus::Passed : EResultStatus::Failed, Failure);
@@ -2738,6 +2829,7 @@ namespace Probe
                 : FString::Printf(TEXT("Probe.BuiltIn.%s"),
                     *StaticEnum<EProbeStepType>()->GetNameStringByValue(static_cast<int64>(Definition.Type)));
             StepResult.Description = Definition.Description;
+            StepResult.GroupName = Definition.GroupName;
             if (StepResult.Description.IsEmpty())
             {
                 if (!Definition.AssertionId.IsNone())
@@ -2752,11 +2844,33 @@ namespace Probe
             StepResult.Detail = Detail;
             StepResult.DurationMs = (FPlatformTime::Seconds() - StepStartedAt) * 1000.0;
             Result.Steps.Add(MoveTemp(StepResult));
-            if (Status != EResultStatus::Passed)
+            if (Status != EResultStatus::Passed && Status != EResultStatus::Skipped)
             {
-                Result.Status = Status;
-                Result.Detail = FString::Printf(TEXT("Step %d: %s"), Index + 1, *Detail);
-                Finish(); return;
+                if (Result.Status == EResultStatus::Passed)
+                {
+                    Result.Status = Status;
+                    Result.Detail = FString::Printf(TEXT("Step %d: %s"), Index + 1, *Detail);
+                }
+                else
+                { Result.Detail += FString::Printf(TEXT(" | Cleanup step %d: %s"), Index + 1, *Detail); }
+                if (!Lifecycle.HasCleanup()) { Finish(); return; }
+                if (Index < Lifecycle.CleanupFirst)
+                {
+                    // Explicitly account for verification steps skipped after the first failure.
+                    for (int32 Skipped = Index + 1; Skipped < Lifecycle.CleanupFirst; ++Skipped)
+                    {
+                        FStepResult Record;
+                        Record.Index = Skipped + 1;
+                        Record.Status = EResultStatus::Skipped;
+                        Record.GroupName = Definitions[Skipped].GroupName;
+                        Record.Description = Definitions[Skipped].Description;
+                        Record.Detail = TEXT("Skipped after test failure; cleanup will run.");
+                        Result.Steps.Add(MoveTemp(Record));
+                    }
+                    Index = Lifecycle.CleanupFirst;
+                }
+                else { ++Index; }
+                NextStep(); return;
             }
             ++Index;
             NextStep();
@@ -2826,26 +2940,27 @@ namespace Probe
         }
     };
 
-    void RunTestAsync(const UProbeTestAsset* Asset, TFunction<void(FTestResult)> Callback)
+    void RunTestAsync(const UProbeTestAsset* Asset, TFunction<void(FTestResult)> Callback, const FRunOptions& Options)
     {
         check(IsInGameThread());
         if (!Asset || !Asset->Steps.ContainsByPredicate(
             [](const FProbeTestStep& Step) { return Step.AssertionId.IsNone() && IsNativeUIStep(Step.Type); }))
         {
-            Callback(RunTest(Asset)); // Existing non-UI runner remains unmodified.
+            Callback(RunTest(Asset, Options)); // Non-UI steps use the same scoped contract.
             return;
         }
         TSharedRef<FAsyncProbeTestRun> Run = MakeShared<FAsyncProbeTestRun>();
-        Run->Begin(Asset, MoveTemp(Callback));
+        Run->Begin(Asset, MoveTemp(Callback), Options);
     }
 
-    FTestResult RunTest(const UProbeTestAsset* Asset)
+    FTestResult RunTest(const UProbeTestAsset* Asset, const FRunOptions& Options)
     {
         FTestResult Result;
         if (!Asset) { Result.Detail = TEXT("Test asset could not be loaded"); return Result; }
         Result.Name = Asset->GetName();
         Result.Id = Asset->TestId.ToString();
         Result.AssetPath = Asset->GetPathName();
+        Result.VariationIndex = Options.VariationIndex;
         const double Start = FPlatformTime::Seconds();
         if (!Asset->bEnabled)
         {
@@ -2862,21 +2977,41 @@ namespace Probe
             Result.Status = EResultStatus::Error;
             Result.Detail = TEXT("Test has no steps. Use + Add Step to configure the test.");
         }
+        else if (Options.FirstStepIndex < 0 || Options.FirstStepIndex >= Asset->Steps.Num()
+            || Options.LastStepIndex < Options.FirstStepIndex)
+        {
+            Result.Status = EResultStatus::Error;
+            Result.Detail = TEXT("Invalid scoped step range.");
+        }
         else
         {
+            TArray<FProbeTestStep> Definitions;
+            FString WorkflowError;
+            ProbeDev9Workflow::FLifecycle Lifecycle;
+            if (!ProbeDev9Workflow::Resolve(*Asset, Options.VariationIndex, Definitions, Result.VariationName, WorkflowError)
+                || !ProbeDev9Workflow::ValidateLifecycle(*Asset, Options, Lifecycle, WorkflowError))
+            {
+                Result.Status = EResultStatus::Error;
+                Result.Detail = WorkflowError;
+                Result.DurationMs = (FPlatformTime::Seconds() - Start) * 1000.0;
+                return Result;
+            }
+            if (!Result.VariationName.IsEmpty()) { Result.Name += TEXT(" [") + Result.VariationName + TEXT("]"); }
+            const int32 LastIndex = FMath::Min(Options.LastStepIndex, Definitions.Num() - 1);
             FProbeRunContext Context; // RAII cleanup even if any step fails or errors.
             Context.bAllowTransientEditorActors = Asset->bAllowTransientEditorActors;
             Result.Status = EResultStatus::Passed;
-            for (int32 Index = 0; Index < Asset->Steps.Num(); ++Index)
+            for (int32 Index = Options.FirstStepIndex; Index <= LastIndex; ++Index)
             {
                 FStepResult StepResult;
                 StepResult.Index = Index + 1;
-                const FProbeTestStep& Definition = Asset->Steps[Index];
+                const FProbeTestStep& Definition = Definitions[Index];
                 StepResult.AssertionId = !Definition.AssertionId.IsNone()
                     ? Definition.AssertionId.ToString()
                     : FString::Printf(TEXT("Probe.BuiltIn.%s"),
                         *StaticEnum<EProbeStepType>()->GetNameStringByValue(static_cast<int64>(Definition.Type)));
                 StepResult.Description = Definition.Description;
+                StepResult.GroupName = Definition.GroupName;
                 if (StepResult.Description.IsEmpty())
                 {
                     if (!Definition.AssertionId.IsNone())
@@ -2888,19 +3023,46 @@ namespace Probe
                     else { StepResult.Description = GetAssertionInfo(Definition.Type).Name; }
                 }
                 const double StepStart = FPlatformTime::Seconds();
-                StepResult.Status = ExecuteStep(Asset->Steps[Index], Context, StepResult.Detail);
+                if (!Definition.bEnabled)
+                {
+                    StepResult.Status = EResultStatus::Skipped;
+                    StepResult.Detail = TEXT("Step disabled by author; no action executed.");
+                }
+                else { StepResult.Status = ExecuteStep(Definition, Context, StepResult.Detail); }
                 StepResult.DurationMs = (FPlatformTime::Seconds() - StepStart) * 1000.0;
                 Result.Steps.Add(MoveTemp(StepResult));
-                if (Result.Steps.Last().Status != EResultStatus::Passed)
+                if (Result.Steps.Last().Status != EResultStatus::Passed && Result.Steps.Last().Status != EResultStatus::Skipped)
                 {
-                    Result.Status = Result.Steps.Last().Status;
-                    Result.Detail = FString::Printf(TEXT("Step %d: %s"), Index + 1, *Result.Steps.Last().Detail);
-                    break;
+                    if (Result.Status == EResultStatus::Passed)
+                    {
+                        Result.Status = Result.Steps.Last().Status;
+                        Result.Detail = FString::Printf(TEXT("Step %d: %s"), Index + 1, *Result.Steps.Last().Detail);
+                    }
+                    else { Result.Detail += FString::Printf(TEXT(" | Cleanup step %d: %s"), Index + 1, *Result.Steps.Last().Detail); }
+                    if (!Lifecycle.HasCleanup()) { break; }
+                    if (Index < Lifecycle.CleanupFirst)
+                    {
+                        for (int32 Skipped = Index + 1; Skipped < Lifecycle.CleanupFirst; ++Skipped)
+                        {
+                            FStepResult Record;
+                            Record.Index = Skipped + 1;
+                            Record.Status = EResultStatus::Skipped;
+                            Record.GroupName = Definitions[Skipped].GroupName;
+                            Record.Description = Definitions[Skipped].Description;
+                            Record.Detail = TEXT("Skipped after test failure; cleanup will run.");
+                            Result.Steps.Add(MoveTemp(Record));
+                        }
+                        Index = Lifecycle.CleanupFirst - 1;
+                    }
                 }
             }
             if (Result.Status == EResultStatus::Passed)
             {
-                Result.Detail = FString::Printf(TEXT("All %d steps passed"), Asset->Steps.Num());
+                const int32 PassedCount = Result.Steps.FilterByPredicate([](const FStepResult& Step)
+                    { return Step.Status == EResultStatus::Passed; }).Num();
+                if (PassedCount == 0) { Result.Status = EResultStatus::Skipped; }
+                Result.Detail = SuccessfulRunDetail(Options, Asset->Steps.Num(),
+                    LastIndex, PassedCount, Result.Steps.Num());
             }
         }
         Result.DurationMs = (FPlatformTime::Seconds() - Start) * 1000.0;
@@ -2910,33 +3072,118 @@ namespace Probe
     {
         TArray<FTestResult> Results;
         if (!Pack) { return Results; }
+        FString PolicyError;
+        if (!ProbeDev10PackPolicy::Validate(*Pack, PolicyError))
+        {
+            FTestResult Invalid;
+            Invalid.Name = Pack->GetName();
+            Invalid.AssetPath = Pack->GetPathName();
+            Invalid.Status = EResultStatus::Error;
+            Invalid.Detail = TEXT("Invalid Pack execution policy: ") + PolicyError;
+            Results.Add(MoveTemp(Invalid));
+            return Results;
+        }
+        bool bStopRemaining = false;
         for (const TSoftObjectPtr<UProbeTestAsset>& Reference : Pack->Tests)
         {
+            const FString Path = Reference.ToString();
+            if (bStopRemaining)
+            {
+                FTestResult Skipped;
+                Skipped.Name = Path;
+                Skipped.AssetPath = Path;
+                Skipped.Status = EResultStatus::Skipped;
+                Skipped.Detail = TEXT("Pack stopped after a failed or errored test.");
+                Results.Add(MoveTemp(Skipped));
+                continue;
+            }
+            FString DependencyReason;
+            if (!ProbeDev10PackPolicy::DependenciesPassed(*Pack, Path, Results, DependencyReason))
+            {
+                FTestResult Skipped;
+                Skipped.Name = Path;
+                Skipped.AssetPath = Path;
+                Skipped.Status = EResultStatus::Skipped;
+                Skipped.Detail = DependencyReason;
+                Results.Add(MoveTemp(Skipped));
+                continue;
+            }
             const FReferenceHealth Check = InspectTestReference(Reference.ToSoftObjectPath());
             if (!Check.IsUsable())
             {
                 FTestResult Missing;
-                Missing.Name = Reference.ToString();
-                Missing.AssetPath = Reference.ToString();
+                Missing.Name = Path;
+                Missing.AssetPath = Path;
                 Missing.Status = EResultStatus::Error;
                 Missing.Detail = Check.Explanation;
                 Results.Add(MoveTemp(Missing));
-                continue; // Never invoke the package loader for missing or redirector references.
+                bStopRemaining = ProbeDev10PackPolicy::ShouldStop(*Pack, EResultStatus::Error);
+                continue;
             }
             UProbeTestAsset* Test = Reference.LoadSynchronous();
-            if (Test)
-            {
-                Results.Add(RunTest(Test));
-            }
-            else
+            if (!Test)
             {
                 FTestResult Missing;
-                Missing.Name = Reference.ToString();
-                Missing.AssetPath = Reference.ToString();
+                Missing.Name = Path;
+                Missing.AssetPath = Path;
                 Missing.Status = EResultStatus::Error;
-                Missing.Detail = TEXT("Probe Pack reference could not be loaded. The test may have moved or been deleted.");
+                Missing.Detail = TEXT("Probe Pack reference could not be loaded.");
                 Results.Add(MoveTemp(Missing));
+                bStopRemaining = ProbeDev10PackPolicy::ShouldStop(*Pack, EResultStatus::Error);
+                continue;
             }
+            auto RunMember = [&](const FRunOptions& Options)
+            {
+                FTestResult Result = RunTest(Test, Options);
+                if (ProbeDev10PackPolicy::ShouldRetry(*Pack, *Test, Result.Status, 1))
+                {
+                    Result = RunTest(Test, Options);
+                    Result.Attempts = 2;
+                    Result.Detail += TEXT(" | Retried once (read-only Pack policy).");
+                }
+                const EResultStatus Status = Result.Status;
+                Results.Add(MoveTemp(Result));
+                if (ProbeDev10PackPolicy::ShouldStop(*Pack, Status)) { bStopRemaining = true; }
+            };
+            if (Test->bRunVariationsInBulk && !Test->Variations.IsEmpty())
+            {
+                const TArray<int32> Enabled = ProbeDev9Workflow::EnabledVariationIndices(*Test);
+                if (Enabled.IsEmpty())
+                {
+                    FTestResult Skipped;
+                    Skipped.Name = Test->GetName();
+                    Skipped.AssetPath = Test->GetPathName();
+                    Skipped.Status = EResultStatus::Skipped;
+                    Skipped.Detail = TEXT("Bulk variation run enabled but all variations are disabled.");
+                    Results.Add(MoveTemp(Skipped));
+                }
+                for (const int32 Variation : Enabled)
+                {
+                    if (bStopRemaining) { break; }
+                    FRunOptions Options;
+                    Options.VariationIndex = Variation;
+                    RunMember(Options);
+                }
+                // If stopping within variations, do not silently omit remaining
+                // variants: they are recorded as explicitly skipped results.
+                if (bStopRemaining && Results.Last().AssetPath == Test->GetPathName())
+                {
+                    int32 LastVariation = Results.Last().VariationIndex;
+                    for (const int32 Variation : Enabled)
+                    {
+                        if (Variation <= LastVariation) { continue; }
+                        FTestResult Skipped;
+                        Skipped.Name = Test->GetName();
+                        Skipped.AssetPath = Test->GetPathName();
+                        Skipped.VariationIndex = Variation;
+                        Skipped.VariationName = Test->Variations[Variation].Name;
+                        Skipped.Status = EResultStatus::Skipped;
+                        Skipped.Detail = TEXT("Pack stopped before this variation.");
+                        Results.Add(MoveTemp(Skipped));
+                    }
+                }
+            }
+            else { RunMember(FRunOptions()); }
         }
         return Results;
     }

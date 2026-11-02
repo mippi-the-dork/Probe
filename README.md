@@ -1,7 +1,76 @@
-# Probe 0.15.4-dev4
+# Probe 0.15.4-dev10
 
 Probe is an **Unreal Engine 5.8.3 Editor-only QA plugin** for creating, executing, and organizing QA checks against plugins, Editor UI registrations, assets, actor state, reflection, and properties. Probe also supports safe temporary UObject fixtures, reversible Editor selection actions, and one-click plugin QA Pack generation. This source package targets Windows 64-bit; no engine source modifications.
 
+
+## Dev 10: Pack execution policy, prerequisites and run comparisons
+
+Dev 10 registers **54 native Automation Framework cases** (50 verified in Dev 9 Hotfix 1 plus four new native policy/report tests) with the same **233 assertions** and **154 templates**. Probe Packs can opt into **Stop on Failure**, **Retry Read-Only Once**, and explicit earlier-member **Requires** dependencies. The native Pack manager provides policy checkboxes and a per-member prerequisite menu. Tests with blocked prerequisites are Skipped with an explanation. Safe retries only apply to failed, built-in, read-only Test Assets; live UI input, selection, fixtures, custom providers, and tests with elevated authorizations are never retried automatically. Existing Packs retain Continue and no retry by default.
+
+Probe reports compare the latest completed run with the previous run in the current Editor workspace session. Results include attempt counts, setup/cleanup/assertion/infrastructure classification, and JSON export metadata. Comparison history is session-only and does not modify project files. The original full-run success message and every saved assertion ordinal remain unchanged. See [Dev 10 Pack policies](Docs/PACK_EXECUTION_AND_HISTORY_0154_DEV10.md) and [Dev 10 QA](Docs/QA_CHECKLIST_0154_DEV10.md).
+
+**Verification:** Dev 9 Hotfix 1 passed **50/50** Probe native tests in UE 5.8.3 based on the user's November 1, 2026 run. Dev 10 has passed offline source checks; UE compilation and the 54-test runtime suite remain unverified.
+
+## Dev 9 Hotfix 1: lifecycle regression fixture correction
+
+The initial Dev 9 build compiled and passed **49/50 native Probe automation cases** in UE 5.8.3. The only failure, `Probe.Editor.Dev9LifecyclePolicy`, was caused by an invalid test fixture: it expected a three-step *contiguous* Cleanup suffix to be rejected as disjoint. The production lifecycle validator correctly accepted that layout. This hotfix fixes the test to check both valid contiguous cleanup suffixes and **genuinely separated** cleanup blocks (`Cleanup`, `Verify`, `Cleanup`), including an explicit diagnostic assertion. **No runner, serialized Test Asset data, permissions, or lifecycle execution behavior changed.** Hotfix 1 subsequently passed 50/50 native Probe tests in the user's UE 5.8.3 Editor. See [Dev 9 Hotfix 1 QA](Docs/QA_CHECKLIST_0154_DEV9_HOTFIX1.md).
+
+## Dev 9: scenario lifecycle and parameter variations (development build)
+
+Probe supports **50 native Automation Framework regression cases** (44 previously verified plus six new cases), **233 built-in assertions**, and **154 templates**. Test Assets may optionally assign a contiguous first **Setup Group** and last **Cleanup Group**. On a failure, remaining verification steps are marked Skipped, while cleanup still executes in the same fixture context. A cleanup failure cannot hide the first failing assertion; later cleanup steps continue. Test-scoped group execution and unconfigured legacy assets retain their existing behavior.
+
+Test Assets can define named **parameter variations** using `Key=Value` bindings and `${Key}` placeholders for their Target, Expected Class, Property Name, Expected Value, and Description fields. **Run Variations** executes enabled cases separately. Expansion into Run All and Probe Packs is opt-in per Test Asset. The runner never modifies saved step definitions or grants Editor input/actor privileges through variations. Result names, retries, and JSON include variation provenance. See [scenario usage](Docs/SCENARIOS_AND_VARIATIONS_0154_DEV9.md) and [Dev 9 QA checklist](Docs/QA_CHECKLIST_0154_DEV9.md).
+
+**Verification:** Dev 8 passed **44/44 Probe native tests** in UE 5.8.3 based on the November 1, 2026 run supplied by the user. Dev 9 initially passed **49/50** because of a test-fixture error; Hotfix 1 then passed **50/50** in UE 5.8.3.
+
+## Dev 8: failure triage and group maintenance (development build)
+
+Probe now includes **233 built-in assertions**, **154 templates**, and **44 native Automation Framework cases**. In Results Explorer, **Problems Only** filters individual step diagnostics to failures/errors, **Copy Failures** produces a compact, actionable issue report, **Retry Failed Group** retries the contiguous group containing the first failed step, and **Rerun Full** executes the complete Test Asset. Group retry never reruns earlier setup implicitly and does not grant permissions. It rejects changed assertion types, changed group names, and disabled failed steps. The Test Definition editor can **Duplicate Group** in place with a distinct name, preserving step settings and participating in the Unreal transaction system.
+
+**Verification:** Dev 7 Hotfix 1 passed **41/41 native Probe regression tests in UE 5.8.3**, based on the user's October 31, 2026 results. Dev 8 subsequently passed **44/44** Probe native regression tests in Unreal. See [Dev 8 usage](Docs/FAILURE_TRIAGE_AND_GROUP_MAINTENANCE_0154_DEV8.md) and [Dev 8 QA](Docs/QA_CHECKLIST_0154_DEV8.md).
+
+## Dev 7 Hotfix 1: full-run diagnostic compatibility
+
+Dev 7 introduced scoped and disabled-step summaries, but accidentally replaced the long-standing `All N steps passed` success message even for complete, fully passing tests. This broke two independent Smoke Gate diagnostic checks, although the underlying fixture assertions passed. Complete all-passed runs now retain `All N steps passed`; whole runs with disabled steps report passed/disabled counts; and scoped runs keep their inclusive range and counts. The same summary policy is used in synchronous and asynchronous execution. The independent Smoke Gate oracle is unchanged. Native regression coverage now checks these cases, and the source validator rejects removal of the legacy success summary. See [Dev 7 Hotfix 1 QA](Docs/QA_CHECKLIST_0154_DEV7_HOTFIX1.md).
+
+**Verification:** Dev 7 Hotfix 1 passed 41/41 native Probe tests in UE 5.8.3, including the repaired Smoke Gate.
+
+## Dev 7: reusable step groups and controlled long runs
+
+Probe contains **233 built-in assertions**, **154 templates**, and **41 registered native Automation Framework tests** (38 from the verified Dev 6 Hotfix 1 baseline plus three Dev 7 regressions). Authors can name **consecutive steps as a group**, **Copy Group** to a versioned clipboard block, and **Paste Steps** into another Test Asset without copying Editor input or actor authorization. **Run Group** executes only that contiguous set of steps; preceding setup outside the range is intentionally not executed. Step checkboxes disable assertions without deleting them; disabled steps report **Skipped** and do not take actions.
+
+**Stop After Test** safely finishes the current queued test (including native Slate cleanup), skips unstarted tests, and is not a hard interrupt. Results Explorer displays step timings and group names; clipboard and JSON reports carry group names. Legacy saved Test Assets retain their enum ordinals and default enabled behavior. The QA and usage instructions are in [Dev 7 step groups and run control](Docs/STEP_GROUPS_AND_RUN_CONTROL_0154_DEV7.md) and [Dev 7 QA checklist](Docs/QA_CHECKLIST_0154_DEV7.md).
+
+**Verification:** Dev 6 Hotfix 1 passed **38/38** Probe tests. The original Dev 7 compiled in UE 5.8.3 and passed **40/41** Probe tests; only the Smoke Gate diagnostic summary contract failed. Dev 7 Hotfix 1 subsequently passed 41/41 native Probe tests.
+
+
+## Dev 6 Hotfix 1: native input reliability and catalog tests
+
+Two test-only catalog expectations were still set to 223 after the Dev 6 assertion total increased to 233. Both now check the full catalog. The native append action now navigates to the end using the conventional **Ctrl+End** chord after a brief focus settle, using the same input implementation for named Details search and tagged Slate widgets. Each input failure reports the specific stage (click/focus, caret navigation, selection, or typing), and the Dev 6 automation test prints per-step diagnostics if text input fails. This source hotfix still requires UE 5.8.3 runtime verification; the 33/33 Dev 5 Hotfix 2 baseline remains the last fully verified release.
+
+## Native Editor UI: conditional waits and text automation
+
+Probe includes **233 built-in assertions** and **154 templates**. Test Assets can use stable `id:<AutomationDriverID>` or `details:search` selectors to inspect live widgets, wait for them to appear/disappear/become interactable, and verify text as the Editor changes. New text actions **Append Text** and **Clear Widget Text** require explicit **Authorize UI Input**. Read-only waits and assertions never authorize or emit clicks. Each timeout reports last-observed state and elapsed duration. The **Widget Targets** browser can create quick readiness, disappearance, and text-change waits, and **Check Targets** distinguishes expected absence from missing targets that should be present.
+
+The native Automation Framework tests use disposable Slate fixtures, including delayed state changes, intentional timeout reporting and authorized text editing. The complete Dev 6 suite registers **38 Probe tests**. **Last verified baseline:** Dev 5 Hotfix 2 passed **33/33** Probe tests in UE 5.8.3; Dev 6 still requires native compilation and runtime verification. See [native UI conditions](Docs/NATIVE_UI_CONDITIONS_0154_DEV6.md) and [Dev 6 checklist](Docs/QA_CHECKLIST_0154_DEV6.md).
+
+## 0.15.4-dev5-hotfix2: Authoring acceptance automation
+
+Extends the successfully tested Dev 5 Hotfix 1 baseline (30/30 native tests in UE 5.8.3) with **three additional automated cases**: live Widget Targets browser filters, an isolated authored Test Asset/preflight exercise with temporary tagged Slate widgets, and asynchronous execution of steps constructed through the same quick-step policy as the UI. The full suite now registers **33** tests. No new assertion types, serialized enum changes, or Test Asset schema changes are involved.
+
+The **Check Targets** preflight now correctly reports `details:search` separately as *native Details (deferred)* rather than calling it unavailable. Browser search and filtering now share testable logic with their regression cases. Preflight remains read-only and does not modify readiness or invoke UI input. A disposable Test Asset's step values are also verified through UObject duplication, but this does **not** replace manual disk save/reopen and undo/redo verification.
+
+**Verification:** Dev 5 Hotfix 1 is user-verified at 30/30. This Hotfix 2 build is source-checked only, pending Unreal 5.8.3 compilation and `Automation RunTests Probe` (expected 33/33). See [Dev 5 acceptance automation checklist](Docs/QA_CHECKLIST_0154_DEV5_ACCEPTANCE_AUTOMATION.md).
+
+## 0.15.4-dev5: Inspect and author from live widget targets
+
+**Quick assertion authoring:** The **Widget Targets** browser can create ready-to-configure native UI assertions directly in the selected Probe Test Asset, including **Exists**, **Visible**, **Interactable** and **Wait For Visible**. For directly tagged `STextBlock` or `SEditableTextBox` controls, it also creates **Text Equals Current Text** and **Wait For Current Text** assertions with captured Expected Value. Changes are transactional, undoable, dirty the asset, and preserve its existing steps. Duplicate IDs, including IDs differing only in capitalization, and stale widget targets cannot be used to create steps. The browser also supports **Unique only** and **Duplicates only** filters and text previews.
+
+**Target inspection:** Every native Widget Selector has an **Inspect** menu to verify exact ID resolution, effective state and available direct text, with **Copy Observed Text** and **Set as Expected** for text assertions. A **Check Targets** toolbar action validates the current Test Asset's native UI selectors in a read-only snapshot. Missing panels are reported as currently unavailable, not as failures or permanent readiness blockers. `details:search` remains an execution-time special selector. Read-only-only assets show an explanatory input authorization hint.
+
+**Source and safety:** `ProbeWidgetDiscovery.h` now exposes shared pure resolution diagnostics and direct-text snapshots; `ProbeWidgetTargetAuthoring.h` holds quick-step safety policy. Three new native tests verify selector edge cases, real tagged Slate text widgets and safe quick-step generation. The suite increases from the **27/27 verified Dev 4 baseline** to **30** registered cases requiring a new UE 5.8.3 runtime verification. No Test Asset migrations, new input privileges or engine changes.
+
+See [Widget Target Authoring](Docs/WIDGET_TARGET_AUTHORING_0154_DEV5.md) and [Dev 5 QA checklist](Docs/QA_CHECKLIST_0154_DEV5.md).
 
 ## 0.15.4-dev4: Discoverable native widget targets
 
@@ -9,7 +78,7 @@ Probe is an **Unreal Engine 5.8.3 Editor-only QA plugin** for creating, executin
 
 **Safety:** untagged widgets are never presented as selectable targets; duplicate IDs are flagged as ambiguous and cannot be copied/inserted. The browser is strictly observational, does not send input or modify selection, and has bounded traversal. The special native Details selector `details:search` remains directly supported and can be entered manually. This pass adds stable Automation Driver IDs to Probe's own **Run Selected**, **Add Step**, and **Refresh Tests** controls for dogfooding and plugin-author examples. No Test Asset schema or step enum changes.
 
-**Regressions:** `Probe.Editor.WidgetDiscoveryUniqueIds` verifies tagged discovery, selector formation and owning-window identity without counting untagged widgets. `Probe.Editor.WidgetDiscoveryRejectsDuplicates` verifies collisions are reported as unsafe. The native automation suite now contains **27 cases**, compared with **25/25 passing in Dev 3** on the user's UE 5.8.3 Editor on October 28/29, 2026. Dev 4 requires a new build and runtime verification before its own pass status can be claimed.
+**Regressions:** `Probe.Editor.WidgetDiscoveryUniqueIds` verifies tagged discovery, selector formation and owning-window identity without counting untagged widgets. `Probe.Editor.WidgetDiscoveryRejectsDuplicates` verifies collisions are reported as unsafe. The Dev 4 native automation suite contains **27 cases** and passed **27/27** in the user's UE 5.8.3 Editor, including manual picker, Copy, Find/Use and save/reopen checks.
 
 See [Widget Target Discovery](Docs/WIDGET_TARGET_DISCOVERY_0154_DEV4.md) and [Dev 4 QA checklist](Docs/QA_CHECKLIST_0154_DEV4.md).
 
@@ -21,7 +90,7 @@ See [Widget Target Discovery](Docs/WIDGET_TARGET_DISCOVERY_0154_DEV4.md) and [De
 
 **Native authoring UI** groups new steps into **Native Widget Assertions**, **Native Widget Waits**, and **Details Panel**, with actionable selector labels, suitable initial values and wait-duration summaries. The existing **Native Widget Automation** grouping remains for click/type. A new independent `Probe.Driver.AuthoredWidgetInspection` Automation Framework spec exercises nine read-only steps and a deliberately failing text assertion against disposable native Slate controls. The authored Details spec now verifies six steps. The optional external UI gate requires both new spec cases. Source validation tools have been updated to the Hotfix 2 C++ filename `ProbeTestExecution.cpp`.
 
-**Previously verified baseline:** Dev 2 Hotfix 2 compiled successfully in the user's UE 5.8.3 Editor, passed all **23/23** native tests, and passed saved Test Asset, persistence, repeated execution, multiple-Test Pack, intentional-failure and state-restoration checks on October 28, 2026. **Dev 3 itself has passed static source checks, but has not yet been compiled or executed in UE 5.8.3.** The expanded suite should report **25/25** after runtime verification. The engine is unchanged.
+**Previously verified baseline:** Dev 2 Hotfix 2 compiled successfully in the user's UE 5.8.3 Editor, passed all **23/23** native tests, and passed saved Test Asset, persistence, repeated execution, multiple-Test Pack, intentional-failure and state-restoration checks on October 28, 2026. **Dev 3 subsequently passed 25/25 automated tests** in the user's UE 5.8.3 Editor. The engine is unchanged.
 
 See [Native Widget Inspection](Docs/NATIVE_WIDGET_INSPECTION_0154_DEV3.md) and [Dev 3 QA checklist](Docs/QA_CHECKLIST_0154_DEV3.md). This version is a development build; complete the validation checklist before treating it as a stable release.
 
@@ -229,7 +298,7 @@ The 25 matching templates appear in categorized menus and start in **Needs Confi
 
 ## Developer and distribution notes
 
-Read [Docs/EXTENDING_PROBE.md](Docs/EXTENDING_PROBE.md) for test provider modules, assertion and template registration, and optional companion plugin packaging. `Tools/ValidateProbeCatalog.py` is a source-only developer check; normal users do not need to run it. Probe now supports **temporary UObject test actions and reversible Editor selection actions**. It now supports explicit opt-in transient actor creation in the active Editor world, but does not yet perform Editor UI clicks or Undo/Redo sequences. The actor actions require a disposable test map for initial QA.
+Read [Docs/EXTENDING_PROBE.md](Docs/EXTENDING_PROBE.md) for test provider modules, assertion and template registration, and optional companion plugin packaging. `Tools/ValidateProbeCatalog.py` is a source-only developer check; normal users do not need to run it. Probe supports **temporary UObject test actions and reversible Editor selection actions**, explicit opt-in transient actor creation, and authorized native Editor UI clicks and typing via its asynchronous Automation Driver runner. Its Test Asset editing supports Undo/Redo. The actor actions require a disposable test map for initial QA.
 
 See [Docs/ASSERTION_UX.md](Docs/ASSERTION_UX.md) for assertion authoring behavior and limitations, and [Docs/QA_CHECKLIST.md](Docs/QA_CHECKLIST.md) for acceptance cases. This package has **not** been compiled or run in a local UE 5.8.3 engine environment; it requires a local build and QA pass.
 
@@ -248,7 +317,7 @@ The resulting Pack is selected in the Packs workspace. Click **Run Pack**, inspe
 
 Test Actions also supports clearing Editor actor selection, selecting the first available actor, selecting by exact Outliner label, selecting by Actor Tag, and explicitly restoring the original selection. The runner automatically restores selection after **each test**, including on failed or erroneous steps. These actions do **not** spawn actors, modify properties, or edit levels; they only manipulate the Editor selection temporarily. The ready-to-run **Selection Clear And Restore** template is a good first validation. Additional selection templates require an appropriate level or configured Actor Label / Tag.
 
-See `Docs/START_PLUGIN_QA.md` for baseline plugin checks, `Docs/START_BEHAVIOR_QA.md` for actor workflow setup and safety boundaries, and `Docs/QA_CHECKLIST_012.md` for the version-specific acceptance tests. Full native UI click automation (Solo, Outliner hierarchy locks, Blueprint editor interactions) is **not** yet implemented; those will need plugin-specific action adapters or future Probe actions.
+See `Docs/START_PLUGIN_QA.md` for baseline plugin checks, `Docs/START_BEHAVIOR_QA.md` for actor workflow setup and safety boundaries, and `Docs/QA_CHECKLIST_012.md` for the version-specific acceptance tests. Native UI clicking, typing, inspection and waits are supported for tagged controls; plugin-specific workflows such as Solo, Outliner hierarchy locks, and Blueprint interactions still need stable widget IDs or appropriate test adapters.
 
 
 ## Test readiness and world authorization (0.14.0)

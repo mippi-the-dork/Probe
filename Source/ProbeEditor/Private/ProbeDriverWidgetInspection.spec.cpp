@@ -6,6 +6,8 @@
 
 #include "ProbeTestRunner.h"
 #include "ProbeTestAsset.h"
+#include "ProbeWidgetDiscovery.h"
+#include "ProbeWidgetTargetAuthoring.h"
 #include "Framework/Application/SlateApplication.h"
 #include "Framework/MetaData/DriverIdMetaData.h"
 #include "Widgets/SWindow.h"
@@ -33,8 +35,10 @@ BEGIN_DEFINE_SPEC(FProbeDriverWidgetInspectionSpec,
     TSharedPtr<SWindow> Window;
     TStrongObjectPtr<UProbeTestAsset> Positive;
     TStrongObjectPtr<UProbeTestAsset> Negative;
+    TStrongObjectPtr<UProbeTestAsset> QuickAuthored;
     TSharedPtr<ProbeWidgetInspection::FCompletion> Completion;
     bool bExpectPass = true;
+    int32 ExpectedSteps = 9;
     bool bTimedOut = false;
 END_DEFINE_SPEC(FProbeDriverWidgetInspectionSpec)
 
@@ -46,6 +50,7 @@ void FProbeDriverWidgetInspectionSpec::Define()
         {
             bTimedOut = false;
             bExpectPass = true;
+            ExpectedSteps = 9;
             Completion = MakeShared<ProbeWidgetInspection::FCompletion>();
             SAssignNew(Window, SWindow)
                 .Title(FText::FromString(TEXT("Probe Read-Only Widget Inspection")))
@@ -98,11 +103,32 @@ void FProbeDriverWidgetInspectionSpec::Define()
 
             Add(*Negative.Get(), EProbeStepType::UIWidgetTextEquals, Text, TEXT("DeliberatelyWrong"));
             Add(*Negative.Get(), EProbeStepType::UIWidgetExists, Button); // Must not execute after failure.
+
+            // Acceptance flow: create actual authored steps from the same live
+            // discovery snapshots and policy used by Widget Targets > + Step.
+            QuickAuthored.Reset(NewObject<UProbeTestAsset>(GetTransientPackage(),
+                UProbeTestAsset::StaticClass(), NAME_None, RF_Transient));
+            const auto Candidates = ProbeWidgetDiscovery::Collect();
+            const auto ButtonResult = ProbeWidgetDiscovery::Resolve(Candidates, Button);
+            const auto TextResult = ProbeWidgetDiscovery::Resolve(Candidates, Text);
+            if (ButtonResult.CanUse() && TextResult.CanUse())
+            {
+                auto AddQuick = [this](EProbeStepType Type, const ProbeWidgetDiscovery::FCandidate& Candidate)
+                {
+                    FProbeTestStep Step;
+                    if (ProbeWidgetTargetAuthoring::ConfigureQuickStep(Step, Type, Candidate))
+                    { QuickAuthored->Steps.Add(Step); }
+                };
+                AddQuick(EProbeStepType::UIWaitForWidgetVisible, ButtonResult.Candidate);
+                AddQuick(EProbeStepType::UIWidgetExists, ButtonResult.Candidate);
+                AddQuick(EProbeStepType::UIWidgetTextEquals, TextResult.Candidate);
+            }
         });
 
         It("reads tagged widget state without sending input", EAsyncExecution::ThreadPool, [this]()
         {
             bExpectPass = true;
+            ExpectedSteps = 9;
             const TSharedRef<ProbeWidgetInspection::FCompletion> State = Completion.ToSharedRef();
             UProbeTestAsset* Asset = Positive.Get();
             AsyncTask(ENamedThreads::GameThread, [State, Asset]()
@@ -122,8 +148,29 @@ void FProbeDriverWidgetInspectionSpec::Define()
         It("reports a mismatched widget text as failure", EAsyncExecution::ThreadPool, [this]()
         {
             bExpectPass = false;
+            ExpectedSteps = 1;
             const TSharedRef<ProbeWidgetInspection::FCompletion> State = Completion.ToSharedRef();
             UProbeTestAsset* Asset = Negative.Get();
+            AsyncTask(ENamedThreads::GameThread, [State, Asset]()
+            {
+                Probe::RunTestAsync(Asset, [State](Probe::FTestResult Result)
+                {
+                    State->Result = MoveTemp(Result);
+                    State->bCompleted.Store(true);
+                });
+            });
+            const double Deadline = FPlatformTime::Seconds() + 20.0;
+            while (!State->bCompleted.Load() && FPlatformTime::Seconds() < Deadline)
+            { FPlatformProcess::Sleep(0.05f); }
+            bTimedOut = !State->bCompleted.Load();
+        });
+
+        It("runs quick-authored live targets without UI-input authorization", EAsyncExecution::ThreadPool, [this]()
+        {
+            bExpectPass = true;
+            ExpectedSteps = 3;
+            const TSharedRef<ProbeWidgetInspection::FCompletion> State = Completion.ToSharedRef();
+            UProbeTestAsset* Asset = QuickAuthored.Get();
             AsyncTask(ENamedThreads::GameThread, [State, Asset]()
             {
                 Probe::RunTestAsync(Asset, [State](Probe::FTestResult Result)
@@ -146,7 +193,7 @@ void FProbeDriverWidgetInspectionSpec::Define()
                 const Probe::FTestResult& Result = Completion->Result;
                 TestEqual(TEXT("Authorable widget result status"), static_cast<int32>(Result.Status),
                     static_cast<int32>(bExpectPass ? Probe::EResultStatus::Passed : Probe::EResultStatus::Failed));
-                TestEqual(TEXT("Correct number of steps executed"), Result.Steps.Num(), bExpectPass ? 9 : 1);
+                TestEqual(TEXT("Correct number of steps executed"), Result.Steps.Num(), ExpectedSteps);
                 for (const Probe::FStepResult& Step : Result.Steps)
                 { TestEqual(TEXT("Correct individual step status"), static_cast<int32>(Step.Status),
                     static_cast<int32>(bExpectPass ? Probe::EResultStatus::Passed : Probe::EResultStatus::Failed)); }
@@ -160,6 +207,7 @@ void FProbeDriverWidgetInspectionSpec::Define()
             }
             Positive.Reset();
             Negative.Reset();
+            QuickAuthored.Reset();
         });
     });
 }
