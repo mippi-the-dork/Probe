@@ -1,4 +1,46 @@
-# Probe 0.15.4-dev11
+# Probe 0.15.4-dev13-hotfix2
+
+## Dev 13 Hotfix 2: native recurring-failure fixture safety
+
+Fixes the UE 5.8.3 Editor crash in `Probe.Editor.Dev13RecurringFailures` caused by passing `First.Results[0]` directly into `First.Results.Add(...)`. UE detects the source object is owned by the same `TArray` being modified and asserts before the test can complete. The fixture now makes a standalone `FTestResult` copy before insertion, preserving the two-failures-in-one-run test scenario. Also guards index-based inspection of generated comparison/incident arrays so an unexpected zero-result condition reports an Automation Framework failure rather than crashing.
+
+Adds an independent offline source gate (`Tools/ValidateProbeArrayAliasing.py`) to catch same-container `Add`/`Emplace`/`Insert` patterns in native automation fixture source, with positive and negative self-checks. All 65 existing native tests remain registered; production History Browser, history storage, Test Assets, Packs and runner logic are unchanged. Dev 13 Hotfix 1 built and its Browser construction test passed in UE 5.8.3. **Dev 13 full-suite runtime verification is pending a Hotfix 2 retest.** See [Dev 13 Hotfix 2 QA](Docs/QA_CHECKLIST_0154_DEV13_HOTFIX2.md).
+
+# Probe 0.15.4-dev13-hotfix1
+
+## Dev 13 Hotfix 1: UE 5.8 Slate browser compile correction
+
+Fixes the two errors from the user's UE 5.8 build in `ProbeDev13HistoryBrowser.h`:
+- Removes one extra `]` at the end of the browser splitter's right panel; the final `]` for `ChildSlot` stays on the next line.
+- Passes `Probe::StatusName(Test.Status)` directly to `FString::Printf` instead of dereferencing the returned `const TCHAR*` (which produces a single `TCHAR` and fails UE's checked `%s` formatting).
+
+The History Browser, test suite, and saved history data format are unchanged. Prior Dev 12 baseline: 60/60 native Probe tests. Dev 13 Hotfix 1 requires a fresh UE 5.8.3 compile and native test verification before acceptance.
+
+
+## Dev 13: dedicated History Browser and regression investigation
+
+**Last native verified baseline: Dev 12 60/60 Probe tests in UE 5.8.3**, plus the user's confirmation that the Dev 12 new tests succeeded. Dev 13 has five new native tests (65 expected total) and requires UE compile/runtime verification.
+
+The History dropdown is now grouped into four short categories, with no raw list of old runs. **Open History Browser...** provides live search and filters, per-run test and step diagnostics, run-to-run change previews, baseline pinning and individually confirmed run deletion. **Regression Analysis** shows recurring failure signatures, flaky tests, and failure-rate trends. Filtered investigation reports can be copied, and trends can be exported as CSV. All data stays under `Saved/Probe`; the existing versioned run file format, 10-run default retention and 64 MiB cap remain unchanged.
+
+See [Dev 13 History Browser and Investigation](Docs/HISTORY_BROWSER_AND_INVESTIGATION_0154_DEV13.md) and [Dev 13 QA Checklist](Docs/QA_CHECKLIST_0154_DEV13.md).
+
+# Probe 0.15.4-dev12
+
+## Dev 12: bounded history, confirmed deletion and historical trend analysis
+
+Probe now registers **60 native Automation Framework cases** (the 57/57 UE 5.8.3-verified Dev 11 baseline plus three new tests). Dev 11's successful manual persistence/restart verification establishes the baseline for this pass. Dev 12 has not yet been compiled or tested in UE 5.8.3.
+
+Run history defaults to **10 project-local run snapshots**. In **History > Maximum Saved Runs**, choose Off (no future saves, old files preserved), 5, 10, 20, 30, or 50. Retained run files are further bounded by a **64 MiB total** size cap; each run remains subject to the pre-existing 12 MiB file size limit. Reducing a nonzero retention limit prunes older runs immediately. Run history is stored in `<Project>/Saved/Probe/History/` rather than packaged content or assets. Clearing history requires an explicit Yes/No confirmation and deletes only Probe history snapshots and the pinned baseline; manual exports in `Saved/Probe/Reports/` and unrelated files are preserved.
+
+An older run may now be **pinned** as the default comparison baseline across Editor restarts. The pin is kept as one separate JSON snapshot outside the rolling history limit (up to 12 MiB). **Use Latest Run as Baseline** unpins it. The History menu also supports filtering by Test Asset, Pack (for new Dev 12 snapshots), variation name, and run outcome. Reopen the menu after changing the text filter. **View Failure Trends**, **Copy Trend Report**, and **Export Trend Report** analyze saved historical runs by test and variation. Failure rates count pass versus fail/error, excluding skipped outcomes; a flaky classification requires at least two pass/fail transitions, so a single regression is not mislabeled flaky. History trends are limited to retained evidence, not all runs ever made. Trend report exports are explicitly initiated, not automatically produced.
+
+See [Dev 12 history guide](Docs/HISTORY_TRENDS_AND_RETENTION_0154_DEV12.md) and [Dev 12 QA checklist](Docs/QA_CHECKLIST_0154_DEV12.md).
+
+**Verification:** Dev 11: **57/57 native tests passed** in UE 5.8.3, plus manual run history validation. Dev 12: offline source gates passed; pending UE compile and native runtime testing.
+
+---
+
 
 Probe is an **Unreal Engine 5.8.3 Editor-only QA plugin** for creating, executing, and organizing QA checks against plugins, Editor UI registrations, assets, actor state, reflection, and properties. Probe also supports safe temporary UObject fixtures, reversible Editor selection actions, and one-click plugin QA Pack generation. This source package targets Windows 64-bit; no engine source modifications.
 

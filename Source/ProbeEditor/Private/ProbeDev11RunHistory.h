@@ -16,7 +16,10 @@
 // All entry points are invoked on the Editor game thread, never from an async IO task.
 namespace ProbeDev11RunHistory
 {
-    static constexpr int32 RetainedRuns = 30;
+    static constexpr int32 RetainedRuns = 30; // Legacy Dev11 retention default for existing source-level tests.
+    static constexpr int32 DefaultSavedRuns = 10;
+    static constexpr int32 MaximumSavedRuns = 50;
+    static constexpr int64 MaxHistoryBytes = 64LL * 1024 * 1024;
     static constexpr int32 MaxTests = 2000;
     static constexpr int32 MaxStepsPerTest = 2000;
     static constexpr int64 MaxFileBytes = 12 * 1024 * 1024;
@@ -25,6 +28,7 @@ namespace ProbeDev11RunHistory
     {
         FDateTime TimestampUtc;
         FString EngineVersion;
+        FString PackPath; // Optional Dev12 provenance; old history files remain readable.
         TArray<Probe::FTestResult> Results;
     };
 
@@ -50,6 +54,7 @@ namespace ProbeDev11RunHistory
         Root->SetStringField(TEXT("format"), TEXT("ProbeRunHistory/1"));
         Root->SetStringField(TEXT("timestamp_utc"), Snapshot.TimestampUtc.ToIso8601());
         Root->SetStringField(TEXT("engine_version"), Snapshot.EngineVersion);
+        Root->SetStringField(TEXT("pack_path"), Snapshot.PackPath);
         TArray<TSharedPtr<FJsonValue>> Tests;
         for (const Probe::FTestResult& Result : Snapshot.Results)
         {
@@ -95,6 +100,7 @@ namespace ProbeDev11RunHistory
             || !Tests || Tests->IsEmpty() || Tests->Num() > MaxTests)
         { return false; }
         Root->TryGetStringField(TEXT("engine_version"), Out.EngineVersion);
+        Root->TryGetStringField(TEXT("pack_path"), Out.PackPath);
         TArray<Probe::FTestResult> Parsed;
         for (const TSharedPtr<FJsonValue>& Value : *Tests)
         {
@@ -185,7 +191,27 @@ namespace ProbeDev11RunHistory
         return false;
     }
 
-    inline bool Save(const FString& Directory, const FSnapshot& Snapshot, FString* OutPath = nullptr)
+    // Only files created by Probe's history writer participate in retention. Never
+    // delete unrelated files in Saved/Probe/History, including pinned baselines.
+    inline void Prune(const FString& Directory, int32 MaxSavedRuns = DefaultSavedRuns,
+        int64 MaxTotalBytes = MaxHistoryBytes)
+    {
+        const TArray<FString> Paths = ListPaths(Directory);
+        const int32 Limit = FMath::Clamp(MaxSavedRuns, 0, MaximumSavedRuns);
+        int64 Bytes = 0;
+        int32 Kept = 0;
+        for (const FString& Path : Paths)
+        {
+            const int64 Size = IFileManager::Get().FileSize(*Path);
+            if (Kept < Limit && Size > 0 && Size <= MaxFileBytes
+                && Bytes <= MaxTotalBytes - Size)
+            { Bytes += Size; ++Kept; }
+            else { IFileManager::Get().Delete(*Path, false, false, true); }
+        }
+    }
+
+    inline bool Save(const FString& Directory, const FSnapshot& Snapshot, FString* OutPath = nullptr,
+        int32 MaxSavedRuns = RetainedRuns)
     {
         FString Json;
         if (!Serialize(Snapshot, Json) || Json.Len() > MaxFileBytes) { return false; }
@@ -202,9 +228,7 @@ namespace ProbeDev11RunHistory
             return false;
         }
         if (OutPath) { *OutPath = Path; }
-        TArray<FString> Paths = ListPaths(Directory);
-        for (int32 Index = RetainedRuns; Index < Paths.Num(); ++Index)
-        { IFileManager::Get().Delete(*Paths[Index], false, false, true); }
+        Prune(Directory, MaxSavedRuns);
         return true;
     }
 

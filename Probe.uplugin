@@ -1,9 +1,9 @@
 {
   "FileVersion": 3,
-  "Version": 44,
-  "VersionName": "0.15.4-dev11",
+  "Version": 48,
+  "VersionName": "0.15.4-dev13-hotfix2",
   "FriendlyName": "Probe",
-  "Description": "Visual QA Tests and Packs, native Editor UI automation, safe conditional waits, reusable step groups, opt-in cleanup and parameter variations, failure triage, Pack execution policies, dependencies, safe retries, persistent run history, and historical comparisons.",
+  "Description": "Visual QA Tests and Packs, native Editor UI automation, parameterized setup/cleanup, Pack execution policies, bounded run history and baseline pinning, dedicated history investigation browser, failure clustering and regression CSV reporting.",
   "Category": "Testing",
   "CreatedBy": "Mippi",
   "CanContainContent": true,

@@ -11,6 +11,9 @@
 #include "ProbeDev10PackPolicy.h"
 #include "ProbeDev10RunHistory.h"
 #include "ProbeDev11RunHistory.h"
+#include "ProbeDev12History.h"
+#include "ProbeDev13HistoryModel.h"
+#include "ProbeDev13HistoryBrowser.h"
 #include "ProbeExtensions.h"
 #include "ProbeSelfTest.h"
 #include "ProbeTestAssetFactory.h"
@@ -31,6 +34,7 @@
 #include "ContentBrowserModule.h"
 #include "IContentBrowserSingleton.h"
 #include "Misc/ConfigCacheIni.h"
+#include "Misc/MessageDialog.h"
 #include "LevelEditor.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetToolsModule.h"
@@ -2235,11 +2239,18 @@ public:
     {
         GConfig->GetFloat(TEXT("ProbeWorkspace"), TEXT("DefinitionFraction"), DefinitionFraction, GEditorPerProjectIni);
         DefinitionFraction = FMath::Clamp(DefinitionFraction, 0.20f, 0.85f);
-        // Recover only the latest valid stored run as the comparison baseline.
-        // Corrupt/unsupported files are ignored; current results remain empty.
+        // Configurable project-local retention. Existing history remains untouched
+        // when saving is disabled (0); Clear History is always explicit.
+        GConfig->GetInt(TEXT("ProbeWorkspace"), TEXT("MaxSavedHistoryRuns"), MaxSavedHistoryRuns, GEditorPerProjectIni);
+        MaxSavedHistoryRuns = FMath::Clamp(MaxSavedHistoryRuns, 0, ProbeDev11RunHistory::MaximumSavedRuns);
+        if (MaxSavedHistoryRuns > 0)
+        { ProbeDev11RunHistory::Prune(ProbeDev11RunHistory::DefaultDirectory(), MaxSavedHistoryRuns); }
         ProbeDev11RunHistory::FSnapshot PreviousSnapshot;
         if (ProbeDev11RunHistory::ReadLatest(ProbeDev11RunHistory::DefaultDirectory(), PreviousSnapshot))
         { LastCompletedResults = MoveTemp(PreviousSnapshot.Results); }
+        ProbeDev11RunHistory::FSnapshot Pinned;
+        if (ProbeDev12History::LoadPinned(ProbeDev11RunHistory::DefaultDirectory(), Pinned))
+        { SelectedHistoryBaselinePath = ProbeDev12History::PinnedPath(ProbeDev11RunHistory::DefaultDirectory()); }
         RefreshAssets();
         FEditorDelegates::PostUndoRedo.AddSP(this, &SProbeWorkspace::HandleUndoRedo);
         ChildSlot
@@ -2322,7 +2333,7 @@ public:
                             + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2, 0, 2, 0)
                             [
                                 SNew(SComboButton)
-                                .ToolTipText(LOCTEXT("RunHistoryTip", "Inspect previous run results or compare this run against a saved baseline. Keeps up to 30 project-local runs in Saved/Probe/History."))
+                                .ToolTipText(LOCTEXT("RunHistoryTip", "Inspect previous run results or compare this run against a saved baseline. Keeps a configurable number of runs (10 by default) under Saved/Probe/History, with a 64 MiB total budget."))
                                 .OnGetMenuContent(this, &SProbeWorkspace::BuildHistoryMenu)
                                 .ButtonContent()
                                 [ SNew(STextBlock).Text(LOCTEXT("RunHistory", "History")) ]
@@ -2672,8 +2683,12 @@ private:
     double LastRunDurationMs = 0.0;
     TArray<Probe::FTestResult> LastCompletedResults;
     ProbeDev10RunHistory::FComparison LastComparison;
-    FString SelectedHistoryBaselinePath; // session-only selection; never changes Test Assets
+    FString SelectedHistoryBaselinePath; // file path; a pinned baseline survives editor restarts
+    int32 MaxSavedHistoryRuns = ProbeDev11RunHistory::DefaultSavedRuns;
+    FString HistorySearch;
+    ProbeDev12History::EHistoryStatusFilter HistoryStatusFilter = ProbeDev12History::EHistoryStatusFilter::All;
     bool bViewingSavedHistory = false;
+    TWeakPtr<SWindow> HistoryBrowserWindow;
 
     void OnDefinitionResized(float NewFraction)
     {
@@ -5442,42 +5457,226 @@ private:
 
     void UseLatestHistoryBaseline()
     {
+        // Explicitly choosing the latest run also removes the persisted pin.
+        ProbeDev12History::Unpin(ProbeDev11RunHistory::DefaultDirectory());
         SelectedHistoryBaselinePath.Reset();
         FeedbackMessage = LOCTEXT("HistoryBaselineAutomatic", "Future runs will compare against the latest completed run.");
-        return;
+    }
+
+    void PinSavedRun(FString Path)
+    {
+        if (bRunInProgress) { return; }
+        ProbeDev11RunHistory::FSnapshot Snapshot;
+        if (!ProbeDev11RunHistory::Read(Path, Snapshot))
+        { FeedbackMessage = LOCTEXT("PinHistoryInvalid", "Cannot pin an invalid or missing run."); return; }
+        const FString Directory = ProbeDev11RunHistory::DefaultDirectory();
+        if (!ProbeDev12History::Pin(Directory, Snapshot))
+        { FeedbackMessage = LOCTEXT("PinHistoryWriteFailed", "Unable to save the pinned baseline."); return; }
+        SelectedHistoryBaselinePath = ProbeDev12History::PinnedPath(Directory);
+        LastComparison = ProbeDev10RunHistory::Compare(Snapshot.Results, Results);
+        FeedbackMessage = LOCTEXT("PinHistorySuccess", "Baseline pinned across Editor restarts.");
+        ShowResults();
+    }
+
+    void SetHistoryLimit(int32 NewLimit)
+    {
+        MaxSavedHistoryRuns = FMath::Clamp(NewLimit, 0, ProbeDev11RunHistory::MaximumSavedRuns);
+        GConfig->SetInt(TEXT("ProbeWorkspace"), TEXT("MaxSavedHistoryRuns"), MaxSavedHistoryRuns, GEditorPerProjectIni);
+        GConfig->Flush(false, GEditorPerProjectIni);
+        // 0 disables recording and preserves old files until the user explicitly clears them.
+        if (MaxSavedHistoryRuns > 0)
+        { ProbeDev11RunHistory::Prune(ProbeDev11RunHistory::DefaultDirectory(), MaxSavedHistoryRuns); }
+        FeedbackMessage = FText::FromString(MaxSavedHistoryRuns == 0
+            ? TEXT("History recording disabled. Existing runs are preserved until cleared.")
+            : FString::Printf(TEXT("History retention set to %d run(s), subject to a 64 MiB disk limit."), MaxSavedHistoryRuns));
+    }
+
+    void ClearSavedHistory()
+    {
+        if (bRunInProgress) { return; }
+        const EAppReturnType::Type Decision = FMessageDialog::Open(EAppMsgType::YesNo, EAppReturnType::No,
+            LOCTEXT("ConfirmClearHistory", "Delete all Probe saved run history and the pinned baseline for this project? This cannot be undone. Test Assets, Packs, and exported reports will not be affected."));
+        if (Decision != EAppReturnType::Yes) { return; }
+        if (!ProbeDev12History::ClearHistory(ProbeDev11RunHistory::DefaultDirectory()))
+        { FeedbackMessage = LOCTEXT("ClearHistoryFailed", "Some history files could not be deleted. Check file permissions."); return; }
+        SelectedHistoryBaselinePath.Reset();
+        LastCompletedResults.Reset();
+        LastComparison = ProbeDev10RunHistory::FComparison();
+        FeedbackMessage = LOCTEXT("ClearHistoryDone", "Saved Probe history and pinned baseline cleared. Current results remain visible.");
+        ShowResults();
+    }
+
+    FString CurrentHistoryTrendReport() const
+    {
+        const TArray<ProbeDev12History::FSnapshot> Snapshots = ProbeDev12History::LoadChronological(
+            ProbeDev11RunHistory::DefaultDirectory());
+        TArray<ProbeDev12History::FSnapshot> Matching;
+        bool bPackSearch = false;
+        for (const ProbeDev12History::FSnapshot& Snapshot : Snapshots)
+        {
+            if (ProbeDev12History::Matches(Snapshot, HistorySearch, HistoryStatusFilter))
+            {
+                Matching.Add(Snapshot);
+                bPackSearch |= !HistorySearch.IsEmpty()
+                    && Snapshot.PackPath.Contains(HistorySearch, ESearchCase::IgnoreCase);
+            }
+        }
+        return ProbeDev12History::TrendReport(ProbeDev12History::Analyze(
+            Matching, bPackSearch ? FString() : HistorySearch), Matching.Num());
+    }
+
+    void ExportHistoryTrends()
+    {
+        const FString Directory = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Probe"), TEXT("Reports"));
+        if (!IFileManager::Get().MakeDirectory(*Directory, true))
+        { FeedbackMessage = LOCTEXT("TrendExportDirFailed", "Unable to create Probe report directory."); return; }
+        const FString Path = FPaths::Combine(Directory, FString::Printf(TEXT("Probe-History-Trends-%s.txt"),
+            *FDateTime::Now().ToString(TEXT("%Y%m%d-%H%M%S"))));
+        const FString Report = CurrentHistoryTrendReport();
+        FeedbackMessage = FFileHelper::SaveStringToFile(Report, *Path,
+            FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM)
+            ? FText::FromString(FString::Printf(TEXT("History trend report exported: %s"), *Path))
+            : LOCTEXT("HistoryTrendExportFailed", "Unable to write trend report.");
+    }
+
+    void CopyHistoryTrends()
+    {
+        FPlatformApplicationMisc::ClipboardCopy(*CurrentHistoryTrendReport());
+        FeedbackMessage = LOCTEXT("HistoryTrendsCopied", "Historical trend report copied to clipboard.");
+    }
+
+    void ShowHistoryTrends()
+    {
+        const FString Text = CurrentHistoryTrendReport();
+        FSlateApplication::Get().AddWindow(SNew(SWindow)
+            .Title(LOCTEXT("HistoryTrendsTitle", "Probe History Trends"))
+            .ClientSize(FVector2D(860, 520))
+            [ SNew(SBorder)
+                .Padding(10)
+                [ SNew(SMultiLineEditableTextBox)
+                    .Text(FText::FromString(Text))
+                    .IsReadOnly(true) ] ]);
+    }
+
+    // Runs are browsed in a dedicated window. Keep the History dropdown short:
+    // one entry point per concern, with no dynamically expanding raw run list.
+    void OpenHistoryBrowser()
+    {
+        if (TSharedPtr<SWindow> Existing = HistoryBrowserWindow.Pin())
+        {
+            Existing->BringToFront(false);
+            return;
+        }
+        TSharedRef<SWindow> Window = SNew(SWindow)
+            .Title(LOCTEXT("ProbeHistoryBrowserWindow", "Probe - History Browser"))
+            .ClientSize(FVector2D(1100, 700));
+        Window->SetContent(
+            SNew(ProbeDev13HistoryUI::SBrowser)
+            .OnViewRun(ProbeDev13HistoryUI::FOnRunAction::CreateSP(this, &SProbeWorkspace::ViewSavedRun))
+            .OnCompareRun(ProbeDev13HistoryUI::FOnRunAction::CreateSP(this, &SProbeWorkspace::CompareToSavedRun))
+            .OnPinRun(ProbeDev13HistoryUI::FOnRunAction::CreateSP(this, &SProbeWorkspace::PinSavedRun))
+            .OnDeleteRun(ProbeDev13HistoryUI::FOnRunAction::CreateSP(this, &SProbeWorkspace::DeleteSavedHistoryRun))
+            .OnCopyReport(ProbeDev13HistoryUI::FOnHistoryTextAction::CreateSP(this, &SProbeWorkspace::CopyInvestigationReport))
+            .OnExportCsv(ProbeDev13HistoryUI::FOnHistoryTextAction::CreateSP(this, &SProbeWorkspace::ExportHistoryCsv)));
+        FSlateApplication::Get().AddWindow(Window);
+        HistoryBrowserWindow = Window;
+    }
+
+    void DeleteSavedHistoryRun(FString Path)
+    {
+        if (bRunInProgress) { return; }
+        ProbeDev11RunHistory::FSnapshot Snapshot;
+        if (!ProbeDev11RunHistory::Read(Path, Snapshot))
+        { FeedbackMessage = LOCTEXT("HistorySingleDeleteMissing", "That history run is missing or invalid."); return; }
+        const FString Label = ProbeDev11RunHistory::Label(Snapshot);
+        const EAppReturnType::Type Decision = FMessageDialog::Open(EAppMsgType::YesNo, EAppReturnType::No,
+            FText::FromString(FString::Printf(TEXT("Delete this saved Probe run?\n\n%s\n\nThis cannot be undone. The pinned baseline, Test Assets, Packs, and exported reports will be preserved."), *Label)));
+        if (Decision != EAppReturnType::Yes) { return; }
+        if (!ProbeDev13History::DeleteSavedRun(ProbeDev11RunHistory::DefaultDirectory(), Path))
+        { FeedbackMessage = LOCTEXT("HistorySingleDeleteFailed", "Unable to delete the selected saved run."); return; }
+        if (SelectedHistoryBaselinePath == Path) { SelectedHistoryBaselinePath.Reset(); }
+        ProbeDev11RunHistory::FSnapshot Latest;
+        LastCompletedResults.Reset();
+        if (ProbeDev11RunHistory::ReadLatest(ProbeDev11RunHistory::DefaultDirectory(), Latest))
+        { LastCompletedResults = MoveTemp(Latest.Results); }
+        FeedbackMessage = LOCTEXT("HistorySingleDeleteSuccess", "Selected Probe run deleted. Other history and the pinned baseline were preserved.");
+    }
+
+    void CopyInvestigationReport(FString Content)
+    {
+        FPlatformApplicationMisc::ClipboardCopy(*Content);
+        FeedbackMessage = LOCTEXT("InvestigationCopied", "Filtered history investigation report copied to clipboard.");
+    }
+
+    void ExportHistoryCsv(FString Content)
+    {
+        const FString Directory = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Probe"), TEXT("Reports"));
+        if (!IFileManager::Get().MakeDirectory(*Directory, true))
+        { FeedbackMessage = LOCTEXT("HistoryCsvFolderFailed", "Unable to create Probe reports directory."); return; }
+        const FString Path = FPaths::Combine(Directory, FString::Printf(TEXT("Probe-History-Trends-%s.csv"),
+            *FDateTime::Now().ToString(TEXT("%Y%m%d-%H%M%S"))));
+        FeedbackMessage = FFileHelper::SaveStringToFile(Content, *Path,
+            FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM)
+            ? FText::FromString(FString::Printf(TEXT("Filtered trend CSV exported: %s"), *Path))
+            : LOCTEXT("HistoryCsvWriteFailed", "Unable to export history trend CSV.");
     }
 
     TSharedRef<SWidget> BuildHistoryMenu()
     {
         FMenuBuilder Menu(true, nullptr);
-        const TArray<FString> Paths = ProbeDev11RunHistory::ListPaths(ProbeDev11RunHistory::DefaultDirectory());
+        Menu.BeginSection(TEXT("ProbeHistoryBrowse"), LOCTEXT("HistoryBrowseHeading", "BROWSE"));
+        Menu.AddMenuEntry(LOCTEXT("HistoryOpenBrowser", "Open History Browser..."),
+            LOCTEXT("HistoryOpenBrowserTip", "Search saved runs, inspect test and step diagnostics, compare runs, pin a baseline, or delete one run."),
+            FSlateIcon(), FUIAction(FExecuteAction::CreateSP(this, &SProbeWorkspace::OpenHistoryBrowser)));
+        Menu.EndSection();
+
+        Menu.BeginSection(TEXT("ProbeHistoryAnalysis"), LOCTEXT("HistoryAnalyzeHeading", "ANALYSIS & REPORTS"));
+        Menu.AddMenuEntry(LOCTEXT("HistoryViewTrends", "View Failure Trends"),
+            LOCTEXT("HistoryViewTrendsTip", "View historical failure rates and pass/fail transitions."),
+            FSlateIcon(), FUIAction(FExecuteAction::CreateSP(this, &SProbeWorkspace::ShowHistoryTrends)));
+        Menu.AddMenuEntry(LOCTEXT("HistoryCopyTrends", "Copy Trend Report"),
+            LOCTEXT("HistoryCopyTrendsTip", "Copy the historical trend report."),
+            FSlateIcon(), FUIAction(FExecuteAction::CreateSP(this, &SProbeWorkspace::CopyHistoryTrends)));
+        Menu.AddMenuEntry(LOCTEXT("HistoryExportTrends", "Export Trend Report"),
+            LOCTEXT("HistoryExportTrendsTip", "Export text trends to Saved/Probe/Reports; the Browser also supports CSV."),
+            FSlateIcon(), FUIAction(FExecuteAction::CreateSP(this, &SProbeWorkspace::ExportHistoryTrends)));
+        Menu.EndSection();
+
+        Menu.BeginSection(TEXT("ProbeHistoryBaseline"), LOCTEXT("HistoryBaselineHeading", "COMPARISON BASELINE"));
+        const FString Directory = ProbeDev11RunHistory::DefaultDirectory();
+        ProbeDev12History::FSnapshot Pinned;
+        const bool bPinned = ProbeDev12History::LoadPinned(Directory, Pinned);
+        Menu.AddMenuEntry(FText::FromString(bPinned ? TEXT("Pinned baseline active") : TEXT("Using latest completed run")),
+            bPinned ? FText::FromString(ProbeDev11RunHistory::Label(Pinned))
+                    : LOCTEXT("HistoryBaselineAutoHint", "Future executions compare against the latest completed run."),
+            FSlateIcon(), FUIAction());
         Menu.AddMenuEntry(LOCTEXT("HistoryAutoBaseline", "Use Latest Run as Baseline"),
-            LOCTEXT("HistoryAutoBaselineTip", "Compare the next run against the last completed run rather than a manually selected history entry."),
+            LOCTEXT("HistoryAutoBaselineTip", "Unpin the baseline and automatically compare against the previous run."),
             FSlateIcon(), FUIAction(FExecuteAction::CreateSP(this, &SProbeWorkspace::UseLatestHistoryBaseline)));
-        if (Paths.IsEmpty())
-        {
-            Menu.AddMenuEntry(LOCTEXT("HistoryEmpty", "No Saved Runs"),
-                LOCTEXT("HistoryEmptyTip", "Complete a Probe run to record its results under Saved/Probe/History."),
-                FSlateIcon(), FUIAction());
-        }
-        int32 Listed = 0;
-        for (const FString& Path : Paths)
-        {
-            ProbeDev11RunHistory::FSnapshot Saved;
-            if (!ProbeDev11RunHistory::Read(Path, Saved)) { continue; }
-            const FString Label = ProbeDev11RunHistory::Label(Saved);
-            Menu.AddSubMenu(FText::FromString(Label), FText::FromString(Path),
-                FNewMenuDelegate::CreateLambda([this, Path](FMenuBuilder& SubMenu)
+        Menu.EndSection();
+
+        Menu.BeginSection(TEXT("ProbeHistoryStorage"), LOCTEXT("HistoryStorageHeading", "STORAGE & MAINTENANCE"));
+        Menu.AddSubMenu(FText::FromString(FString::Printf(TEXT("Maximum Saved Runs: %s"),
+                MaxSavedHistoryRuns == 0 ? TEXT("Off") : *FString::FromInt(MaxSavedHistoryRuns))),
+            LOCTEXT("HistoryLimitTip", "Project-local retention (default 10 runs, 64 MiB rolling storage limit)."),
+            FNewMenuDelegate::CreateLambda([this](FMenuBuilder& SubMenu)
+            {
+                for (const int32 Limit : { 0, 5, 10, 20, 30, 50 })
                 {
-                    SubMenu.AddMenuEntry(LOCTEXT("HistoryView", "View Saved Results"),
-                        LOCTEXT("HistoryViewTip", "Open these saved results in the Results Explorer without executing any tests."),
-                        FSlateIcon(), FUIAction(FExecuteAction::CreateSP(this, &SProbeWorkspace::ViewSavedRun, Path)));
-                    SubMenu.AddMenuEntry(LOCTEXT("HistoryCompare", "Compare Against This Run"),
-                        LOCTEXT("HistoryCompareTip", "Compare the currently displayed results and future runs against this saved baseline."),
-                        FSlateIcon(), FUIAction(FExecuteAction::CreateSP(this, &SProbeWorkspace::CompareToSavedRun, Path)));
-                }));
-            if (++Listed >= 12) { break; }
-        }
+                    const FString Name = Limit == 0 ? TEXT("Off (keep existing)")
+                        : FString::Printf(TEXT("%d runs"), Limit);
+                    SubMenu.AddMenuEntry(FText::FromString(Name),
+                        LOCTEXT("HistoryLimitChoiceTip", "Apply a per-project retention limit. Reducing the limit prunes old runs."),
+                        FSlateIcon(), FUIAction(
+                            FExecuteAction::CreateSP(this, &SProbeWorkspace::SetHistoryLimit, Limit),
+                            FCanExecuteAction(), FIsActionChecked::CreateLambda([this, Limit]() { return MaxSavedHistoryRuns == Limit; })),
+                        NAME_None, EUserInterfaceActionType::RadioButton);
+                }
+            }));
+        Menu.AddMenuEntry(LOCTEXT("HistoryClear", "Clear All Saved History..."),
+            LOCTEXT("HistoryClearTip", "Requires confirmation. Deletes saved snapshots and the pinned baseline, not Test Assets, Packs, or exports."),
+            FSlateIcon(), FUIAction(FExecuteAction::CreateSP(this, &SProbeWorkspace::ClearSavedHistory)));
+        Menu.EndSection();
         return Menu.MakeWidget();
     }
 
@@ -5693,6 +5892,8 @@ private:
             bRunInProgress = false;
             bStopAfterCurrentTest = false;
             bStopDueToPackFailure = false;
+            const FString FinishedPackPath = ActivePackForRun.Get()
+                ? ActivePackForRun.Get()->GetPathName() : FString();
             ActivePackForRun.Reset();
             PackCompletedAttempts.Reset();
             ScopedRunOptions.Reset();
@@ -5717,8 +5918,10 @@ private:
                 ProbeDev11RunHistory::FSnapshot Snapshot;
                 Snapshot.TimestampUtc = FDateTime::UtcNow();
                 Snapshot.EngineVersion = FEngineVersion::Current().ToString();
+                Snapshot.PackPath = FinishedPackPath;
                 Snapshot.Results = Results;
-                if (!ProbeDev11RunHistory::Save(ProbeDev11RunHistory::DefaultDirectory(), Snapshot))
+                if (MaxSavedHistoryRuns > 0 && !ProbeDev11RunHistory::Save(
+                    ProbeDev11RunHistory::DefaultDirectory(), Snapshot, nullptr, MaxSavedHistoryRuns))
                 { UE_LOG(LogTemp, Warning, TEXT("Probe could not persist run history under Saved/Probe/History.")); }
             }
             LastRunDurationMs = 0.0;
