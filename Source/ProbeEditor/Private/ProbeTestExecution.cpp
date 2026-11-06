@@ -2410,6 +2410,7 @@ namespace Probe
         FProbeRunContext Context;
         FTestResult Result;
         TFunction<void(FTestResult)> OnComplete;
+        TFunction<void(int32, int32)> OnProgress;
         int32 Index = 0;
         double StartedAt = 0.0;
         double StepStartedAt = 0.0;
@@ -2422,10 +2423,12 @@ namespace Probe
         TWeakPtr<IDetailsView> EditedView;
         TWeakPtr<SWidget> PreviousKeyboardFocus;
 
-        void Begin(const UProbeTestAsset* Asset, TFunction<void(FTestResult)> Callback, const FRunOptions& Options)
+        void Begin(const UProbeTestAsset* Asset, TFunction<void(FTestResult)> Callback, const FRunOptions& Options,
+            TFunction<void(int32, int32)> Progress)
         {
             check(IsInGameThread());
             OnComplete = MoveTemp(Callback);
+            OnProgress = MoveTemp(Progress);
             StartedAt = FPlatformTime::Seconds();
             if (!Asset)
             {
@@ -2484,6 +2487,9 @@ namespace Probe
                     LastIndex, PassedCount, Result.Steps.Num());
                 Finish(); return;
             }
+            // Report before executing. This includes disabled steps and cleanup
+            // reached after a failure, so the monitor never implies a hidden rerun.
+            if (OnProgress) { OnProgress(Index + 1, Definitions.Num()); }
             const FProbeTestStep& Step = Definitions[Index];
             if (!Step.bEnabled)
             {
@@ -2940,17 +2946,21 @@ namespace Probe
         }
     };
 
-    void RunTestAsync(const UProbeTestAsset* Asset, TFunction<void(FTestResult)> Callback, const FRunOptions& Options)
+    void RunTestAsync(const UProbeTestAsset* Asset, TFunction<void(FTestResult)> Callback, const FRunOptions& Options,
+        TFunction<void(int32, int32)> OnProgress)
     {
         check(IsInGameThread());
         if (!Asset || !Asset->Steps.ContainsByPredicate(
             [](const FProbeTestStep& Step) { return Step.AssertionId.IsNone() && IsNativeUIStep(Step.Type); }))
         {
-            Callback(RunTest(Asset, Options)); // Non-UI steps use the same scoped contract.
+            if (OnProgress) { OnProgress(0, Asset ? Asset->Steps.Num() : 0); }
+            FTestResult Finished = RunTest(Asset, Options); // Native assertions share the scoped contract.
+            if (OnProgress) { OnProgress(Asset ? Asset->Steps.Num() : 0, Asset ? Asset->Steps.Num() : 0); }
+            Callback(MoveTemp(Finished));
             return;
         }
         TSharedRef<FAsyncProbeTestRun> Run = MakeShared<FAsyncProbeTestRun>();
-        Run->Begin(Asset, MoveTemp(Callback), Options);
+        Run->Begin(Asset, MoveTemp(Callback), Options, MoveTemp(OnProgress));
     }
 
     FTestResult RunTest(const UProbeTestAsset* Asset, const FRunOptions& Options)

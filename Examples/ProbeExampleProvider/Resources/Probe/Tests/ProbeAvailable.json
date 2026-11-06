@@ -1,0 +1,24 @@
+{
+  "format": "ProbeTest/1",
+  "id": "ProbeExampleProvider.Available",
+  "name": "Example Provider Availability",
+  "description": "Directly runnable portable test. Generates no .uasset.",
+  "enabled": true,
+  "steps": [
+    {
+      "type": "PluginInstalled",
+      "target": "ProbeExampleProvider",
+      "description": "Example provider is installed"
+    },
+    {
+      "assertion": "ProbeExampleProvider.PluginPresent",
+      "description": "Probe itself is installed"
+    },
+    {
+      "assertion": "ProbeExampleProvider.NativeCheck",
+      "target": "Probe",
+      "expected": "Probe",
+      "description": "Opt-in native read-only reflected provider check"
+    }
+  ]
+}

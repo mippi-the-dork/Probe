@@ -1,0 +1,18 @@
+{
+  "format": "ProbeProvider/1",
+  "provider": "ProbeExampleProvider",
+  "version": "1.0.0",
+  "assertions": [
+    "Assertions/PluginPresent.json",
+    "Assertions/ReflectedCheck.json"
+  ],
+  "templates": [
+    "Templates/Smoke.json"
+  ],
+  "tests": [
+    "Tests/ProbeAvailable.json"
+  ],
+  "packs": [
+    "Packs/All.json"
+  ]
+}

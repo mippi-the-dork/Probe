@@ -1,0 +1,7 @@
+{
+  "format": "ProbePack/1",
+  "id": "ProbeExampleProvider.All",
+  "name": "Example Provider Pack",
+  "failurePolicy": "StopOnFailure",
+  "tests": ["ProbeExampleProvider.Available"]
+}

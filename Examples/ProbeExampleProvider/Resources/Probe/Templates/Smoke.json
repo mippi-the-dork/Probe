@@ -1,0 +1,10 @@
+{
+  "format": "ProbeTemplate/1",
+  "id": "ProbeExampleProvider.SmokeTemplate",
+  "name": "Example Provider Smoke Template",
+  "description": "Reusable authoring template. Always requires review when inserted.",
+  "steps": [
+    { "type": "PluginInstalled", "target": "ProbeExampleProvider", "description": "Example provider installed" },
+    { "assertion": "ProbeExampleProvider.PluginPresent", "description": "Probe available to run the check" }
+  ]
+}

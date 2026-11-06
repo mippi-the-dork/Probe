@@ -1,0 +1,10 @@
+{
+  "format": "ProbeAssertion/1",
+  "id": "ProbeExampleProvider.PluginPresent",
+  "name": "Probe plugin installed",
+  "category": "Example Provider",
+  "description": "Read-only check using the built-in PluginInstalled assertion.",
+  "kind": "builtin-alias",
+  "type": "PluginInstalled",
+  "target": "Probe"
+}

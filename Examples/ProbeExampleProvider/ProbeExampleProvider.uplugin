@@ -1,0 +1,17 @@
+{
+  "FileVersion": 3,
+  "Version": 1,
+  "VersionName": "1.0.0",
+  "FriendlyName": "Probe Example Provider (optional)",
+  "Description": "Standalone example with JSON-based Probe definitions and an optional reflected read-only check; no Probe build dependency.",
+  "Category": "Testing",
+  "EnabledByDefault": false,
+  "CanContainContent": false,
+  "Modules": [
+    {
+      "Name": "ProbeExampleProviderEditor",
+      "Type": "Editor",
+      "LoadingPhase": "Default"
+    }
+  ]
+}

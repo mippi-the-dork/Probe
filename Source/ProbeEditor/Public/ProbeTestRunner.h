@@ -53,7 +53,10 @@ namespace Probe
     PROBEEDITOR_API FTestResult RunTest(const UProbeTestAsset* Asset, const FRunOptions& Options = FRunOptions());
     // Completion always runs on the Editor game thread. Required for native
     // UI steps; synchronous RunTest explicitly refuses live UI input.
+    // Optional read-only progress notification on the Editor game thread.
+    // StepNumber is the upcoming one-based step; zero is a preflight/start event.
     PROBEEDITOR_API void RunTestAsync(const UProbeTestAsset* Asset,
-        TFunction<void(FTestResult)> OnComplete, const FRunOptions& Options = FRunOptions());
+        TFunction<void(FTestResult)> OnComplete, const FRunOptions& Options = FRunOptions(),
+        TFunction<void(int32 StepNumber, int32 TotalSteps)> OnProgress = TFunction<void(int32, int32)>());
     PROBEEDITOR_API TArray<FTestResult> RunPack(const UProbeTestPack* Pack);
 }

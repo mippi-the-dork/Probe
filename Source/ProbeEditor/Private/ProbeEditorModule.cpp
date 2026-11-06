@@ -14,7 +14,9 @@
 #include "ProbeDev12History.h"
 #include "ProbeDev13HistoryModel.h"
 #include "ProbeDev13HistoryBrowser.h"
+#include "ProbeDev14Authoring.h"
 #include "ProbeExtensions.h"
+#include "ProbePortableProviders.h"
 #include "ProbeSelfTest.h"
 #include "ProbeTestAssetFactory.h"
 #include "ProbeTestPack.h"
@@ -56,6 +58,7 @@
 #include "Widgets/Images/SImage.h"
 #include "Styling/AppStyle.h"
 #include "Widgets/SBoxPanel.h"
+#include "Widgets/Notifications/SProgressBar.h"
 #include "Widgets/SNullWidget.h"
 #include "Widgets/Text/STextBlock.h"
 #include "Widgets/Input/SButton.h"
@@ -94,6 +97,10 @@
 #include "HAL/IConsoleManager.h"
 #include "Misc/Crc.h"
 #include "HAL/PlatformApplicationMisc.h"
+
+#include "ProbeDev15Recipes.h"
+#include "ProbeDev15Browser.h"
+#include "ProbeDev16UX.h"
 
 #define LOCTEXT_NAMESPACE "ProbeEditor"
 
@@ -157,62 +164,7 @@ namespace Probe
     // accidentally run with an omitted class/path/comparison field.
     static FString StepConfigurationIssue(const FProbeTestStep& Step)
     {
-        if (!Step.bEnabled) { return FString(); }
-        if (!Step.AssertionId.IsNone() && !FindExtensionAssertion(Step.AssertionId))
-        { return FString::Printf(TEXT("Required assertion provider '%s' is unavailable"), *Step.AssertionId.ToString()); }
-        const uint8 Fields = StepFields(Step);
-        if ((Fields & TargetField) && Step.Target.TrimStartAndEnd().IsEmpty()) { return TEXT("Choose a Target"); }
-        if ((Fields & ClassField) && Step.ExpectedClass.TrimStartAndEnd().IsEmpty()) { return TEXT("Choose the expected class"); }
-        if ((Fields & PropertyField) && Step.PropertyName.TrimStartAndEnd().IsEmpty()) { return TEXT("Enter a Property, Function, or Tag name"); }
-        // Empty text is a legitimate expected value for equality/inequality
-        // on text widgets, including an intentionally cleared Details search.
-        const bool bEmptyExpectedIsValid = Step.AssertionId.IsNone()
-            && ProbeNativeUIPolicy::AllowsEmptyValue(Step.Type);
-        if ((Fields & ValueField) && Step.ExpectedValue.TrimStartAndEnd().IsEmpty() && !bEmptyExpectedIsValid)
-        { return TEXT("Enter an expected value or search text"); }
-        if (Step.AssertionId.IsNone() &&
-            (Step.Type == EProbeStepType::ActorFixtureSetLocation
-             || Step.Type == EProbeStepType::ActorFixtureLocationNearlyEquals
-             || Step.Type == EProbeStepType::ActorFixtureLocationNotNearlyEquals
-             || Step.Type == EProbeStepType::ActorFixtureSetRotation
-             || Step.Type == EProbeStepType::ActorFixtureRotationNearlyEquals
-             || Step.Type == EProbeStepType::ActorFixtureRotationNotNearlyEquals
-             || Step.Type == EProbeStepType::ActorFixtureSetScale
-             || Step.Type == EProbeStepType::ActorFixtureScaleNearlyEquals
-             || Step.Type == EProbeStepType::ActorFixtureScaleNotNearlyEquals))
-        {
-            TArray<FString> Components;
-            Step.ExpectedValue.ParseIntoArray(Components, TEXT(","), false);
-            if (Components.Num() != 3) { return TEXT("Enter three comma-separated numbers, e.g. 100,0,50"); }
-            for (const FString& Component : Components)
-            {
-                const FString Trimmed = Component.TrimStartAndEnd();
-                double Number = 0.0;
-                if (!LexTryParseString(Number, *Trimmed) || !FMath::IsFinite(Number))
-                { return TEXT("Each vector or rotation component must be a finite number"); }
-            }
-        }
-        if (Step.AssertionId.IsNone() &&
-            ProbeNativeUIPolicy::HasTarget(Step.Type)
-            && !Step.Target.Equals(TEXT("details:search"), ESearchCase::IgnoreCase)
-            && !(Step.Target.StartsWith(TEXT("id:"), ESearchCase::IgnoreCase)
-                && Step.Target.Len() > 3 && !Step.Target.RightChop(3).TrimStartAndEnd().IsEmpty()))
-        { return TEXT("Use details:search or id:<Slate automation ID>, not screen coordinates"); }
-        if (Step.AssertionId.IsNone() &&
-            ProbeNativeUIPolicy::IsWait(Step.Type)
-            && (!FMath::IsFinite(Step.UIWaitTimeoutSeconds)
-                || Step.UIWaitTimeoutSeconds < 0.1 || Step.UIWaitTimeoutSeconds > 30.0))
-        { return TEXT("Wait Timeout must be between 0.1 and 30 seconds"); }
-        if (Step.Type == EProbeStepType::ObjectPropertyNumericInRange && Step.AssertionId.IsNone())
-        {
-            FString Lower, Upper;
-            double Min = 0.0, Max = 0.0;
-            if (!Step.ExpectedValue.Split(TEXT(","), &Lower, &Upper)
-                || !LexTryParseString(Min, *Lower.TrimStartAndEnd())
-                || !LexTryParseString(Max, *Upper.TrimStartAndEnd()) || Min > Max)
-            { return TEXT("Expected range must be min,max with min <= max"); }
-        }
-        return FString();
+        return ProbeDev14::ConfigurationIssue(Step);
     }
     static FString TestConfigurationIssue(const UProbeTestAsset& Asset)
     {
@@ -242,6 +194,7 @@ namespace Probe
     // Keep the original tab ID so an existing saved Editor layout can reopen it.
     static const FName TabId(TEXT("ProbeWorkspace"));
     static const FName PackTabId(TEXT("ProbePackWorkspace"));
+    static const FName PortableTabId(TEXT("ProbePortableProviders"));
 
     enum class ETestTemplate : uint8
     {
@@ -2239,6 +2192,8 @@ public:
     {
         GConfig->GetFloat(TEXT("ProbeWorkspace"), TEXT("DefinitionFraction"), DefinitionFraction, GEditorPerProjectIni);
         DefinitionFraction = FMath::Clamp(DefinitionFraction, 0.20f, 0.85f);
+        GConfig->GetBool(TEXT("ProbeWorkspace"), TEXT("Dev16SettingsExpanded"), bDev16SettingsExpanded, GEditorPerProjectIni);
+        GConfig->GetBool(TEXT("ProbeWorkspace"), TEXT("Dev16ResultsCollapsed"), bDev16ResultsCollapsed, GEditorPerProjectIni);
         // Configurable project-local retention. Existing history remains untouched
         // when saving is disabled (0); Clear History is always explicit.
         GConfig->GetInt(TEXT("ProbeWorkspace"), TEXT("MaxSavedHistoryRuns"), MaxSavedHistoryRuns, GEditorPerProjectIni);
@@ -2319,56 +2274,37 @@ public:
                                 .OnClicked(this, &SProbeWorkspace::RefreshClicked)
                                 [ SNew(SImage).Image(FAppStyle::GetBrush("Icons.Refresh")) ]
                             ]
+                            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(6,0)
+                            [ SNew(SSeparator).Orientation(Orient_Vertical) ]
+                            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(3, 0, 2, 0)
+                            [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
+                              .ToolTipText(LOCTEXT("ManagePacksTip", "Open the Probe Packs workspace to edit, validate and run Packs"))
+                              .OnClicked_Lambda([]()
+                              { FGlobalTabmanager::Get()->TryInvokeTab(Probe::PackTabId); return FReply::Handled(); })
+                              [ SNew(STextBlock).Text(LOCTEXT("ManagePacksButton", "Packs")) ] ]
+                            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2,0,2,0)
+                            [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
+                              .ToolTipText(LOCTEXT("Dev15QABrowserTip", "Search Tests and Packs, inspect readiness and export preflight reports."))
+                              .OnClicked_Lambda([]() { ProbeDev15::OpenBrowser(); return FReply::Handled(); })
+                              [ SNew(STextBlock).Text(LOCTEXT("Dev15QABrowser", "QA Browser")) ] ]
+                            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2, 0, 3, 0)
+                            [ SNew(SComboButton)
+                              .ToolTipText(LOCTEXT("RunHistoryTip", "Browse saved runs, regressions and baselines."))
+                              .OnGetMenuContent(this, &SProbeWorkspace::BuildHistoryMenu)
+                              .ButtonContent()[ SNew(STextBlock).Text(LOCTEXT("RunHistory", "History")) ] ]
                             + SHorizontalBox::Slot().FillWidth(1.0f)
                             [ SNullWidget::NullWidget ]
-                            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(7, 0, 4, 0)
-                            [
-                                SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
-                                .ToolTipText(LOCTEXT("ManagePacksTip", "Open the Probe Packs workspace to add, remove, save, and run groups of tests"))
-                                .OnClicked_Lambda([]() { FGlobalTabmanager::Get()->TryInvokeTab(Probe::PackTabId); return FReply::Handled(); })
-                                [ SNew(STextBlock).Text(LOCTEXT("ManagePacksButton", "Manage Packs")) ]
-                            ]
-                            // Execution controls read left-to-right Export, Rerun,
-                            // Run All, Run Selected. The primary action stays at the edge.
-                            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2, 0, 2, 0)
-                            [
-                                SNew(SComboButton)
-                                .ToolTipText(LOCTEXT("RunHistoryTip", "Inspect previous run results or compare this run against a saved baseline. Keeps a configurable number of runs (10 by default) under Saved/Probe/History, with a 64 MiB total budget."))
-                                .OnGetMenuContent(this, &SProbeWorkspace::BuildHistoryMenu)
-                                .ButtonContent()
-                                [ SNew(STextBlock).Text(LOCTEXT("RunHistory", "History")) ]
-                            ]
-                            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
-                            [
-                                SNew(SButton)
-                                .ButtonStyle(FAppStyle::Get(), "SimpleButton")
-                                .ToolTipText(LOCTEXT("ExportResultsTip", "Export current results as JSON in Saved/Probe/Reports"))
-                                .IsEnabled(this, &SProbeWorkspace::HasResults)
-                                .OnClicked(this, &SProbeWorkspace::ExportReport)
-                                [ SNew(SImage).Image(FAppStyle::GetBrush("Icons.Export")) ]
-                            ]
-                            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
-                            [
-                                SNew(SButton)
-                                .ButtonStyle(FAppStyle::Get(), "SimpleButton")
-                                .ToolTipText(LOCTEXT("RerunProblemsTip", "Rerun tests that failed or errored"))
-                                .IsEnabled(this, &SProbeWorkspace::HasProblemResults)
-                                .OnClicked(this, &SProbeWorkspace::RerunProblems)
-                                [ SNew(SImage).Image(FAppStyle::GetBrush("Icons.Reimport")) ]
-                            ]
-                            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(4, 0, 3, 0)
-                            [
-                                SNew(SComboButton)
-                                .ToolTipText(LOCTEXT("RunPackTip", "Run an existing Probe Pack; use Manage Packs to create and edit packs"))
-                                .OnGetMenuContent(this, &SProbeWorkspace::BuildPackMenu)
-                                .ButtonContent()
-                                [ SNew(STextBlock).Text(LOCTEXT("RunPack", "Run Pack")) ]
-                            ]
+                            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(5,0,3,0)
+                            [ SNew(SComboButton)
+                              .ToolTipText(LOCTEXT("RunPackTip", "Run an existing Probe Pack. Manage Packs in the Packs workspace."))
+                              .OnGetMenuContent(this, &SProbeWorkspace::BuildPackMenu)
+                              .ButtonContent()[ SNew(STextBlock).Text(LOCTEXT("RunPack", "Run Pack")) ] ]
                             + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(4, 0, 3, 0)
                             [
                                 SNew(SButton)
                                 .ButtonStyle(FAppStyle::Get(), "SimpleButton")
-                                .ToolTipText(LOCTEXT("StopAfterCurrentTip", "Finish the currently executing test safely, then skip remaining queued tests. Does not interrupt an in-flight Automation Driver action."))
+                                .ToolTipText(LOCTEXT("StopAfterCurrentTip", "Finish the current test then safely skip queued tests."))
+                                .Visibility_Lambda([this]() { return bRunInProgress ? EVisibility::Visible : EVisibility::Collapsed; })
                                 .IsEnabled_Lambda([this]() { return bRunInProgress && !bStopAfterCurrentTest; })
                                 .OnClicked(this, &SProbeWorkspace::StopAfterCurrentTest)
                                 [ SNew(STextBlock).Text(LOCTEXT("StopAfterCurrent", "Stop After Test")) ]
@@ -2426,7 +2362,7 @@ public:
             [
                 SNew(SSplitter).Orientation(Orient_Vertical)
                 + SSplitter::Slot().Value(TAttribute<float>::Create(
-                    TAttribute<float>::FGetter::CreateLambda([this]() { return bResultsFocused ? 0.0f : DefinitionFraction; })))
+                    TAttribute<float>::FGetter::CreateLambda([this]() { return bResultsFocused ? 0.0f : (bDev16ResultsCollapsed ? 1.0f : DefinitionFraction); })))
                 .OnSlotResized(SSplitter::FOnSlotResized::CreateSP(this, &SProbeWorkspace::OnDefinitionResized))
                 [
                     SNew(SVerticalBox)
@@ -2481,16 +2417,18 @@ public:
                         .BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
                         .Padding(4)
                         [
-                            SNew(SScrollBox)
+                            SAssignNew(DefinitionScroll, SScrollBox)
                             + SScrollBox::Slot()
                             [ SAssignNew(EditorRows, SVerticalBox) ]
                         ]
                     ]
                 ]
                 + SSplitter::Slot().Value(TAttribute<float>::Create(
-                    TAttribute<float>::FGetter::CreateLambda([this]() { return bResultsFocused ? 1.0f : 1.0f - DefinitionFraction; })))
+                    TAttribute<float>::FGetter::CreateLambda([this]() { return bResultsFocused ? 1.0f : (bDev16ResultsCollapsed ? 0.0f : 1.0f - DefinitionFraction); })))
                 [
                     SNew(SVerticalBox)
+                    .Visibility_Lambda([this]() { return (bDev16ResultsCollapsed && !bResultsFocused)
+                        ? EVisibility::Collapsed : EVisibility::Visible; })
                     + SVerticalBox::Slot().AutoHeight().Padding(2, 6, 2, 4)
                     [
                         SNew(SHorizontalBox)
@@ -2499,6 +2437,23 @@ public:
                         + SHorizontalBox::Slot().FillWidth(1.0f).VAlign(VAlign_Center)
                         [ SNew(SScrollBox).Orientation(Orient_Horizontal).ScrollBarVisibility(EVisibility::Visible)
                           + SScrollBox::Slot() [ SAssignNew(ResultSummary, SHorizontalBox) ] ]
+                        + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0,0,5,0)
+                        [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
+                          .ToolTipText(LOCTEXT("Dev16ExportFromResultsTip", "Export current results to Saved/Probe/Reports as JSON."))
+                          .IsEnabled(this, &SProbeWorkspace::HasResults)
+                          .OnClicked(this, &SProbeWorkspace::ExportReport)
+                          [ SNew(STextBlock).Text(LOCTEXT("Dev16ExportFromResults", "Export")) ] ]
+                        + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0,0,5,0)
+                        [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
+                          .ToolTipText(LOCTEXT("Dev16RerunProblemsTip", "Rerun only failed or errored tests."))
+                          .IsEnabled(this, &SProbeWorkspace::HasProblemResults)
+                          .OnClicked(this, &SProbeWorkspace::RerunProblems)
+                          [ SNew(STextBlock).Text(LOCTEXT("Dev16RerunProblems", "Rerun Problems")) ] ]
+                        + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0,0,5,0)
+                        [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
+                          .ToolTipText(LOCTEXT("Dev16CollapseResultsTip", "Collapse results and return screen space to Test authoring."))
+                          .OnClicked(this, &SProbeWorkspace::ToggleDev16ResultsCollapsed)
+                          [ SNew(STextBlock).Text(LOCTEXT("Dev16CollapseResults", "Collapse")) ] ]
                         + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 5, 0)
                         [
                             SNew(SButton)
@@ -2564,6 +2519,27 @@ public:
                     ]
                 ]
             ]
+            + SVerticalBox::Slot().AutoHeight().Padding(7,3,7,3)
+            [ SNew(SBox).Visibility_Lambda([this]()
+              { return bDev16ResultsCollapsed && !bResultsFocused ? EVisibility::Visible : EVisibility::Collapsed; })
+              [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
+                .ToolTipText(LOCTEXT("Dev16ExpandResultsTip", "Expand the resizable Results Explorer and execution diagnostics panel."))
+                .OnClicked(this, &SProbeWorkspace::ToggleDev16ResultsCollapsed)
+                [ SNew(SHorizontalBox)
+                  + SHorizontalBox::Slot().FillWidth(1.0f).VAlign(VAlign_Center)
+                  [ SNew(STextBlock).Text_Lambda([this]()
+                    { return FText::FromString(FString::Printf(TEXT("Results  >  %d test(s)  |  %s"),
+                        Results.Num(), bRunInProgress ? TEXT("Running") : Results.IsEmpty() ? TEXT("No results yet") : TEXT("Click to inspect"))); }) ]
+                  + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+                  [ SNew(STextBlock).Text(LOCTEXT("Dev16ExpandResults", "Expand")) ] ] ] ]
+            + SVerticalBox::Slot().AutoHeight().Padding(8, 1, 8, 1)
+            [ SNew(SBox).Visibility_Lambda([this]() { return bRunInProgress ? EVisibility::Visible : EVisibility::Collapsed; })
+              [ SNew(SHorizontalBox)
+              + SHorizontalBox::Slot().FillWidth(1).VAlign(VAlign_Center).Padding(0,0,10,0)
+              [ SNew(STextBlock).Text(this, &SProbeWorkspace::Dev14LiveProgressText)
+                .ColorAndOpacity(FSlateColor::UseSubduedForeground()) ]
+              + SHorizontalBox::Slot().FillWidth(0.7f).VAlign(VAlign_Center)
+              [ SNew(SProgressBar).Percent(this, &SProbeWorkspace::Dev14LiveProgressFraction) ] ] ]
             + SVerticalBox::Slot().AutoHeight().Padding(8, 5, 8, 5)
             [
                 SNew(SHorizontalBox)
@@ -2589,6 +2565,11 @@ public:
 
     virtual FReply OnKeyDown(const FGeometry& MyGeometry, const FKeyEvent& InKeyEvent) override
     {
+        if (InKeyEvent.IsControlDown() && InKeyEvent.GetKey() == EKeys::F && Dev15StepSearchBox.IsValid())
+        {
+            FSlateApplication::Get().SetKeyboardFocus(Dev15StepSearchBox, EFocusCause::SetDirectly);
+            return FReply::Handled();
+        }
         if (InKeyEvent.IsControlDown() && InKeyEvent.GetKey() == EKeys::S && CanSaveSelected())
         {
             SaveSelected();
@@ -2652,6 +2633,8 @@ private:
     TSharedPtr<FAssetData> Selected;
     TSharedPtr<SComboBox<TSharedPtr<FAssetData>>> TestSelector;
     TSharedPtr<SVerticalBox> EditorRows;
+    TSharedPtr<SScrollBox> DefinitionScroll;
+    TMap<int32, TWeakPtr<SWidget>> StepRowWidgets;
     TSharedPtr<SHorizontalBox> ResultSummary;
     TSharedPtr<SMultiLineEditableTextBox> ResultsLog;
     TSharedPtr<SVerticalBox> ResultList;
@@ -2677,7 +2660,23 @@ private:
     TSet<int32> ExpandedDiagnosticIndices;
     FString ExpandedDiagnosticTestPath;
     TSet<int32> ExpandedStepIndices;
+    TSet<int32> SelectedBulkStepIndices;
+    FString BulkGroupName;
+    FString Dev15StepQuery;
+    TSharedPtr<SSearchBox> Dev15StepSearchBox; // SSearchBox has no .Text Slate argument in UE 5.8; restore through SetText().
+    FString Dev15RecipeName;
+    FString Dev16RecipeSearch;
+    TWeakPtr<SWindow> Dev16RecipeBrowserWindow;
+    TSharedPtr<SVerticalBox> Dev16RecipeBrowserRows;
+    TSet<FString> Dev16CollapsedGroups;
+    bool bDev16SettingsExpanded = false;
+    FString Dev16OverviewCache;
+    bool bDev16ResultsCollapsed = true;
     FString ExpandedAssetPath;
+    int32 ActiveExecutionResult = INDEX_NONE;
+    int32 ActiveExecutionStep = 0;
+    int32 ActiveExecutionStepCount = 0;
+    double ActiveExecutionStartSeconds = 0.0;
     bool bStepNotesShown = false;
     FDateTime LastRunTime;
     double LastRunDurationMs = 0.0;
@@ -2692,7 +2691,7 @@ private:
 
     void OnDefinitionResized(float NewFraction)
     {
-        if (!bResultsFocused)
+        if (!bResultsFocused && !bDev16ResultsCollapsed)
         {
             DefinitionFraction = FMath::Clamp(NewFraction, 0.20f, 0.85f);
             GConfig->SetFloat(TEXT("ProbeWorkspace"), TEXT("DefinitionFraction"), DefinitionFraction, GEditorPerProjectIni);
@@ -2701,7 +2700,16 @@ private:
 
     FReply ToggleResultsFocus()
     {
+        bDev16ResultsCollapsed = false;
         bResultsFocused = !bResultsFocused;
+        return FReply::Handled();
+    }
+
+    FReply ToggleDev16ResultsCollapsed()
+    {
+        bResultsFocused = false;
+        bDev16ResultsCollapsed = !bDev16ResultsCollapsed;
+        GConfig->SetBool(TEXT("ProbeWorkspace"), TEXT("Dev16ResultsCollapsed"), bDev16ResultsCollapsed, GEditorPerProjectIni);
         return FReply::Handled();
     }
 
@@ -2806,6 +2814,7 @@ private:
         const FScopedTransaction Transaction(TransactionLabel);
         Asset->Modify();
         Edit(*Asset);
+        Dev16OverviewCache = ProbeDev16::TestSummary(*Asset);
         Asset->MarkPackageDirty();
     }
 
@@ -2818,6 +2827,7 @@ private:
             const FScopedTransaction Transaction(TransactionLabel);
             Asset->Modify();
             Edit(Asset->Steps[Index]);
+            Dev16OverviewCache = ProbeDev16::TestSummary(*Asset);
             Asset->MarkPackageDirty();
         }
         if (bRebuild && SelectedAsset() == Asset) { RebuildTestEditor(); }
@@ -2825,6 +2835,7 @@ private:
 
     void HandleUndoRedo()
     {
+        SelectedBulkStepIndices.Reset();
         RebuildTestEditor();
     }
 
@@ -3616,15 +3627,6 @@ private:
         const int32 StepCount = Asset->Steps.Num();
         const bool bExpanded = ExpandedStepIndices.Contains(Index);
         TSharedRef<SVerticalBox> Card = SNew(SVerticalBox);
-        if (!Step.GroupName.TrimStartAndEnd().IsEmpty() && (Index == 0
-            || Asset->Steps[Index - 1].GroupName.TrimStartAndEnd() != Step.GroupName.TrimStartAndEnd()))
-        {
-            const ProbeStepGroups::FRange Range = ProbeStepGroups::FindContiguous(Asset->Steps, Index);
-            Card->AddSlot().AutoHeight().Padding(6, 6, 4, 3)
-            [ SNew(STextBlock).Font(FAppStyle::GetFontStyle("NormalFontBold"))
-              .Text(FText::FromString(FString::Printf(TEXT("Group: %s  (%d steps)"),
-                  *Step.GroupName, Range.Num()))) ];
-        }
         Card->AddSlot().AutoHeight()
         [
             SNew(SBorder)
@@ -3643,6 +3645,13 @@ private:
                               bExpanded ? TEXT("Probe.DisclosureExpanded") : TEXT("Probe.DisclosureCollapsed"))
                           : FAppStyle::GetBrush(TEXT("Icons.ChevronRight"))) ]
                 ]
+                + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 5, 0)
+                [ SNew(SCheckBox)
+                  .ToolTipText(LOCTEXT("Dev14BulkSelectStepTip", "Select for multi-step editing; independent from Enabled."))
+                  .IsChecked_Lambda([this, Index]() { return SelectedBulkStepIndices.Contains(Index) ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+                  .OnCheckStateChanged_Lambda([this, Index](ECheckBoxState State)
+                  { if (State == ECheckBoxState::Checked) { SelectedBulkStepIndices.Add(Index); }
+                    else { SelectedBulkStepIndices.Remove(Index); } }) ]
                 + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 7, 0)
                 [ SNew(SCheckBox)
                   .IsChecked(Step.bEnabled ? ECheckBoxState::Checked : ECheckBoxState::Unchecked)
@@ -3672,51 +3681,11 @@ private:
                       .Visibility(bExpanded ? EVisibility::Collapsed : EVisibility::Visible)
                       .AutoWrapText(true) ]
                 ]
-                + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(4, 0, 1, 0)
-                [
-                    SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
-                    .ToolTipText(LOCTEXT("MoveStepUp", "Move step up"))
-                    .IsEnabled(Index > 0)
-                    .OnClicked_Lambda([this, TestRef, Index]() { return ReorderStep(TestRef, Index, -1); })
-                    [ SNew(STextBlock).Text(FText::FromString(TEXT("↑"))) ]
-                ]
-                + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
-                [
-                    SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
-                    .ToolTipText(LOCTEXT("MoveStepDown", "Move step down"))
-                    .IsEnabled(Index + 1 < StepCount)
-                    .OnClicked_Lambda([this, TestRef, Index]() { return ReorderStep(TestRef, Index, +1); })
-                    [ SNew(STextBlock).Text(FText::FromString(TEXT("↓"))) ]
-                ]
-                + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
-                [
-                    SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
-                    .ToolTipText(LOCTEXT("DuplicateStepTip", "Duplicate this step"))
-                    .OnClicked_Lambda([this, TestRef, Index]() { return DuplicateStep(TestRef, Index); })
-                    [ SNew(SImage).Image(FAppStyle::GetBrush("Icons.Duplicate")) ]
-                ]
-                + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
-                [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
-                  .ToolTipText(LOCTEXT("CopyStepGroupTip", "Copy this step or its adjacent named group to the clipboard as a reusable Probe step group."))
-                  .OnClicked_Lambda([this, TestRef, Index]() { return CopyStepGroup(TestRef, Index); })
-                  [ SNew(STextBlock).Text(LOCTEXT("CopyStepGroup", "Copy Group")) ] ]
-                + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
-                [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
-                  .ToolTipText(LOCTEXT("DuplicateGroupTip", "Duplicate this step or its contiguous named group directly after itself. Named copies receive a distinct group name. Undoable."))
-                  .OnClicked_Lambda([this, TestRef, Index]() { return DuplicateStepGroup(TestRef, Index); })
-                  [ SNew(STextBlock).Text(LOCTEXT("DuplicateGroupButton", "Duplicate Group")) ] ]
-                + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
-                [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
-                  .ToolTipText(LOCTEXT("RunStepGroupTip", "Run just this step or its adjacent named group. Earlier setup steps are NOT executed."))
-                  .OnClicked_Lambda([this, TestRef, Index]() { return RunStepGroup(TestRef, Index); })
-                  [ SNew(STextBlock).Text(LOCTEXT("RunStepGroup", "Run Group")) ] ]
-                + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
-                [
-                    SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
-                    .ToolTipText(LOCTEXT("DeleteStepTip", "Remove this step"))
-                    .OnClicked_Lambda([this, TestRef, Index]() { return DeleteStep(TestRef, Index); })
-                    [ SNew(SImage).Image(FAppStyle::GetBrush("Icons.Delete")) ]
-                ]
+                + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(4,0)
+                [ SNew(SComboButton)
+                  .ToolTipText(LOCTEXT("Dev16StepActionsTip", "Step actions: reorder, duplicate, copy, run or remove"))
+                  .OnGetMenuContent_Lambda([this, TestRef, Index]() { return BuildDev16StepActionsMenu(TestRef, Index); })
+                  .ButtonContent()[ SNew(STextBlock).Text(LOCTEXT("Dev16StepMenu", "...")) ] ]
             ]
         ];
         const FString ConfigIssue = Probe::StepConfigurationIssue(Step);
@@ -3897,24 +3866,649 @@ private:
         return Card;
     }
 
+    FReply ShowDev14TestPreflight()
+    {
+        if (const UProbeTestAsset* Test = SelectedAsset())
+        {
+            const ProbeDev14::FReport Report = ProbeDev14::PreflightTest(*Test);
+            FMessageDialog::Open(EAppMsgType::Ok, EAppReturnType::Ok, FText::FromString(Report.Text()));
+            FeedbackMessage = FText::FromString(FString::Printf(TEXT("Preflight: %d blocking, %d warning(s)."), Report.Blocking, Report.Warnings));
+        }
+        return FReply::Handled();
+    }
+
+    FReply AppendDev14Recipe(ProbeDev14::ERecipe Recipe)
+    {
+        UProbeTestAsset* Test = SelectedAsset();
+        if (!Test || bRunInProgress) { return FReply::Handled(); }
+        if (Test->Steps.Num() + ProbeDev14::BuildRecipe(Recipe).Num() > 4096
+            || (!Test->Steps.IsEmpty() && !Test->CleanupGroupName.TrimStartAndEnd().IsEmpty()))
+        { FeedbackMessage = LOCTEXT("Dev14RecipeFull", "Cannot append: recipe exceeds 4096 steps or would move an existing Cleanup group away from the end."); return FReply::Handled(); }
+        ChangeAsset(TWeakObjectPtr<UProbeTestAsset>(Test), LOCTEXT("Dev14RecipeTransaction", "Append Probe Test Recipe"),
+            [Recipe](UProbeTestAsset& Asset) { ProbeDev14::AppendRecipe(Asset, Recipe); });
+        RebuildTestEditor();
+        FeedbackMessage = FText::FromString(FString(TEXT("Added recipe: ")) + ProbeDev14::RecipeName(Recipe)
+            + TEXT(". Review targets and mark the Test configured when ready."));
+        return FReply::Handled();
+    }
+
+    // FUIAction's FExecuteAction is void-returning, unlike Slate button handlers.
+    // Keep the FReply helper for consistency with the Test Steps command handlers,
+    // and adapt it here for the menu delegate without changing recipe semantics.
+    void AppendDev14RecipeMenuAction(ProbeDev14::ERecipe Recipe)
+    {
+        AppendDev14Recipe(Recipe);
+    }
+
+    TSharedRef<SWidget> BuildDev14RecipeMenu()
+    {
+        FMenuBuilder Menu(true, nullptr);
+        const ProbeDev14::ERecipe Recipes[] = {
+            ProbeDev14::ERecipe::PluginHealth, ProbeDev14::ERecipe::EditorState,
+            ProbeDev14::ERecipe::ReadOnlyUI, ProbeDev14::ERecipe::TransientFixture };
+        for (const ProbeDev14::ERecipe Recipe : Recipes)
+        {
+            Menu.AddMenuEntry(FText::FromString(ProbeDev14::RecipeName(Recipe)),
+                LOCTEXT("Dev14RecipeReview", "Append a multi-step pattern for author review. Existing permissions do not change."),
+                FSlateIcon(), FUIAction(FExecuteAction::CreateSP(this, &SProbeWorkspace::AppendDev14RecipeMenuAction, Recipe)));
+        }
+        return Menu.MakeWidget();
+    }
+
+    FReply ApplyDev14Bulk(ProbeDev14::EBulkAction Action)
+    {
+        UProbeTestAsset* Test = SelectedAsset();
+        if (!Test || bRunInProgress || SelectedBulkStepIndices.IsEmpty()) { return FReply::Handled(); }
+        if (Action == ProbeDev14::EBulkAction::Delete && FMessageDialog::Open(EAppMsgType::YesNo, EAppReturnType::No,
+            LOCTEXT("Dev14BulkDeleteConfirm", "Remove selected Test steps? You can undo this operation.")) != EAppReturnType::Yes)
+        { return FReply::Handled(); }
+        TSet<int32> NewSelection = SelectedBulkStepIndices;
+        for (int32 I : NewSelection)
+        {
+            if (!Test->Steps.IsValidIndex(I))
+            { FeedbackMessage = LOCTEXT("Dev14BulkInvalid", "Selection changed. Reselect the steps before editing."); return FReply::Handled(); }
+        }
+        if ((Action == ProbeDev14::EBulkAction::Duplicate && Test->Steps.Num() + NewSelection.Num() > 4096)
+            || (Action == ProbeDev14::EBulkAction::AssignGroup && BulkGroupName.TrimStartAndEnd().Len() > 96))
+        { FeedbackMessage = LOCTEXT("Dev14BulkRejected", "Multi-step edit rejected. Check group name or step limit."); return FReply::Handled(); }
+        ChangeAsset(TWeakObjectPtr<UProbeTestAsset>(Test), LOCTEXT("Dev14BulkTransaction", "Bulk Edit Probe Steps"),
+            [this, Action, &NewSelection](UProbeTestAsset& Asset)
+            { ProbeDev14::ApplyBulk(Asset, NewSelection, Action, BulkGroupName); });
+        SelectedBulkStepIndices = MoveTemp(NewSelection);
+        ExpandedStepIndices.Reset();
+        RebuildTestEditor();
+        FeedbackMessage = LOCTEXT("Dev14BulkDone", "Selected steps updated in one undoable transaction.");
+        return FReply::Handled();
+    }
+
+    TSharedRef<SWidget> BuildDev14BulkActionsMenu()
+    {
+        FMenuBuilder Menu(true, nullptr);
+        struct FAction { ProbeDev14::EBulkAction Value; const TCHAR* Name; const TCHAR* Hint; };
+        const FAction Actions[] = {
+            {ProbeDev14::EBulkAction::Enable, TEXT("Enable Selected"), TEXT("Allow selected steps to run")},
+            {ProbeDev14::EBulkAction::Disable, TEXT("Disable Selected"), TEXT("Skip selected steps without removing them")},
+            {ProbeDev14::EBulkAction::MoveUp, TEXT("Move Selected Up"), TEXT("Move selected blocks up without changing their internal order")},
+            {ProbeDev14::EBulkAction::MoveDown, TEXT("Move Selected Down"), TEXT("Move selected blocks down without changing their internal order")},
+            {ProbeDev14::EBulkAction::Duplicate, TEXT("Duplicate Selected"), TEXT("Duplicate each selected step after its original")},
+            {ProbeDev14::EBulkAction::Delete, TEXT("Remove Selected..."), TEXT("Ask for confirmation, then remove selected steps")}
+        };
+        for (const FAction& Action : Actions)
+        {
+            Menu.AddMenuEntry(FText::FromString(Action.Name), FText::FromString(Action.Hint), FSlateIcon(),
+                FUIAction(FExecuteAction::CreateLambda([this, ActionValue = Action.Value]()
+                { ApplyDev14Bulk(ActionValue); })));
+        }
+        return Menu.MakeWidget();
+    }
+
+    TSharedRef<SWidget> MakeDev14BulkToolbar()
+    {
+        TSharedRef<SHorizontalBox> Bar = SNew(SHorizontalBox);
+        Bar->AddSlot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 8, 0)
+        [ SNew(STextBlock).Text_Lambda([this]() { return FText::FromString(FString::Printf(TEXT("Bulk: %d selected"), SelectedBulkStepIndices.Num())); }) ];
+        Bar->AddSlot().AutoWidth().Padding(0, 0, 4, 0)
+        [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
+          .OnClicked_Lambda([this]() { if (const UProbeTestAsset* A = SelectedAsset())
+          { for (int32 I = 0; I < A->Steps.Num(); ++I) { SelectedBulkStepIndices.Add(I); } RebuildTestEditor(); }
+            return FReply::Handled(); })
+          [ SNew(STextBlock).Text(LOCTEXT("Dev14SelectAll", "All")) ] ];
+        Bar->AddSlot().AutoWidth().Padding(0, 0, 7, 0)
+        [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
+          .OnClicked_Lambda([this]() { SelectedBulkStepIndices.Reset(); RebuildTestEditor(); return FReply::Handled(); })
+          [ SNew(STextBlock).Text(LOCTEXT("Dev14SelectNone", "None")) ] ];
+        Bar->AddSlot().AutoWidth().Padding(0, 0, 5, 0)
+        [ SNew(SComboButton)
+          .ToolTipText(LOCTEXT("Dev14BulkActionsTip", "Apply a selected-step operation as one undoable transaction."))
+          .IsEnabled_Lambda([this]() { return !SelectedBulkStepIndices.IsEmpty() && !bRunInProgress; })
+          .OnGetMenuContent(this, &SProbeWorkspace::BuildDev14BulkActionsMenu)
+          .ButtonContent()[ SNew(STextBlock).Text(LOCTEXT("Dev14BulkActions", "Actions")) ] ];
+        Bar->AddSlot().FillWidth(1).Padding(6, 0, 4, 0)
+        [ SNew(SEditableTextBox)
+          .HintText(LOCTEXT("Dev14BulkGroupHint", "Group name"))
+          .Text(FText::FromString(BulkGroupName))
+          .OnTextCommitted_Lambda([this](const FText& Value, ETextCommit::Type)
+          { BulkGroupName = Value.ToString().TrimStartAndEnd(); }) ];
+        Bar->AddSlot().AutoWidth()
+        [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
+          .IsEnabled_Lambda([this]() { return !SelectedBulkStepIndices.IsEmpty() && !bRunInProgress; })
+          .OnClicked_Lambda([this]() { return ApplyDev14Bulk(ProbeDev14::EBulkAction::AssignGroup); })
+          [ SNew(STextBlock).Text(LOCTEXT("Dev14AssignGroup", "Assign Group")) ] ];
+        return SNew(SBorder).BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder")).Padding(5)[Bar];
+    }
+
+    FReply SaveDev15Recipe()
+    {
+        const UProbeTestAsset* Test = SelectedAsset();
+        if (!Test || bRunInProgress || SelectedBulkStepIndices.IsEmpty())
+        { FeedbackMessage = LOCTEXT("Dev15RecipeSelect", "Select a contiguous group of steps to save as a recipe."); return FReply::Handled(); }
+        TArray<int32> Indices = SelectedBulkStepIndices.Array();
+        Indices.Sort();
+        for (int32 I = 1; I < Indices.Num(); ++I)
+        { if (Indices[I] != Indices[I - 1] + 1)
+          { FeedbackMessage = LOCTEXT("Dev15RecipeContiguous", "A reusable recipe must use a contiguous selection."); return FReply::Handled(); } }
+        ProbeStepGroups::FRange Range;
+        Range.First = Indices[0];
+        Range.Last = Indices.Last();
+        FString Error;
+        if (!ProbeDev15Recipes::Save(Test->Steps, Range, Dev15RecipeName, false, Error))
+        {
+            if (Error.StartsWith(TEXT("Recipe exists:")) &&
+                FMessageDialog::Open(EAppMsgType::YesNo, EAppReturnType::No,
+                    LOCTEXT("Dev15ReplaceRecipe", "A recipe with this name already exists. Replace it?")) == EAppReturnType::Yes)
+            { ProbeDev15Recipes::Save(Test->Steps, Range, Dev15RecipeName, true, Error); }
+        }
+        FeedbackMessage = Error.IsEmpty()
+            ? FText::FromString(TEXT("Saved reusable recipe. It is stored per project under Saved/Probe/Recipes."))
+            : FText::FromString(Error);
+        return FReply::Handled();
+    }
+
+    void InsertDev15SavedRecipe(const FString& Name)
+    {
+        UProbeTestAsset* Test = SelectedAsset();
+        if (!Test || bRunInProgress) { return; }
+        TArray<FProbeTestStep> Steps;
+        FString Error;
+        if (!ProbeDev15Recipes::Read(Name, Steps, Error))
+        { FeedbackMessage = FText::FromString(Error); return; }
+        // Preflight the append without touching the actual asset.
+        if (Test->Steps.Num() + Steps.Num() > 4096 ||
+            (!Test->Steps.IsEmpty() && !Test->CleanupGroupName.TrimStartAndEnd().IsEmpty()))
+        { FeedbackMessage = LOCTEXT("Dev15RecipeCannotAppend", "Cannot append recipe after Cleanup or beyond 4096 steps."); return; }
+        const int32 Before = Test->Steps.Num();
+        ChangeAsset(TWeakObjectPtr<UProbeTestAsset>(Test),
+            LOCTEXT("Dev15RecipeTransaction", "Insert Saved Probe Recipe"),
+            [Steps](UProbeTestAsset& Asset)
+            { FString Ignore; ProbeDev15Recipes::Append(Asset, Steps, Ignore); });
+        for (int32 I = Before; I < Before + Steps.Num(); ++I) { ExpandedStepIndices.Add(I); }
+        RebuildTestEditor();
+        FeedbackMessage = FText::FromString(FString::Printf(
+            TEXT("Inserted '%s' (%d steps). Review targets and permissions before executing."), *Name, Steps.Num()));
+    }
+
+    TSharedRef<SWidget> BuildDev15SavedRecipesMenu()
+    {
+        FMenuBuilder Menu(true, nullptr);
+        const TArray<FString> Names = ProbeDev15Recipes::List();
+        if (Names.IsEmpty())
+        { Menu.AddMenuEntry(LOCTEXT("Dev15NoSavedRecipes", "No saved recipes"),
+            LOCTEXT("Dev15NoSavedRecipesHelp", "Select contiguous steps, enter a name, and use Save Group."),
+            FSlateIcon(), FUIAction()); }
+        for (const FString& Name : Names)
+        { Menu.AddMenuEntry(FText::FromString(Name),
+            LOCTEXT("Dev15InsertRecipeTip", "Append the saved steps and mark this Test as requiring author review. Permissions are not copied."),
+            FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this, Name]() { InsertDev15SavedRecipe(Name); }))); }
+        return Menu.MakeWidget();
+    }
+
+    void Dev15JumpToStep(int32 Index)
+    {
+        const UProbeTestAsset* Test = SelectedAsset();
+        if (!Test || !Test->Steps.IsValidIndex(Index)) { return; }
+        Dev15StepQuery.Reset();
+        const ProbeDev16::FGroup Group = ProbeDev16::GroupAt(Test->Steps, Index);
+        if (Group.Num()) { Dev16CollapsedGroups.Remove(ProbeDev16::GroupKey(Group)); }
+        ExpandedStepIndices.Add(Index);
+        RebuildTestEditor();
+        if (DefinitionScroll.IsValid())
+        {
+            if (const TWeakPtr<SWidget>* Row = StepRowWidgets.Find(Index))
+            { if (TSharedPtr<SWidget> Widget = Row->Pin())
+              { DefinitionScroll->ScrollDescendantIntoView(Widget.ToSharedRef()); } }
+        }
+    }
+
+    TSharedRef<SWidget> BuildDev15OutlineMenu()
+    {
+        FMenuBuilder Menu(true, nullptr);
+        const UProbeTestAsset* Test = SelectedAsset();
+        if (!Test) { return Menu.MakeWidget(); }
+        int32 GroupCount = 0;
+        for (int32 Index = 0; Index < Test->Steps.Num(); ++Index)
+        {
+            if (!ProbeDev16::IsGroupStart(Test->Steps, Index)) { continue; }
+            ++GroupCount;
+            const ProbeDev16::FGroup Group = ProbeDev16::GroupAt(Test->Steps, Index);
+            Menu.AddMenuEntry(FText::FromString(FString::Printf(TEXT("%d: %s (%d steps)"),
+                    Index + 1, *Group.Name, Group.Num())),
+                LOCTEXT("Dev16OutlineGroupTip", "Expand and jump to this distinct contiguous group."), FSlateIcon(),
+                FUIAction(FExecuteAction::CreateLambda([this, Index]() { Dev15JumpToStep(Index); })));
+        }
+        if (GroupCount == 0)
+        { Menu.AddMenuEntry(LOCTEXT("Dev15NoGroups", "No named groups"),
+            LOCTEXT("Dev15NoGroupsTip", "Assign groups with the bulk step editor."), FSlateIcon(), FUIAction()); }
+        return Menu.MakeWidget();
+    }
+
+    // Dev 16: Group is organization inside one Test; Recipe is a reusable saved pattern.
+    // Both built-in and project-saved patterns appear in ONE Recipes surface.
+    void PromptDev16Name(const FText& Title, const FString& Initial, int32 MaxLength,
+        TFunction<void(const FString&)> OnAccepted)
+    {
+        TSharedRef<SWindow> Window = SNew(SWindow)
+            .Title(Title).ClientSize(FVector2D(460.0f, 152.0f))
+            .SupportsMinimize(false).SupportsMaximize(false);
+        TSharedRef<FString> Value = MakeShared<FString>(Initial);
+        TSharedRef<TFunction<void(const FString&)>> SavedCallback =
+            MakeShared<TFunction<void(const FString&)>>(MoveTemp(OnAccepted));
+        const TWeakPtr<SWindow> WeakWindow(Window);
+        Window->SetContent(
+            SNew(SVerticalBox)
+            + SVerticalBox::Slot().AutoHeight().Padding(12,10,12,6)
+            [ SNew(STextBlock).Text(Title) ]
+            + SVerticalBox::Slot().AutoHeight().Padding(12,0,12,6)
+            [ SNew(SEditableTextBox).Text(FText::FromString(Initial))
+              .HintText(LOCTEXT("Dev16NameHint", "Enter a descriptive name"))
+              .OnTextChanged_Lambda([Value](const FText& Text) { *Value = Text.ToString(); }) ]
+            + SVerticalBox::Slot().AutoHeight().Padding(12,0,12,8)
+            [ SNew(STextBlock)
+              .Text(LOCTEXT("Dev16NameRules", "Recipe names: letters, numbers, spaces, underscores or hyphens. Existing recipes are never overwritten without confirmation."))
+              .AutoWrapText(true).ColorAndOpacity(FSlateColor::UseSubduedForeground()) ]
+            + SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Right).Padding(10,0,10,10)
+            [ SNew(SHorizontalBox)
+              + SHorizontalBox::Slot().AutoWidth().Padding(4,0)
+              [ SNew(SButton).Text(LOCTEXT("Dev16CancelName", "Cancel"))
+                .OnClicked_Lambda([WeakWindow]()
+                { if (TSharedPtr<SWindow> Dialog = WeakWindow.Pin()) { Dialog->RequestDestroyWindow(); }
+                  return FReply::Handled(); }) ]
+              + SHorizontalBox::Slot().AutoWidth().Padding(4,0)
+              [ SNew(SButton).Text(LOCTEXT("Dev16AcceptName", "Save"))
+                .IsEnabled_Lambda([Value, MaxLength]()
+                { const FString Clean = Value->TrimStartAndEnd(); return !Clean.IsEmpty() && Clean.Len() <= MaxLength; })
+                .OnClicked_Lambda([WeakWindow, Value, SavedCallback]()
+                { const FString Clean = Value->TrimStartAndEnd();
+                  if (TSharedPtr<SWindow> Dialog = WeakWindow.Pin()) { Dialog->RequestDestroyWindow(); }
+                  (*SavedCallback)(Clean); return FReply::Handled(); }) ] ]);
+        FSlateApplication::Get().AddModalWindow(Window,
+            FSlateApplication::Get().GetActiveTopLevelWindow(), false);
+    }
+
+    void SaveDev16RecipeRange(TArray<FProbeTestStep> Snapshot, ProbeStepGroups::FRange Range,
+        const FString& Name)
+    {
+        FString Error;
+        if (!ProbeDev15Recipes::Save(Snapshot, Range, Name, false, Error))
+        {
+            if (Error.StartsWith(TEXT("Recipe exists:")) &&
+                FMessageDialog::Open(EAppMsgType::YesNo, EAppReturnType::No,
+                    LOCTEXT("Dev16ConfirmReplaceRecipe", "Replace the existing saved recipe with this name?")) == EAppReturnType::Yes)
+            { ProbeDev15Recipes::Save(Snapshot, Range, Name, true, Error); }
+        }
+        FeedbackMessage = Error.IsEmpty()
+            ? FText::FromString(FString::Printf(TEXT("Saved recipe '%s'. Find it in Recipes > Saved Recipes."), *Name))
+            : FText::FromString(Error);
+        RefreshDev16RecipeBrowser();
+    }
+
+    FReply SaveDev16SelectedRecipe()
+    {
+        const UProbeTestAsset* Test = SelectedAsset();
+        ProbeDev16::FGroup Span;
+        if (!Test || bRunInProgress ||
+            !ProbeDev16::IsContiguousSelection(SelectedBulkStepIndices, Test->Steps.Num(), Span))
+        {
+            FeedbackMessage = LOCTEXT("Dev16RecipeSelectionHint", "Select one or more adjacent Test steps before saving a recipe.");
+            return FReply::Handled();
+        }
+        ProbeStepGroups::FRange Range;
+        Range.First = Span.First; Range.Last = Span.Last;
+        const TArray<FProbeTestStep> Snapshot = Test->Steps;
+        PromptDev16Name(LOCTEXT("Dev16SaveRecipeTitle", "Save Selected Steps as Recipe"),
+            Dev15RecipeName, 64,
+            [this, Snapshot, Range](const FString& Name)
+            { Dev15RecipeName = Name; SaveDev16RecipeRange(Snapshot, Range, Name); });
+        return FReply::Handled();
+    }
+
+    void SaveDev16GroupRecipe(TWeakObjectPtr<UProbeTestAsset> TestRef, int32 Index)
+    {
+        const UProbeTestAsset* Test = TestRef.Get();
+        if (!Test || bRunInProgress) { return; }
+        const ProbeDev16::FGroup Group = ProbeDev16::GroupAt(Test->Steps, Index);
+        if (!Group.Num()) { return; }
+        ProbeStepGroups::FRange Range;
+        Range.First = Group.First; Range.Last = Group.Last;
+        const TArray<FProbeTestStep> Snapshot = Test->Steps;
+        PromptDev16Name(LOCTEXT("Dev16SaveGroupRecipe", "Save Group as Reusable Recipe"),
+            Group.Name, 64,
+            [this, Snapshot, Range](const FString& Name)
+            { SaveDev16RecipeRange(Snapshot, Range, Name); });
+    }
+
+    void RenameDev16Group(TWeakObjectPtr<UProbeTestAsset> TestRef, int32 Index)
+    {
+        const UProbeTestAsset* Test = TestRef.Get();
+        if (!Test || bRunInProgress) { return; }
+        const ProbeDev16::FGroup Group = ProbeDev16::GroupAt(Test->Steps, Index);
+        if (!Group.Num()) { return; }
+        PromptDev16Name(LOCTEXT("Dev16RenameGroup", "Rename Test Step Group"), Group.Name, 96,
+            [this, TestRef, Index](const FString& Name)
+            {
+                ChangeAsset(TestRef, LOCTEXT("Dev16RenameGroupTransaction", "Rename Probe Step Group"),
+                    [Index, Name](UProbeTestAsset& Asset) { ProbeDev16::RenameGroup(Asset, Index, Name); });
+                Dev16CollapsedGroups.Reset();
+                RebuildTestEditor();
+            });
+    }
+
+    void RenameDev16Recipe(const FString& Name)
+    {
+        PromptDev16Name(LOCTEXT("Dev16RenameRecipe", "Rename Saved Recipe"), Name, 64,
+            [this, Name](const FString& NewName)
+            {
+                FString Error;
+                const bool bSuccess = ProbeDev16::RenameRecipe(Name, NewName, Error);
+                FeedbackMessage = FText::FromString(bSuccess ? TEXT("Saved recipe renamed.") : Error);
+                RefreshDev16RecipeBrowser();
+            });
+    }
+
+    void DuplicateDev16Recipe(const FString& Name)
+    {
+        PromptDev16Name(LOCTEXT("Dev16DuplicateRecipe", "Duplicate Saved Recipe"), Name + TEXT("_Copy"), 64,
+            [this, Name](const FString& NewName)
+            {
+                FString Error;
+                const bool bSuccess = ProbeDev16::DuplicateRecipe(Name, NewName, Error);
+                FeedbackMessage = FText::FromString(bSuccess ? TEXT("Saved recipe duplicated.") : Error);
+                RefreshDev16RecipeBrowser();
+            });
+    }
+
+    void DeleteDev16Recipe(const FString& Name)
+    {
+        if (FMessageDialog::Open(EAppMsgType::YesNo, EAppReturnType::No,
+            FText::FromString(FString::Printf(TEXT("Delete saved recipe '%s'? This cannot be undone."), *Name)))
+            != EAppReturnType::Yes) { return; }
+        FString Error;
+        const bool bSuccess = ProbeDev16::DeleteRecipe(Name, Error);
+        FeedbackMessage = FText::FromString(bSuccess ? TEXT("Saved recipe deleted.") : Error);
+        RefreshDev16RecipeBrowser();
+    }
+
+    TSharedRef<SWidget> BuildDev16RecipesMenu()
+    {
+        FMenuBuilder Menu(true, nullptr);
+        Menu.BeginSection(TEXT("BuiltInRecipes"), LOCTEXT("Dev16BuiltInRecipes", "Built-in Recipes"));
+        for (const ProbeDev14::ERecipe Recipe : {
+            ProbeDev14::ERecipe::PluginHealth, ProbeDev14::ERecipe::EditorState,
+            ProbeDev14::ERecipe::ReadOnlyUI, ProbeDev14::ERecipe::TransientFixture })
+        {
+            Menu.AddMenuEntry(FText::FromString(ProbeDev14::RecipeName(Recipe)),
+                LOCTEXT("Dev16BuiltInRecipeTip", "Insert built-in Test steps. Review before running; no permissions are granted."),
+                FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this, Recipe]()
+                { AppendDev14Recipe(Recipe); })));
+        }
+        Menu.EndSection();
+        Menu.BeginSection(TEXT("SavedRecipes"), LOCTEXT("Dev16SavedRecipes", "Saved Recipes"));
+        const TArray<FString> Names = ProbeDev15Recipes::List();
+        if (Names.IsEmpty())
+        { Menu.AddMenuEntry(LOCTEXT("Dev16NoRecipesYet", "No saved recipes yet"),
+            LOCTEXT("Dev16NoRecipesHint", "Select adjacent steps and use Save Selection as Recipe."),
+            FSlateIcon(), FUIAction()); }
+        for (const FString& Name : Names)
+        {
+            Menu.AddMenuEntry(FText::FromString(Name),
+                LOCTEXT("Dev16InsertSavedTip", "Insert project-local reusable recipe steps; receiving Test requires review."),
+                FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this, Name]()
+                { InsertDev15SavedRecipe(Name); })));
+        }
+        Menu.EndSection();
+        Menu.BeginSection(TEXT("RecipeActions"), LOCTEXT("Dev16RecipeCommands", "Recipe Actions"));
+        Menu.AddMenuEntry(LOCTEXT("Dev16SaveSelection", "Save Selection as Recipe..."),
+            LOCTEXT("Dev16SaveSelectionTip", "Save contiguous selected Test steps to the project recipe library."),
+            FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { SaveDev16SelectedRecipe(); }),
+                FCanExecuteAction::CreateLambda([this]() { return !bRunInProgress && !SelectedBulkStepIndices.IsEmpty(); })));
+        Menu.AddMenuEntry(LOCTEXT("Dev16BrowseRecipes", "Browse & Manage Recipes..."),
+            LOCTEXT("Dev16BrowseRecipesTip", "Search, inspect, insert, rename, duplicate or delete project recipes."),
+            FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this]() { OpenDev16RecipeBrowser(); })));
+        Menu.EndSection();
+        return Menu.MakeWidget();
+    }
+
+    void PreviewDev16Recipe(const FString& Name, const TArray<FProbeTestStep>& Steps)
+    {
+        FString Preview = FString::Printf(TEXT("%s  |  %d step(s)\n\n"), *Name, Steps.Num());
+        const int32 Shown = FMath::Min(Steps.Num(), 36);
+        for (int32 I = 0; I < Shown; ++I)
+        {
+            const FProbeTestStep& Step = Steps[I];
+            Preview += FString::Printf(TEXT("%d. %s%s\n"), I + 1,
+                *Probe::StepDisplayName(Step),
+                Step.GroupName.IsEmpty() ? TEXT("") : *FString::Printf(TEXT("  [%s]"), *Step.GroupName));
+        }
+        if (Steps.Num() > Shown) { Preview += TEXT("...remaining steps omitted from preview"); }
+        FMessageDialog::Open(EAppMsgType::Ok, EAppReturnType::Ok, FText::FromString(Preview));
+    }
+
+    void RefreshDev16RecipeBrowser()
+    {
+        if (!Dev16RecipeBrowserRows.IsValid() || !Dev16RecipeBrowserWindow.IsValid()) { return; }
+        Dev16RecipeBrowserRows->ClearChildren();
+        auto Matches = [this](const FString& Name, const FString& Kind)
+        { return Dev16RecipeSearch.IsEmpty() || Name.Contains(Dev16RecipeSearch, ESearchCase::IgnoreCase)
+            || Kind.Contains(Dev16RecipeSearch, ESearchCase::IgnoreCase); };
+        int32 Found = 0;
+        for (const ProbeDev14::ERecipe Recipe : {
+            ProbeDev14::ERecipe::PluginHealth, ProbeDev14::ERecipe::EditorState,
+            ProbeDev14::ERecipe::ReadOnlyUI, ProbeDev14::ERecipe::TransientFixture })
+        {
+            const FString Name = ProbeDev14::RecipeName(Recipe);
+            if (!Matches(Name, TEXT("Built-in"))) { continue; }
+            ++Found;
+            Dev16RecipeBrowserRows->AddSlot().AutoHeight().Padding(3,2)
+            [ SNew(SBorder).BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder")).Padding(8)
+              [ SNew(SHorizontalBox)
+                + SHorizontalBox::Slot().FillWidth(1.0f).VAlign(VAlign_Center)
+                [ SNew(STextBlock).Text(FText::FromString(FString::Printf(TEXT("%s  |  Built-in  |  %d steps"),
+                    *Name, ProbeDev14::BuildRecipe(Recipe).Num()))) ]
+                + SHorizontalBox::Slot().AutoWidth().Padding(3,0)
+                [ SNew(SButton).Text(LOCTEXT("Dev16PreviewBuiltIn", "Preview"))
+                  .OnClicked_Lambda([this, Recipe, Name]()
+                  { PreviewDev16Recipe(Name, ProbeDev14::BuildRecipe(Recipe)); return FReply::Handled(); }) ]
+                + SHorizontalBox::Slot().AutoWidth().Padding(5,0)
+                [ SNew(SButton).Text(LOCTEXT("Dev16InsertBuiltIn", "Insert"))
+                  .IsEnabled_Lambda([this]() { return HasSelectedAsset() && !bRunInProgress; })
+                  .OnClicked_Lambda([this, Recipe]() { return AppendDev14Recipe(Recipe); }) ] ] ];
+        }
+        for (const FString& Name : ProbeDev15Recipes::List())
+        {
+            if (!Matches(Name, TEXT("Saved"))) { continue; }
+            ++Found;
+            TArray<FProbeTestStep> Steps;
+            FString Error;
+            const bool bRead = ProbeDev15Recipes::Read(Name, Steps, Error);
+            const FString Detail = bRead
+                ? FString::Printf(TEXT("%d steps | %s"), Steps.Num(), Steps.IsEmpty()
+                    ? TEXT("Empty recipe") : *Probe::StepDisplayName(Steps[0]))
+                : Error;
+            Dev16RecipeBrowserRows->AddSlot().AutoHeight().Padding(3,2)
+            [ SNew(SBorder).BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder")).Padding(8)
+              [ SNew(SHorizontalBox)
+                + SHorizontalBox::Slot().FillWidth(1.0f).VAlign(VAlign_Center)
+                [ SNew(SVerticalBox)
+                  + SVerticalBox::Slot().AutoHeight()
+                  [ SNew(STextBlock).Text(FText::FromString(Name)).Font(FAppStyle::GetFontStyle("NormalFontBold")) ]
+                  + SVerticalBox::Slot().AutoHeight()
+                  [ SNew(STextBlock).Text(FText::FromString(Detail))
+                    .ColorAndOpacity(FSlateColor::UseSubduedForeground()) ] ]
+                + SHorizontalBox::Slot().AutoWidth().Padding(3,0)
+                [ SNew(SButton).Text(LOCTEXT("Dev16PreviewSaved", "Preview"))
+                  .IsEnabled(bRead)
+                  .OnClicked_Lambda([this, Name, Steps]()
+                  { PreviewDev16Recipe(Name, Steps); return FReply::Handled(); }) ]
+                + SHorizontalBox::Slot().AutoWidth().Padding(3,0)
+                [ SNew(SButton).Text(LOCTEXT("Dev16InsertSaved", "Insert"))
+                  .IsEnabled_Lambda([this, bRead]() { return bRead && HasSelectedAsset() && !bRunInProgress; })
+                  .OnClicked_Lambda([this, Name]() { InsertDev15SavedRecipe(Name); return FReply::Handled(); }) ]
+                + SHorizontalBox::Slot().AutoWidth().Padding(3,0)
+                [ SNew(SComboButton)
+                  .OnGetMenuContent_Lambda([this, Name]() -> TSharedRef<SWidget>
+                  {
+                      FMenuBuilder Actions(true, nullptr);
+                      Actions.AddMenuEntry(LOCTEXT("Dev16RenameSaved", "Rename..."), FText::GetEmpty(), FSlateIcon(),
+                          FUIAction(FExecuteAction::CreateLambda([this, Name]() { RenameDev16Recipe(Name); })));
+                      Actions.AddMenuEntry(LOCTEXT("Dev16DuplicateSaved", "Duplicate..."), FText::GetEmpty(), FSlateIcon(),
+                          FUIAction(FExecuteAction::CreateLambda([this, Name]() { DuplicateDev16Recipe(Name); })));
+                      Actions.AddMenuEntry(LOCTEXT("Dev16DeleteSaved", "Delete..."), FText::GetEmpty(), FSlateIcon(),
+                          FUIAction(FExecuteAction::CreateLambda([this, Name]() { DeleteDev16Recipe(Name); })));
+                      return Actions.MakeWidget();
+                  })
+                  .ButtonContent()[ SNew(STextBlock).Text(LOCTEXT("Dev16RecipeMore", "Actions")) ] ] ] ];
+        }
+        if (Found == 0)
+        { Dev16RecipeBrowserRows->AddSlot().AutoHeight().Padding(12)
+          [ SNew(STextBlock).Text(LOCTEXT("Dev16NoRecipeMatches", "No matching recipes. Clear the search or save a selection from a Test.")) ]; }
+    }
+
+    void OpenDev16RecipeBrowser()
+    {
+        if (TSharedPtr<SWindow> Existing = Dev16RecipeBrowserWindow.Pin())
+        { Existing->BringToFront(true); return; }
+        TSharedRef<SWindow> Window = SNew(SWindow)
+            .Title(LOCTEXT("Dev16RecipeBrowserTitle", "Probe | Recipe Browser"))
+            .ClientSize(FVector2D(800.0f, 540.0f));
+        Window->SetContent(
+            SNew(SVerticalBox)
+            + SVerticalBox::Slot().AutoHeight().Padding(10,9,10,6)
+            [ SNew(STextBlock).Text(LOCTEXT("Dev16RecipeBrowserIntro",
+                "Built-in patterns and saved project recipes. Inserting a recipe never grants permissions and requires Test review."))
+                .AutoWrapText(true).ColorAndOpacity(FSlateColor::UseSubduedForeground()) ]
+            + SVerticalBox::Slot().AutoHeight().Padding(10,0,10,8)
+            [ SNew(SSearchBox)
+              .HintText(LOCTEXT("Dev16RecipeFind", "Find recipes by name or kind..."))
+              .OnTextChanged_Lambda([this](const FText& Query)
+              { Dev16RecipeSearch = Query.ToString(); RefreshDev16RecipeBrowser(); }) ]
+            + SVerticalBox::Slot().FillHeight(1.0f).Padding(8,0,8,8)
+            [ SNew(SBorder).BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
+              [ SNew(SScrollBox)
+                + SScrollBox::Slot()[ SAssignNew(Dev16RecipeBrowserRows, SVerticalBox) ] ] ]
+            + SVerticalBox::Slot().AutoHeight().Padding(10,0,10,10)
+            [ SNew(SHorizontalBox)
+              + SHorizontalBox::Slot().FillWidth(1.0f).VAlign(VAlign_Center)
+              [ SNew(SVerticalBox)
+                + SVerticalBox::Slot().AutoHeight()
+                [ SNew(STextBlock).Text(LOCTEXT("Dev16RecipeBrowserLocation", "Saved recipes: Project/Saved/Probe/Recipes/"))
+                  .ColorAndOpacity(FSlateColor::UseSubduedForeground()) ]
+                + SVerticalBox::Slot().AutoHeight()
+                [ SNew(STextBlock).Text(this, &SProbeWorkspace::FeedbackText)
+                  .ColorAndOpacity(FSlateColor::UseSubduedForeground()) ] ]
+              + SHorizontalBox::Slot().AutoWidth()
+              [ SNew(SButton).Text(LOCTEXT("Dev16BrowserSaveSelection", "Save Selected Steps as Recipe..."))
+                .IsEnabled_Lambda([this]() { return !SelectedBulkStepIndices.IsEmpty() && !bRunInProgress; })
+                .OnClicked_Lambda([this]() { return SaveDev16SelectedRecipe(); }) ] ]);
+        Dev16RecipeBrowserWindow = Window;
+        FSlateApplication::Get().AddWindow(Window);
+        RefreshDev16RecipeBrowser();
+    }
+
+    TSharedRef<SWidget> BuildDev16GroupActionsMenu(TWeakObjectPtr<UProbeTestAsset> TestRef, int32 Index)
+    {
+        FMenuBuilder Menu(true, nullptr);
+        Menu.AddMenuEntry(LOCTEXT("Dev16GroupRenameAction", "Rename Group..."),
+            LOCTEXT("Dev16GroupRenameTip", "Rename every step in this contiguous group. Undoable."),
+            FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this, TestRef, Index]()
+            { RenameDev16Group(TestRef, Index); })));
+        Menu.AddMenuEntry(LOCTEXT("Dev16GroupRecipe", "Save Group as Recipe..."),
+            LOCTEXT("Dev16GroupRecipeTip", "Create a reusable recipe from these group steps. Does not change the Test."),
+            FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this, TestRef, Index]()
+            { SaveDev16GroupRecipe(TestRef, Index); })));
+        Menu.AddMenuSeparator();
+        Menu.AddMenuEntry(LOCTEXT("Dev16GroupCopy", "Copy Group"), FText::GetEmpty(), FSlateIcon(),
+            FUIAction(FExecuteAction::CreateLambda([this, TestRef, Index]() { CopyStepGroup(TestRef, Index); })));
+        Menu.AddMenuEntry(LOCTEXT("Dev16GroupDuplicate", "Duplicate Group"), FText::GetEmpty(), FSlateIcon(),
+            FUIAction(FExecuteAction::CreateLambda([this, TestRef, Index]() { DuplicateStepGroup(TestRef, Index); })));
+        Menu.AddMenuEntry(LOCTEXT("Dev16GroupRun", "Run Group"),
+            LOCTEXT("Dev16GroupRunTip", "Run this group alone. Previous setup steps are not executed."),
+            FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this, TestRef, Index]() { RunStepGroup(TestRef, Index); })));
+        return Menu.MakeWidget();
+    }
+
+    TSharedRef<SWidget> BuildDev16StepActionsMenu(TWeakObjectPtr<UProbeTestAsset> TestRef, int32 Index)
+    {
+        FMenuBuilder Menu(true, nullptr);
+        Menu.AddMenuEntry(LOCTEXT("Dev16MoveUp", "Move Up"), FText::GetEmpty(), FSlateIcon(),
+            FUIAction(FExecuteAction::CreateLambda([this, TestRef, Index]() { ReorderStep(TestRef, Index, -1); }),
+                FCanExecuteAction::CreateLambda([Index]() { return Index > 0; })));
+        Menu.AddMenuEntry(LOCTEXT("Dev16MoveDown", "Move Down"), FText::GetEmpty(), FSlateIcon(),
+            FUIAction(FExecuteAction::CreateLambda([this, TestRef, Index]() { ReorderStep(TestRef, Index, +1); }),
+                FCanExecuteAction::CreateLambda([this, Index]()
+                { const UProbeTestAsset* Test = SelectedAsset(); return Test && Index + 1 < Test->Steps.Num(); })));
+        Menu.AddMenuEntry(LOCTEXT("Dev16DuplicateStep", "Duplicate Step"), FText::GetEmpty(), FSlateIcon(),
+            FUIAction(FExecuteAction::CreateLambda([this, TestRef, Index]() { DuplicateStep(TestRef, Index); })));
+        Menu.AddMenuEntry(LOCTEXT("Dev16CopyStep", "Copy Step or Group"), FText::GetEmpty(), FSlateIcon(),
+            FUIAction(FExecuteAction::CreateLambda([this, TestRef, Index]() { CopyStepGroup(TestRef, Index); })));
+        Menu.AddMenuEntry(LOCTEXT("Dev16RunSingleStep", "Run Step or Group"),
+            LOCTEXT("Dev16RunSingleTip", "Run only the step or its adjacent named group; setup steps are not executed."),
+            FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this, TestRef, Index]() { RunStepGroup(TestRef, Index); })));
+        Menu.AddMenuSeparator();
+        Menu.AddMenuEntry(LOCTEXT("Dev16DeleteStep", "Delete Step"), FText::GetEmpty(), FSlateIcon(),
+            FUIAction(FExecuteAction::CreateLambda([this, TestRef, Index]() { DeleteStep(TestRef, Index); })));
+        return Menu.MakeWidget();
+    }
+
+    TSharedRef<SWidget> BuildDev16StepToolsMenu()
+    {
+        FMenuBuilder Menu(true, nullptr);
+        Menu.AddMenuEntry(LOCTEXT("Dev16ToolsPaste", "Paste Copied Steps"), FText::GetEmpty(), FSlateIcon(),
+            FUIAction(FExecuteAction::CreateLambda([this]() { PasteStepGroup(); })));
+        Menu.AddMenuEntry(LOCTEXT("Dev16ToolsNotes", "Toggle Step Notes"), FText::GetEmpty(), FSlateIcon(),
+            FUIAction(FExecuteAction::CreateLambda([this]() { ToggleStepNotes(); })));
+        Menu.AddMenuEntry(LOCTEXT("Dev16ToolsAll", "Select All Steps"), FText::GetEmpty(), FSlateIcon(),
+            FUIAction(FExecuteAction::CreateLambda([this]()
+            { if (const UProbeTestAsset* Test = SelectedAsset())
+              { SelectedBulkStepIndices.Reset(); for (int32 I = 0; I < Test->Steps.Num(); ++I) { SelectedBulkStepIndices.Add(I); }
+                RebuildTestEditor(); } })));
+        Menu.AddMenuEntry(LOCTEXT("Dev16ToolsClear", "Clear Step Selection"), FText::GetEmpty(), FSlateIcon(),
+            FUIAction(FExecuteAction::CreateLambda([this]()
+            { SelectedBulkStepIndices.Reset(); RebuildTestEditor(); })));
+        return Menu.MakeWidget();
+    }
+
     void RebuildTestEditor()
     {
         if (!EditorRows.IsValid()) { return; }
         EditorRows->ClearChildren();
+        StepRowWidgets.Reset();
         UProbeTestAsset* Asset = SelectedAsset();
         if (!Asset)
         {
+            Dev16OverviewCache.Reset();
             ExpandedAssetPath.Reset();
             ExpandedStepIndices.Reset();
             EditorRows->AddSlot().AutoHeight().Padding(10)
             [ SNew(STextBlock).Text(LOCTEXT("NoTestSelected", "Create or select a Probe Test to edit its configuration.")) ];
             return;
         }
+        Dev16OverviewCache = ProbeDev16::TestSummary(*Asset);
         const FString AssetPath = Asset->GetPathName();
         if (ExpandedAssetPath != AssetPath)
         {
             ExpandedAssetPath = AssetPath;
             ExpandedStepIndices.Reset();
+            SelectedBulkStepIndices.Reset();
+            Dev16CollapsedGroups.Reset();
             if (Asset->Steps.Num() > 0) { ExpandedStepIndices.Add(0); }
         }
         const TWeakObjectPtr<UProbeTestAsset> TestRef(Asset);
@@ -4319,32 +4913,63 @@ private:
         [ SNew(SBorder).BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
           .Padding(FMargin(10.0f, 8.0f)) [ Scenario ] ];
         EditorRows->AddSlot().AutoHeight().Padding(3, 3, 3, 7)
-        [
-            SNew(SBorder)
-            .BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
-            .Padding(FMargin(9, 7))
-            [ Settings ]
-        ];
-        EditorRows->AddSlot().AutoHeight().Padding(8, 4, 8, 5)
-        [
-            SNew(SHorizontalBox)
-            + SHorizontalBox::Slot().FillWidth(1.0f).VAlign(VAlign_Center)
-            [ SNew(STextBlock).Text(FText::FromString(FString::Printf(TEXT("Test Steps (%d)"), Asset->Steps.Num()))) ]
-            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 7, 0)
-            [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
-              .ToolTipText(LOCTEXT("PasteGroupTip", "Append a copied Probe step group to this Test Asset. Permission settings are never copied."))
-              .OnClicked(this, &SProbeWorkspace::PasteStepGroup)
-              [ SNew(STextBlock).Text(LOCTEXT("PasteGroup", "Paste Steps")) ] ]
-            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
-            [
-                SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
-                .ToolTipText(LOCTEXT("NotesToggleTip", "Show or hide optional step descriptions"))
-                .OnClicked(this, &SProbeWorkspace::ToggleStepNotes)
-                [ SNew(STextBlock).Text(bStepNotesShown
-                    ? LOCTEXT("HideNotes", "Hide Notes") : LOCTEXT("ShowNotes", "Show Notes"))
-                  .ColorAndOpacity(FSlateColor::UseSubduedForeground()) ]
-            ]
-        ];
+        [ SNew(SExpandableArea)
+          .InitiallyCollapsed(!bDev16SettingsExpanded)
+          .OnAreaExpansionChanged_Lambda([this](bool bExpanded)
+          { bDev16SettingsExpanded = bExpanded;
+            GConfig->SetBool(TEXT("ProbeWorkspace"), TEXT("Dev16SettingsExpanded"), bExpanded, GEditorPerProjectIni); })
+          .HeaderContent()
+          [ SNew(SVerticalBox)
+            + SVerticalBox::Slot().AutoHeight().Padding(2,2)
+            [ SNew(STextBlock).Text(LOCTEXT("Dev16OverviewTitle", "Test Overview & Workflow Settings"))
+              .Font(FAppStyle::GetFontStyle("NormalFontBold")) ]
+            + SVerticalBox::Slot().AutoHeight().Padding(2,0,2,4)
+            [ SNew(STextBlock).Text_Lambda([this]() { return FText::FromString(Dev16OverviewCache); })
+              .ColorAndOpacity(FSlateColor::UseSubduedForeground()) ] ]
+          .BodyContent()
+          [ SNew(SBorder).BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
+            .Padding(FMargin(9,7))[ Settings ] ] ];
+        EditorRows->AddSlot().AutoHeight().Padding(7, 4, 7, 4)
+        [ SNew(SHorizontalBox)
+          + SHorizontalBox::Slot().FillWidth(1.0f).VAlign(VAlign_Center)
+          [ SNew(STextBlock).Text(FText::FromString(FString::Printf(TEXT("Test Steps (%d)"), Asset->Steps.Num())))
+            .Font(FAppStyle::GetFontStyle("NormalFontBold")) ]
+          + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0,0,7,0)
+          [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
+            .ToolTipText(LOCTEXT("Dev16PreflightTip", "Read-only readiness and permissions preflight; does not run this Test."))
+            .OnClicked(this, &SProbeWorkspace::ShowDev14TestPreflight)
+            [ SNew(STextBlock).Text(LOCTEXT("Dev16Preflight", "Preflight")) ] ]
+          + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0,0,7,0)
+          [ SNew(SComboButton)
+            .ToolTipText(LOCTEXT("Dev16RecipesTip", "Built-in and project-saved reusable Test recipes, with creation and management in one menu."))
+            .OnGetMenuContent(this, &SProbeWorkspace::BuildDev16RecipesMenu)
+            .ButtonContent()[ SNew(STextBlock).Text(LOCTEXT("Dev16Recipes", "Recipes")) ] ]
+          + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+          [ SNew(SComboButton)
+            .ToolTipText(LOCTEXT("Dev16StepToolsTip", "Paste, selection and step display actions"))
+            .OnGetMenuContent(this, &SProbeWorkspace::BuildDev16StepToolsMenu)
+            .ButtonContent()[ SNew(STextBlock).Text(LOCTEXT("Dev16StepTools", "Step Options")) ] ] ];
+        EditorRows->AddSlot().AutoHeight().Padding(7, 0, 7, 5)
+        [ SNew(SHorizontalBox)
+          + SHorizontalBox::Slot().FillWidth(1.0f).Padding(0,0,6,0)
+          [ SAssignNew(Dev15StepSearchBox, SSearchBox)
+            .HintText(LOCTEXT("Dev15FindStepHint", "Find steps by assertion, target, group, description or expected value..."))
+            .OnTextChanged_Lambda([this](const FText& Query) { Dev15StepQuery = Query.ToString(); }) ]
+          + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+          [ SNew(SComboButton)
+            .ToolTipText(LOCTEXT("Dev15OutlineTip", "Jump to a named group and expand its steps."))
+            .OnGetMenuContent(this, &SProbeWorkspace::BuildDev15OutlineMenu)
+            .ButtonContent()[ SNew(STextBlock).Text(LOCTEXT("Dev15Outline", "Groups")) ] ] ];
+        EditorRows->AddSlot().AutoHeight().Padding(6, 0, 6, 6)
+        [ SNew(SBox)
+          .Visibility_Lambda([this]() { return SelectedBulkStepIndices.IsEmpty() ? EVisibility::Collapsed : EVisibility::Visible; })
+          [ MakeDev14BulkToolbar() ] ];
+        // Restore search text when the editor rows are rebuilt (e.g. adding or moving steps).
+        // The SSearchBox Slate argument list in UE 5.8 does not expose a .Text() setter.
+        if (Dev15StepSearchBox.IsValid())
+        {
+            Dev15StepSearchBox->SetText(FText::FromString(Dev15StepQuery));
+        }
         if (Asset->Steps.IsEmpty())
         {
             EditorRows->AddSlot().AutoHeight().Padding(10)
@@ -4353,8 +4978,61 @@ private:
         }
         for (int32 Index = 0; Index < Asset->Steps.Num(); ++Index)
         {
-            EditorRows->AddSlot().AutoHeight().Padding(3, 0, 3, 3)
-            [ MakeStepCard(TestRef, Index) ];
+            if (ProbeDev16::IsGroupStart(Asset->Steps, Index))
+            {
+                const ProbeDev16::FGroup Group = ProbeDev16::GroupAt(Asset->Steps, Index);
+                const FString Key = ProbeDev16::GroupKey(Group);
+                EditorRows->AddSlot().AutoHeight().Padding(4,5,4,2)
+                [ SNew(SBox)
+                  .Visibility_Lambda([this, TestRef, Group]()
+                  {
+                      const UProbeTestAsset* Current = TestRef.Get();
+                      if (!Current) { return EVisibility::Collapsed; }
+                      if (Dev15StepQuery.IsEmpty()) { return EVisibility::Visible; }
+                      for (int32 I = Group.First; I <= Group.Last; ++I)
+                      { if (Current->Steps.IsValidIndex(I) && ProbeDev15::StepMatches(Current->Steps[I], Dev15StepQuery))
+                        { return EVisibility::Visible; } }
+                      return EVisibility::Collapsed;
+                  })
+                  [ SNew(SBorder).BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
+                    .Padding(FMargin(7,3))
+                    [ SNew(SHorizontalBox)
+                      + SHorizontalBox::Slot().FillWidth(1.0f).VAlign(VAlign_Center)
+                      [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
+                        .ToolTipText(LOCTEXT("Dev16GroupCollapseTip", "Collapse or expand this contiguous group. Searching still shows matching steps."))
+                        .OnClicked_Lambda([this, Key]()
+                        { if (Dev16CollapsedGroups.Contains(Key)) { Dev16CollapsedGroups.Remove(Key); }
+                          else { Dev16CollapsedGroups.Add(Key); }
+                          RebuildTestEditor(); return FReply::Handled(); })
+                        [ SNew(STextBlock).Text_Lambda([this, Group, Key]()
+                          { return FText::FromString(FString::Printf(TEXT("%s  %s  (%d steps)"),
+                            Dev16CollapsedGroups.Contains(Key) ? TEXT(">") : TEXT("v"), *Group.Name, Group.Num())); })
+                          .Font(FAppStyle::GetFontStyle("NormalFontBold")) ] ]
+                      + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+                      [ SNew(SComboButton)
+                        .ToolTipText(LOCTEXT("Dev16GroupActionsTip", "Group actions: rename, save as recipe, copy, duplicate or run"))
+                        .OnGetMenuContent_Lambda([this, TestRef, Index]()
+                        { return BuildDev16GroupActionsMenu(TestRef, Index); })
+                        .ButtonContent()[ SNew(STextBlock).Text(LOCTEXT("Dev16GroupActions", "Group Actions")) ] ] ] ] ];
+            }
+            TSharedRef<SWidget> RowWidget = MakeStepCard(TestRef, Index);
+            StepRowWidgets.Add(Index, RowWidget);
+            // Compute the group identity once per editor rebuild, not every Slate visibility pass.
+            const ProbeDev16::FGroup StepGroup = ProbeDev16::GroupAt(Asset->Steps, Index);
+            const FString StepGroupKey = StepGroup.Num() ? ProbeDev16::GroupKey(StepGroup) : FString();
+            EditorRows->AddSlot().AutoHeight().Padding(6, 0, 6, 2)
+            [ SNew(SBox)
+              .Visibility_Lambda([this, TestRef, Index, StepGroupKey]()
+              {
+                  const UProbeTestAsset* Current = TestRef.Get();
+                  if (!Current || !Current->Steps.IsValidIndex(Index) ||
+                      !ProbeDev15::StepMatches(Current->Steps[Index], Dev15StepQuery))
+                  { return EVisibility::Collapsed; }
+                  return (!StepGroupKey.IsEmpty() && Dev15StepQuery.IsEmpty() &&
+                      Dev16CollapsedGroups.Contains(StepGroupKey))
+                      ? EVisibility::Collapsed : EVisibility::Visible;
+              })
+              [ RowWidget ] ];
         }
     }
 
@@ -4701,6 +5379,7 @@ private:
 
     void ExecuteAsset(UProbeTestAsset* Asset, const Probe::FRunOptions& Options = Probe::FRunOptions())
     {
+        bDev16ResultsCollapsed = false;
         if (!Asset) { return; }
         Probe::FTestResult Pending;
         Pending.Name = Asset->GetName();
@@ -4821,6 +5500,37 @@ private:
                 LastComparison.Regressions, LastComparison.Recovered);
         }
         return FText::FromString(Summary);
+    }
+
+    TOptional<float> Dev14LiveProgressFraction() const
+    {
+        if (!bRunInProgress || Results.IsEmpty()) { return 0.0f; }
+        const int32 Finished = Results.Num() - QueuedTestResultIndices.Num()
+            - (ActiveExecutionResult != INDEX_NONE ? 1 : 0);
+        const float StepFraction = ActiveExecutionStepCount > 0
+            ? static_cast<float>(ActiveExecutionStep) / ActiveExecutionStepCount : 0.0f;
+        return FMath::Clamp((Finished + StepFraction) / Results.Num(), 0.0f, 1.0f);
+    }
+
+    FText Dev14LiveProgressText() const
+    {
+        if (!bRunInProgress) { return LOCTEXT("Dev14MonitorIdle", "Execution monitor: idle"); }
+        const int32 Finished = FMath::Max(0, Results.Num() - QueuedTestResultIndices.Num()
+            - (ActiveExecutionResult != INDEX_NONE ? 1 : 0));
+        int32 Problems = 0;
+        for (int32 I = 0; I < Results.Num(); ++I)
+        {
+            if (I == ActiveExecutionResult || QueuedTestResultIndices.Contains(I)) { continue; }
+            Problems += ProbeDev10PackPolicy::IsProblem(Results[I].Status);
+        }
+        const FString ActiveName = Results.IsValidIndex(ActiveExecutionResult)
+            ? Results[ActiveExecutionResult].Name : TEXT("Queue");
+        const double Elapsed = ActiveExecutionStartSeconds > 0.0
+            ? FPlatformTime::Seconds() - ActiveExecutionStartSeconds : 0.0;
+        return FText::FromString(FString::Printf(
+            TEXT("Running %d/%d | %s | step %d/%d | %.1fs | %d problem(s)%s"),
+            Finished, Results.Num(), *ActiveName, ActiveExecutionStep, ActiveExecutionStepCount,
+            Elapsed, Problems, bStopAfterCurrentTest ? TEXT(" | stopping after test") : TEXT("")));
     }
 
     static int32 ResultSortPriority(Probe::EResultStatus Status)
@@ -5083,6 +5793,18 @@ private:
         return FReply::Handled();
     }
 
+    FReply Dev14JumpToFirstFailure()
+    {
+        if (!Results.IsValidIndex(SelectedResultIndex)) { return FReply::Handled(); }
+        for (const Probe::FStepResult& Step : Results[SelectedResultIndex].Steps)
+        {
+            if (ProbeDev10PackPolicy::IsProblem(Step.Status))
+            { return EditSelectedResultStep(Step.Index); }
+        }
+        FeedbackMessage = LOCTEXT("Dev14NoFailedSteps", "The selected result contains no failed step to navigate to.");
+        return FReply::Handled();
+    }
+
     FReply EditSelectedResultStep(int32 StepNumber)
     {
         const FReply Result = EditSelectedResultTest();
@@ -5091,6 +5813,12 @@ private:
             ExpandedStepIndices.Add(StepNumber - 1);
             bResultsFocused = false;
             RebuildTestEditor();
+            if (DefinitionScroll.IsValid())
+            {
+                if (const TWeakPtr<SWidget>* Row = StepRowWidgets.Find(StepNumber - 1))
+                { if (TSharedPtr<SWidget> Found = Row->Pin())
+                  { DefinitionScroll->ScrollDescendantIntoView(Found.ToSharedRef()); } }
+            }
         }
         return Result;
     }
@@ -5233,6 +5961,11 @@ private:
               { bProblemStepsOnly = !bProblemStepsOnly; RebuildResultDetails(); return FReply::Handled(); })
               [ SNew(STextBlock).Text_Lambda([this]()
                 { return bProblemStepsOnly ? LOCTEXT("AllStepsView", "All Steps") : LOCTEXT("ProblemsOnlyView", "Problems Only"); }) ] ]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 4, 0)
+            [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
+              .ToolTipText(LOCTEXT("Dev14JumpFailureTip", "Open the first failed/errored step in Test Definition."))
+              .OnClicked(this, &SProbeWorkspace::Dev14JumpToFirstFailure)
+              [ SNew(STextBlock).Text(LOCTEXT("Dev14JumpFailure", "First Failure")) ] ]
             + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 4, 0)
             [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
               .ToolTipText(LOCTEXT("EditResultTip", "Select this test in the Test Definition editor"))
@@ -5826,6 +6559,10 @@ private:
 
     void ExecuteQueuedResult(int32 ResultIndex, UProbeTestAsset* Asset, const Probe::FRunOptions Options)
     {
+        ActiveExecutionResult = ResultIndex;
+        ActiveExecutionStep = 0;
+        ActiveExecutionStepCount = Asset ? Asset->Steps.Num() : 0;
+        ActiveExecutionStartSeconds = FPlatformTime::Seconds();
         TWeakPtr<SProbeWorkspace> WeakWorkspace = SharedThis(this);
         const TWeakObjectPtr<UProbeTestAsset> WeakAsset(Asset);
         Probe::RunTestAsync(Asset, [WeakWorkspace, WeakAsset, ResultIndex, Options](Probe::FTestResult Finished)
@@ -5875,11 +6612,22 @@ private:
                     { Owner->StartNextQueuedTest(); }
                     return false;
                 }));
-        }, Options);
+        }, Options, [WeakWorkspace, ResultIndex](int32 StepNumber, int32 TotalSteps)
+        {
+            if (TSharedPtr<SProbeWorkspace> Owner = WeakWorkspace.Pin())
+            {
+                if (Owner->bRunInProgress && Owner->ActiveExecutionResult == ResultIndex)
+                { Owner->ActiveExecutionStep = StepNumber; Owner->ActiveExecutionStepCount = TotalSteps; }
+            }
+        });
     }
 
     void StartNextQueuedTest()
     {
+        ActiveExecutionResult = INDEX_NONE;
+        ActiveExecutionStep = 0;
+        ActiveExecutionStepCount = 0;
+        ActiveExecutionStartSeconds = 0.0;
         if (bStopAfterCurrentTest)
         {
             ProbeQueueControl::SkipPending(QueuedTestResultIndices, Results,
@@ -6145,6 +6893,11 @@ public:
                 .ToolTipText(LOCTEXT("RunSelectedPackTip", "Run only the checked tests in this Pack, preserving Pack order."))
                 [ SNew(STextBlock).Text(LOCTEXT("RunSelectedPackLabel", "Run Selected")) ] ]
               + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0,0,4,0)
+              [ SNew(SButton).OnClicked(this, &SProbePackWorkspace::ShowDev14PackReadiness)
+                .ToolTipText(LOCTEXT("Dev14PackReadinessTip", "Preflight all Pack members and prerequisite rules, without executing tests."))
+                .IsEnabled_Lambda([this]() { return GetPack() != nullptr; })
+                [ SNew(STextBlock).Text(LOCTEXT("Dev14PackReadiness", "Readiness Overview")) ] ]
+              + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0,0,4,0)
               [ SNew(SButton).OnClicked(this, &SProbePackWorkspace::ValidateCurrentReferences)
                 .ToolTipText(LOCTEXT("ValidateCurrentPackTip", "Validate only the selected Pack's test references."))
                 .IsEnabled_Lambda([this]() { return GetPack() != nullptr; })
@@ -6153,6 +6906,11 @@ public:
               [ SNew(SButton).OnClicked(this, &SProbePackWorkspace::ValidateAllReferences)
                 .ToolTipText(LOCTEXT("ValidateAllPackTip", "Check all Packs and duplicate stable Test IDs across the project."))
                 [ SNew(STextBlock).Text(LOCTEXT("ValidateAllPacks", "Validate All")) ] ]
+              + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(4,0,6,0)
+              [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
+                .OnClicked_Lambda([]() { ProbeDev15::OpenBrowser(); return FReply::Handled(); })
+                .ToolTipText(LOCTEXT("Dev15PackBrowserTip", "Open the project-wide QA Browser and readiness dashboard."))
+                [ SNew(STextBlock).Text(LOCTEXT("Dev15PackBrowser", "QA Browser")) ] ]
               + SHorizontalBox::Slot().FillWidth(1) [ SNullWidget::NullWidget ]
               + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
               [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
@@ -6359,6 +7117,18 @@ private:
         }
         return FReply::Handled();
     }
+    FReply ShowDev14PackReadiness()
+    {
+        const UProbeTestPack* Pack = GetPack();
+        if (!Pack) { return FReply::Handled(); }
+        const ProbeDev14::FReport Report = ProbeDev14::PreflightPack(*Pack,
+            [](const FString& Path) -> const UProbeTestAsset*
+            { return Path.IsEmpty() ? nullptr : LoadObject<UProbeTestAsset>(nullptr, *Path); });
+        FMessageDialog::Open(EAppMsgType::Ok, EAppReturnType::Ok, FText::FromString(Report.Text()));
+        Message = FString::Printf(TEXT("Pack readiness: %d blocking, %d warning(s)."), Report.Blocking, Report.Warnings);
+        return FReply::Handled();
+    }
+
     FReply ValidateCurrentReferences()
     {
         const UProbeTestPack* Pack = GetPack();
@@ -7017,6 +7787,160 @@ private:
 
 };
 
+// Dev 17: transparent read-only discovery and opt-in execution of plugin-shipped JSON.
+class SProbePortableBrowser : public SCompoundWidget
+{
+public:
+    SLATE_BEGIN_ARGS(SProbePortableBrowser) {} SLATE_END_ARGS()
+
+    void Construct(const FArguments&)
+    {
+        ChildSlot
+        [ SNew(SBorder).BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder")).Padding(10)
+          [ SNew(SVerticalBox)
+            + SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 8)
+              [ SNew(SHorizontalBox)
+                + SHorizontalBox::Slot().FillWidth(1.0f)
+                  [ SNew(STextBlock).Text(LOCTEXT("PortableProviderTitle", "Portable Plugin Providers"))
+                    .Font(FAppStyle::GetFontStyle("HeadingExtraSmall")) ]
+                + SHorizontalBox::Slot().AutoWidth()
+                  [ SNew(SButton).Text(LOCTEXT("PortableProviderRefresh", "Refresh Discovery"))
+                    .ToolTipText(LOCTEXT("PortableRefreshTip", "Validate Resources/Probe definitions from enabled plugins. No test runs during discovery."))
+                    .IsEnabled_Lambda([this]() { return !bRunning; })
+                    .OnClicked_Lambda([this]() { ProbePortable::Refresh(); Rebuild(); return FReply::Handled(); }) ] ]
+            + SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 6)
+              [ SNew(STextBlock).AutoWrapText(true)
+                .Text_Lambda([this]() { return FText::FromString(Feedback); }) ]
+            + SVerticalBox::Slot().FillHeight(1.0f)
+              [ SNew(SScrollBox)
+                + SScrollBox::Slot()
+                  [ SAssignNew(Contents, SVerticalBox) ] ] ] ];
+        Rebuild();
+    }
+
+private:
+    TSharedPtr<SVerticalBox> Contents;
+    FString Feedback = TEXT("Discovery only. Tests and Packs run only when you select Run.");
+    bool bRunning = false;
+
+    void Rebuild()
+    {
+        if (!Contents.IsValid()) { return; }
+        Contents->ClearChildren();
+        int32 TotalTests = 0, TotalPacks = 0;
+        for (const ProbePortable::FPortableProvider& Provider : ProbePortable::Providers())
+        {
+            TotalTests += Provider.Tests.Num(); TotalPacks += Provider.Packs.Num();
+            const FString Header = FString::Printf(TEXT("%s  |  v%s  |  %d tests  |  %d packs"),
+                *Provider.PluginName, *Provider.Version, Provider.Tests.Num(), Provider.Packs.Num());
+            Contents->AddSlot().AutoHeight().Padding(0, 7, 0, 3)
+            [ SNew(STextBlock).Text(FText::FromString(Header))
+                .Font(FAppStyle::GetFontStyle("NormalFontBold")) ];
+            for (const ProbePortable::FPortableTest& Test : Provider.Tests)
+            {
+                AddRunRow(Test.Name + TEXT("  [") + Test.Id + TEXT("]"), Test.Id, false,
+                    Test.Description.IsEmpty() ? TEXT("Portable read-only Test") : Test.Description);
+            }
+            for (const ProbePortable::FPortablePack& Pack : Provider.Packs)
+            {
+                AddRunRow(Pack.Name + TEXT("  [") + Pack.Id + TEXT("]"), Pack.Id, true,
+                    FString::Printf(TEXT("Pack of %d tests, %s"), Pack.TestIds.Num(),
+                        Pack.bStopOnFailure ? TEXT("Stop on Failure") : TEXT("Continue on Failure")));
+            }
+        }
+        for (const FString& Issue : ProbePortable::Diagnostics())
+        {
+            Contents->AddSlot().AutoHeight().Padding(3)
+            [ SNew(STextBlock).ColorAndOpacity(FLinearColor(1.f, .5f, .4f))
+                .AutoWrapText(true).Text(FText::FromString(TEXT("Provider issue: ") + Issue)) ];
+        }
+        if (ProbePortable::Providers().IsEmpty() && ProbePortable::Diagnostics().IsEmpty())
+        {
+            Contents->AddSlot().AutoHeight().Padding(4)
+            [ SNew(STextBlock).AutoWrapText(true)
+                .Text(LOCTEXT("NoPortableProviders", "No enabled plugins have a valid Resources/Probe/manifest.json. See Docs/PORTABLE_PROVIDER_SPEC_1.md.")) ];
+        }
+        if (!bRunning)
+        {
+            Feedback = FString::Printf(TEXT("%d provider(s), %d tests, %d packs. Discovery never executes tests."),
+                ProbePortable::Providers().Num(), TotalTests, TotalPacks);
+        }
+    }
+
+    void AddRunRow(const FString& Label, const FString& Id, bool bPack, const FString& Tip)
+    {
+        Contents->AddSlot().AutoHeight().Padding(3, 2)
+        [ SNew(SHorizontalBox)
+            + SHorizontalBox::Slot().FillWidth(1.0f).VAlign(VAlign_Center)
+              [ SNew(STextBlock).Text(FText::FromString(Label))
+                .ToolTipText(FText::FromString(Tip)) ]
+            + SHorizontalBox::Slot().AutoWidth()
+              [ SNew(SButton).Text(LOCTEXT("RunPortableDefinition", "Run"))
+                .IsEnabled_Lambda([this]() { return !bRunning; })
+                .ToolTipText(LOCTEXT("RunPortableTip", "Explicitly execute this portable definition using Probe's existing runner; no .uasset is created."))
+                .OnClicked_Lambda([this, Id, bPack]() { return Execute(Id, bPack); }) ] ];
+    }
+
+    FReply Execute(const FString& Id, bool bPack)
+    {
+        if (bRunning) { return FReply::Handled(); }
+        bRunning = true;
+        Feedback = TEXT("Running ") + Id;
+        const TWeakPtr<SProbePortableBrowser> Weak = SharedThis(this);
+        const auto Done = [Weak](TArray<Probe::FTestResult> Results)
+        {
+            if (const TSharedPtr<SProbePortableBrowser> Self = Weak.Pin())
+            {
+                Self->bRunning = false;
+                int32 Passed = 0, Failed = 0, Skipped = 0;
+                for (const Probe::FTestResult& Result : Results)
+                {
+                    Passed += Result.Status == Probe::EResultStatus::Passed ? 1 : 0;
+                    Failed += Result.Status == Probe::EResultStatus::Failed || Result.Status == Probe::EResultStatus::Error ? 1 : 0;
+                    Skipped += Result.Status == Probe::EResultStatus::Skipped ? 1 : 0;
+                    UE_LOG(LogTemp, Display, TEXT("Probe Portable %s: %s (%s)"),
+                        *Result.Id, Probe::StatusName(Result.Status), *Result.Detail);
+                }
+                Self->Feedback = FString::Printf(TEXT("Run complete: %d passed, %d failed/errors, %d skipped. Details in Output Log (Probe Portable)."),
+                    Passed, Failed, Skipped);
+            }
+        };
+        FString Error;
+        const bool bAccepted = bPack
+            ? ProbePortable::RunPack(Id, Done, Error)
+            : ProbePortable::RunTest(Id, Done, Error);
+        if (!bAccepted) { bRunning = false; Feedback = Error; }
+        return FReply::Handled();
+    }
+};
+
+static void ProbePortableConsoleRun(const TArray<FString>& Args, bool bPack)
+{
+    if (Args.Num() != 1)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("Usage: Probe.Portable.RunTest <Provider.TestId> / Probe.Portable.RunPack <Provider.PackId>"));
+        return;
+    }
+    FString Error;
+    auto Done = [](TArray<Probe::FTestResult> Results)
+    {
+        for (const Probe::FTestResult& Result : Results)
+        {
+            UE_LOG(LogTemp, Display, TEXT("Probe Portable %s => %s: %s"),
+                *Result.Id, Probe::StatusName(Result.Status), *Result.Detail);
+        }
+    };
+    const bool bAccepted = bPack
+        ? ProbePortable::RunPack(Args[0], Done, Error)
+        : ProbePortable::RunTest(Args[0], Done, Error);
+    if (!bAccepted) { UE_LOG(LogTemp, Error, TEXT("Probe Portable: %s"), *Error); }
+}
+
+static void ProbePortableConsoleRunTest(const TArray<FString>& Args)
+{ ProbePortableConsoleRun(Args, false); }
+static void ProbePortableConsoleRunPack(const TArray<FString>& Args)
+{ ProbePortableConsoleRun(Args, true); }
+
 class FProbeEditorModule : public IModuleInterface
 {
 public:
@@ -7041,12 +7965,32 @@ public:
             TEXT("Run deterministic Probe Self-Test Smoke cases, verify all outcomes independently, and write a JSON report under Saved/Probe/SelfTests."),
             FConsoleCommandDelegate::CreateStatic(&Probe::RunSelfTestConsoleCommand),
             ECVF_Default);
+        // Probe manages registration. Other plugins only ship optional JSON files.
+        ProbePortable::Refresh();
+        IConsoleManager::Get().RegisterConsoleCommand(TEXT("Probe.Portable.Refresh"),
+            TEXT("Refresh dependency-free Resources/Probe JSON provider discovery; never executes tests."),
+            FConsoleCommandDelegate::CreateStatic(&ProbePortable::Refresh), ECVF_Default);
+        IConsoleManager::Get().RegisterConsoleCommand(TEXT("Probe.Portable.RunTest"),
+            TEXT("Explicitly run a portable JSON Test by namespaced ID."),
+            FConsoleCommandWithArgsDelegate::CreateStatic(&ProbePortableConsoleRunTest), ECVF_Default);
+        IConsoleManager::Get().RegisterConsoleCommand(TEXT("Probe.Portable.RunPack"),
+            TEXT("Explicitly run a portable JSON Pack by namespaced ID."),
+            FConsoleCommandWithArgsDelegate::CreateStatic(&ProbePortableConsoleRunPack), ECVF_Default);
         RegisterAssetAppearance();
 
         // Record only Probe assets affected by Undo/Redo. The post-transaction callback
         // restores package dirtiness after the engine has restored transaction package flags.
         FCoreUObjectDelegates::OnObjectTransacted.AddRaw(this, &FProbeEditorModule::OnObjectTransacted);
         FEditorDelegates::PostUndoRedo.AddRaw(this, &FProbeEditorModule::OnPostUndoRedo);
+        FGlobalTabmanager::Get()->RegisterNomadTabSpawner(Probe::PortableTabId,
+            FOnSpawnTab::CreateLambda([](const FSpawnTabArgs&)
+            {
+                return SNew(SDockTab).TabRole(ETabRole::NomadTab)
+                    [ SNew(SProbePortableBrowser) ];
+            }))
+            .SetDisplayName(LOCTEXT("ProbePortableTabName", "Probe Providers"))
+            .SetIcon(FSlateIcon(TEXT("ProbeAssetAppearance"), TEXT("Probe.TabIcon")))
+            .SetMenuType(ETabSpawnerMenuType::Hidden);
         FGlobalTabmanager::Get()->RegisterNomadTabSpawner(Probe::PackTabId,
             FOnSpawnTab::CreateRaw(this, &FProbeEditorModule::SpawnPackTab))
             .SetDisplayName(LOCTEXT("PacksTabName", "Probe Packs"))
@@ -7062,6 +8006,10 @@ public:
 
     virtual void ShutdownModule() override
     {
+        ProbePortable::Clear();
+        IConsoleManager::Get().UnregisterConsoleObject(TEXT("Probe.Portable.Refresh"), false);
+        IConsoleManager::Get().UnregisterConsoleObject(TEXT("Probe.Portable.RunTest"), false);
+        IConsoleManager::Get().UnregisterConsoleObject(TEXT("Probe.Portable.RunPack"), false);
         IConsoleManager::Get().UnregisterConsoleObject(TEXT("Probe.SelfTest"), false);
         IConsoleManager::Get().UnregisterConsoleObject(TEXT("Probe.GenerateTemplateTests"), false);
         for (const FName Id : Probe::GetExtensionTemplateIds())
@@ -7077,6 +8025,7 @@ public:
             UToolMenus::UnRegisterStartupCallback(this);
             UToolMenus::UnregisterOwner(this);
         }
+        FGlobalTabmanager::Get()->UnregisterNomadTabSpawner(Probe::PortableTabId);
         FGlobalTabmanager::Get()->UnregisterNomadTabSpawner(Probe::PackTabId);
         FGlobalTabmanager::Get()->UnregisterNomadTabSpawner(Probe::TabId);
         if (AssetStyle.IsValid())
@@ -7400,6 +8349,18 @@ private:
             {
                 FGlobalTabmanager::Get()->TryInvokeTab(Probe::TabId);
             })));
+
+        Section.AddMenuEntry("OpenProbeQABrowser", LOCTEXT("OpenProbeQABrowser", "Probe QA Browser"),
+            LOCTEXT("OpenProbeQABrowserTip", "Search Test Assets and Packs and inspect authoring readiness without executing tests."),
+            FSlateIcon(TEXT("ProbeAssetAppearance"), TEXT("Probe.TabIcon")),
+            FUIAction(FExecuteAction::CreateLambda([]() { ProbeDev15::OpenBrowser(); })));
+
+        Section.AddMenuEntry("OpenProbePortableProviders",
+            LOCTEXT("OpenProbePortableProviders", "Probe Providers"),
+            LOCTEXT("OpenProbePortableProvidersTip", "Discover and explicitly run portable JSON Tests/Packs shipped by enabled plugins in Resources/Probe, without a Probe dependency."),
+            FSlateIcon(TEXT("ProbeAssetAppearance"), TEXT("Probe.TabIcon")),
+            FUIAction(FExecuteAction::CreateLambda([]()
+            { FGlobalTabmanager::Get()->TryInvokeTab(Probe::PortableTabId); })));
 
         if (UToolMenu* PackAssetMenu = UE::ContentBrowser::ExtendToolMenu_AssetContextMenu(UProbeTestPack::StaticClass()))
         {

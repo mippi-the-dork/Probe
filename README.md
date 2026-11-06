@@ -1,10 +1,91 @@
+# Probe 0.15.4-dev17
+
+## Dev 17: Dependency-free JSON Provider API
+
+**Verified baseline:** Dev 16 built and passed **93/93 native Probe Automation Framework tests**, and manual checks of Groups, Recipes, workspace and Results succeeded. Dev 17 adds **10 native tests** for **103 expected Probe tests**. It remains **source-validated only** until a UE 5.8.3 build and Editor/manual checks pass.
+
+- **Optional `Resources/Probe` folder:** Enabled plugins can provide a versioned `manifest.json` and declarative assertion, template, Test and Pack JSON files, without linking to or requiring Probe. When Probe is absent, these files are inert.
+- **Automatic discovery with diagnostics:** Probe scans enabled plugins when its editor module starts and on explicit Refresh. Unsupported schema versions, unsafe file paths, missing definitions, duplicate IDs and cross-provider references are rejected before registration. Discovery does not execute tests.
+- **Portable execution:** JSON Tests and Packs run through the existing Probe runner as transient in-memory Test Assets. No `.uasset` is generated, and portable Tests are not automatically mixed into Run All.
+- **Provider assertions:** Built-in assertion aliases and optional explicitly marked `ProbeReadOnly` reflected native checks, limited to an exact static signature and owning plugin module. This is not an arbitrary function invocation API.
+- **Unreal Editor interface:** **Tools > Testing > Probe Providers** lists providers, validation issues, Tests and Packs with explicit **Run** controls. Console equivalents: `Probe.Portable.Refresh`, `Probe.Portable.RunTest <ID>`, `Probe.Portable.RunPack <ID>`.
+- **Independent QA:** Native tests for JSON validation, path sandboxing, provider ownership, forbidden input, missing references, malformed JSON, transient execution, duplicate definitions, and inert reflection declarations.
+
+**Safety/scope:** Provider v1 is **read-only**. Mutating actions, provider-owned async operations, fixtures and permissions need the separate Dev 18 contract. Built-in `UProbeTestAsset`/`UProbeTestPack` formats and enum ordinal values remain unchanged, and no other plugins have Probe dependencies or test migrations. No UE compilation was performed here.
+
+Docs: [Portable Provider Specification](Docs/PORTABLE_PROVIDER_SPEC_1.md), [Dev 17 QA Checklist](Docs/QA_CHECKLIST_0154_DEV17.md), [Design Decisions](Docs/DEV17_DESIGN_DECISIONS.md), [Standalone Example Provider](Examples/ProbeExampleProvider/).
+
+---
+
+# Probe 0.15.4-dev16
+
+## Dev 16: Workspace & Authoring UX Overhaul
+
+**Verified baseline:** Dev 15 Hotfix 1 built in UE 5.8.3 and all **84 native Probe Automation Framework tests** passed, alongside successful manual QA of the Dev 15 workspace. Dev 16 adds **9 native tests**, for **93 expected Probe tests**. This new package requires an Unreal compile and Editor manual verification before acceptance.
+
+- **Unified recipes:** The **Recipes** menu now lists both built-in and project-saved recipes, with Save Selection as Recipe and Browse & Manage Recipes. The former "Save Group" control was saving a recipe, but storing it under a separate "Insert Saved" list. Both categories now live together. The existing project-local JSON format remains unchanged.
+- **Recipe Browser:** Search, read-only preview, insert, rename, duplicate and delete saved recipes. Built-in recipes are immutable. Name/path validation, collision guards and deletion confirmation are retained. Saved recipes never grant execution permissions.
+- **Actual group headers:** Contiguous named groups have expandable headers and context-sensitive Group Actions for rename, copy, duplicate, run and Save Group as Recipe. No Test/Pack asset migration.
+- **Contextual authoring:** Each Test step keeps its select/Enabled controls and displays secondary actions under a single `...` menu. Multi-step editing appears only when the user selects steps; Preflight, Recipes, Group Outline and Step Finder are organized around the Steps heading.
+- **Compact overview:** Readiness, step count, enabled state and authorization are visible without the long workflow settings block. Expand Overview & Workflow Settings for the original controls.
+- **Flexible diagnostics:** Results is a resizable pane that collapses to one status strip while idle and expands when execution starts. JSON export and Rerun Problems are in the Results header. Live progress is visible while running.
+- **Native navigation:** Related toolbar navigation is grouped together. Ctrl+F focuses Step Finder when the Probe workspace receives the shortcut.
+
+**Safety:** No changes to serialized Test or Pack structures, runtime authorization, history, runner, existing assertions/templates or other plugins. Source-only offline gates pass; no local UE compilation was performed.
+
+Docs: [Dev 16 Guide](Docs/WORKSPACE_AND_RECIPES_0154_DEV16.md), [Dev 16 QA Checklist](Docs/QA_CHECKLIST_0154_DEV16.md), [1.0 Readiness Audit](Docs/PROBE_1_0_READINESS_AUDIT.md).
+
+---
+
+# Probe 0.15.4-dev15-hotfix1
+
+**Hotfix 1 (UE 5.8.3):** Corrected the Step Finder `SSearchBox` construction. The UE 5.8 widget does not expose a `.Text` Slate argument; Probe now restores its search text via `SetText()` after building the widget. No Test/Pack asset serialization or runner behavior was changed.
+
+## Dev 15: Project QA Browser & Workflow Authoring
+
+**Verified baseline:** Dev 14 Hotfix 1 compiled successfully in UE 5.8.3, passed **73/73 Probe native Automation Framework tests**, and passed the user's manual verification. Dev 15 adds **11 native tests**, bringing the expected suite to **84**, and requires fresh UE compilation and Editor verification.
+
+- **QA Browser:** Unified searchable Test Asset and Pack inventory, Tools > Testing > Probe QA Browser, also accessible from both existing workspaces. Uses Asset Registry metadata for initial discovery and reuses an existing window.
+- **Project readiness dashboard:** Explicit read-only Scan Visible / Scan Selected / Scan All, with Ready, Warnings, Blocked, Disabled and Not Scanned states, separate Test/Pack filtering, and useful per-asset diagnoses. Uses Dev 14's existing preflight so there is only one authoring policy.
+- **Batch QA workflows:** Select visible entries, inspect selected entries independently of filters, copy filtered investigations, export CSV, open in the appropriate workspace, and optionally execute only explicitly selected, previously scanned Ready Test Assets.
+- **Test Step Finder and Group Outline:** Live search by assertion, target, group, expected value and description without modifying step order, plus direct group navigation.
+- **Saved reusable recipes:** Save a contiguous group of steps under a project-local name; insert in other Test Assets as a single undoable edit. Insertion always sets Needs Configuration for review and never copies permissions. Uses the existing versioned ProbeStepGroup/1 JSON format under `Saved/Probe/Recipes/`.
+- **1.0 readiness audit:** A release-blocker checklist separated from work best scheduled after 1.0.
+
+No changes to serialized Test/Pack structures, runtime permissions, existing history format or engine source. Tests use only Unreal's native Automation Framework. Initial asset discovery is metadata-only; requested preflight can load assets but never executes test steps.
+
+Documentation: [Dev 15 Guide](Docs/QA_BROWSER_AND_WORKFLOWS_0154_DEV15.md), [QA Checklist](Docs/QA_CHECKLIST_0154_DEV15.md), [1.0 Readiness Audit](Docs/PROBE_1_0_READINESS_AUDIT.md).
+
+---
+
+# Probe 0.15.4-dev14
+
+## Dev 14: Test Authoring & Execution
+
+**Baseline:** Dev 13 Hotfix 2 was compiled and verified in Unreal Engine 5.8.3: 65/65 native Probe tests, plus 3 external Metric/Orbit tests; the History Browser manual UI checks also passed. This Dev 14 source package has **73 registered native Probe tests** and requires a fresh UE 5.8.3 build and test run.
+
+This pass adds six authoring/execution improvements without changing serialized UProbeTestAsset/UProbeTestPack structures or existing enum values:
+
+- **Full Test Preflight**: read-only validation of required fields, enabled/disabled steps, explicit UI/actor permissions, named lifecycle blocks, and enabled parameter variations. The existing configuration validator was shared rather than duplicated. Preflight reports reasons; it does not execute or automatically authorize anything.
+- **Bulk Step Editing**: independently select steps (not the same as enabled), select all/none, toggle enabled state, move selected blocks, duplicate, remove with confirmation, and assign group names. Mutations are one native Unreal undo transaction per action. Duplicate and selection limits are checked before editing.
+- **Reusable Test Recipes**: append ready-to-customize multi-step Plugin Health, Editor State, Read-Only UI, and Transient Fixture patterns. The Test is automatically marked Needs Configuration for author review. Existing permissions are never changed. Recipes cannot be appended behind an existing Cleanup lifecycle block.
+- **Live Execution Monitor**: native Slate progress bar and status showing the current test, step count, elapsed time, completed test count, problem count, and stop-after-test request. Progress notifications are supplied by the same async runner as the native UI automation. Completion is still handled on the Editor thread.
+- **Jump to First Failure**: from Results, open the first failed/errored step and scroll the Test Definition to it. Existing individual Edit Step buttons remain.
+- **Pack Readiness Overview**: preview dependency-order validity, missing Test references, member configuration and authorization, and safe retry eligibility before execution. Existing Pack run behavior is unchanged, even for legacy Packs.
+
+No new persistent formats, new plugin dependencies, or external automation drivers. Probe tests continue to use Unreal Engine's native Automation Framework.
+
+See [Dev 14 User Guide](Docs/TEST_AUTHORING_AND_EXECUTION_0154_DEV14.md) and [Dev 14 QA Checklist](Docs/QA_CHECKLIST_0154_DEV14.md).
+
+---
+
 # Probe 0.15.4-dev13-hotfix2
 
 ## Dev 13 Hotfix 2: native recurring-failure fixture safety
 
 Fixes the UE 5.8.3 Editor crash in `Probe.Editor.Dev13RecurringFailures` caused by passing `First.Results[0]` directly into `First.Results.Add(...)`. UE detects the source object is owned by the same `TArray` being modified and asserts before the test can complete. The fixture now makes a standalone `FTestResult` copy before insertion, preserving the two-failures-in-one-run test scenario. Also guards index-based inspection of generated comparison/incident arrays so an unexpected zero-result condition reports an Automation Framework failure rather than crashing.
 
-Adds an independent offline source gate (`Tools/ValidateProbeArrayAliasing.py`) to catch same-container `Add`/`Emplace`/`Insert` patterns in native automation fixture source, with positive and negative self-checks. All 65 existing native tests remain registered; production History Browser, history storage, Test Assets, Packs and runner logic are unchanged. Dev 13 Hotfix 1 built and its Browser construction test passed in UE 5.8.3. **Dev 13 full-suite runtime verification is pending a Hotfix 2 retest.** See [Dev 13 Hotfix 2 QA](Docs/QA_CHECKLIST_0154_DEV13_HOTFIX2.md).
+Adds an independent offline source gate (`Tools/ValidateProbeArrayAliasing.py`) to catch same-container `Add`/`Emplace`/`Insert` patterns in native automation fixture source, with positive and negative self-checks. All 65 existing native tests remain registered; production History Browser, history storage, Test Assets, Packs and runner logic are unchanged. Dev 13 Hotfix 1 built and its Browser construction test passed in UE 5.8.3. **Dev 13 Hotfix 2 was subsequently verified: 65/65 native Probe tests plus the History Browser manual checks.** See [Dev 13 Hotfix 2 QA](Docs/QA_CHECKLIST_0154_DEV13_HOTFIX2.md).
 
 # Probe 0.15.4-dev13-hotfix1
 

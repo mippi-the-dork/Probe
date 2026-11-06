@@ -1,0 +1,10 @@
+{
+  "format": "ProbeAssertion/1",
+  "id": "ProbeExampleProvider.NativeCheck",
+  "name": "Native reflected read-only check",
+  "category": "Example Provider",
+  "description": "A native static read-only UFUNCTION exposed by the example plugin itself.",
+  "kind": "reflected-readonly",
+  "class": "/Script/ProbeExampleProviderEditor.ProbeExampleProviderChecks",
+  "function": "CheckExpectedPlugin"
+}
