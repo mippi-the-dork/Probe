@@ -1,3 +1,59 @@
+# Probe 0.15.4-dev20
+
+## Dev 20: Unified Test Library in the main Probe workspace
+
+**Verified baseline:** Dev 19 Hotfix 1 compiled and passed **127/127 Probe native tests**. Its provider and authored JSON/manual integration tests passed. Dev 20 adds **9 new native tests (136 expected)** and is **source-validated only** until a new Unreal build and manual UI verification.
+
+- **Main workspace Test Library:** source-aware search, source filter, safe scrolling/200-row cap, persistent collapsed state, inspect and Run Selection for **authored Test Assets, authored Packs, portable Tests/Packs and native Unreal Automation tests**.
+- **Authored Test/Pack:** existing asset editing, queue, Pack policies, Results Explorer and History remain unchanged. **Run All Authored** explicitly excludes native and portable tests.
+- **Portable Test/Pack:** run directly from the main Probe tab; action-bearing definitions require per-run confirmation and can be cancelled. Actual portable step results feed Probe's Results Explorer and optional History, plus the existing `ProbePortableReport/1` output.
+- **Native Unreal Automation:** discover test names through the engine and submit selected names to Unreal's `Automation RunTests`; **actual native results remain in Tools > Test Automation** until a controller-aware results bridge is built. Probe does not invent native PASS results.
+- **Providers window:** remains the place for JSON authoring, validation, import/export, and debugging; it is no longer required for routine portable execution.
+- **No saved-format changes:** current Probe assets and `Resources/Probe` JSON remain unchanged; independent plugins still have no Probe dependency.
+
+See [Dev 20 Unified Workspace](Docs/DEV20_UNIFIED_WORKSPACE.md), [Dev 20 QA Checklist](Docs/QA_CHECKLIST_0154_DEV20.md), and [Dev 20 Design Decisions](Docs/DEV20_DESIGN_DECISIONS.md).
+
+**Known pre-1.0 work:** import authoritative Unreal Automation results into Probe History and design mixed-source Packs before claiming fully unified reporting/scheduling.
+
+---
+
+# Probe 0.15.4-dev19
+
+## Dev 19: Portable Provider Authoring, Validation & Reporting
+
+**Verified baseline:** Dev 18 Hotfix 2 compiled in UE 5.8.3 and passed **115/115 Probe native tests**. Its separate `ProbeExampleProvider` passed fixture lifecycle (3 steps) and both Tests in the authorized Actions Pack. Dev 19 adds **12 new native tests (127 expected)** and requires fresh UE compilation and manual verification.
+
+- **Provider authoring:** Generate validated `Resources/Probe` starter folders (manifest, read-only assertion alias, Template, Test, Pack) under the project Saved directory; no external plugin is automatically modified or made dependent on Probe.
+- **Provider Browser:** Search; per-plugin Validate; Preview Tests/Packs with step source, authorizations and Pack order; edit JSON via the associated local editor; copy unchanged source definitions to Saved/Probe/DefinitionExports.
+- **Portable Test import/export:** Import read-only Tests as disabled Needs Review Test Assets under `/Game/Probe/Imported`. Export read-only built-in Test Assets to a new, self-contained JSON provider draft, validated using the same UE loader. Unsafe or ambiguous exports are rejected, not silently rewritten. Privileged action Tests remain portable-only.
+- **Developer console:** `Probe.Portable.Validate`, `Probe.Portable.CreateStarter`, `Probe.Portable.ImportTest`, and `Probe.Portable.ExportAsset`.
+- **Machine-readable portable reports:** Versioned `ProbePortableReport/1` JSON saved under `Saved/Probe/PortableReports` after explicit runs, including Test/Pack outcomes and step evidence. Presentation distinguishes deliberate cancellation from ordinary failure, preserving raw engine status.
+- **Native automation:** New tests for starter contracts, validation/round-trip, privilege isolation, reporting, persistence, and definition exports. No change to Test/Pack asset serialization, permission defaults, third-party plugin dependencies, or existing assertions/templates.
+
+Docs: [Provider Authoring](Docs/PROVIDER_AUTHORING_DEV19.md), [Portable Reports](Docs/PORTABLE_REPORTS_DEV19.md), [Dev 19 QA Checklist](Docs/QA_CHECKLIST_0154_DEV19.md), [Design Decisions](Docs/DEV19_DESIGN_DECISIONS.md), [Provider v1 contract](Docs/PORTABLE_PROVIDER_SPEC_1.md) and [Dev 18 Actions](Docs/PORTABLE_ACTIONS_DEV18.md).
+
+**Current status:** Source package only. The UE 5.8.3 build and Dev 19 interaction/regression tests are pending.
+
+---
+
+# Probe 0.15.4-dev18-hotfix1
+
+## Dev 18: Authorized Portable Actions, Async Providers & Cleanup
+
+**Verified baseline:** Dev 17 built in UE 5.8.3, passed **103/103 native Probe tests**, and successfully discovered/executed the independent `ProbeExampleProvider` Test and Pack. Dev 18 adds **12 native tests** for **115 expected Probe tests**; the Dev 18 package remains source-validated only until an Unreal build and manual action execution pass.
+
+- **Optional action definitions:** A providing plugin can ship `Resources/Probe/Actions/*.json`, referenced by the existing `ProbeProvider/1` manifest. It still does not include or link Probe. Ordinary Dev 17 JSON providers remain compatible.
+- **Explicit run authorization:** Read-only `RunTest`/`RunPack` commands reject action-bearing definitions. New `RunTestActions`/`RunPackActions` commands and a confirmation in the Provider Browser authorize the requested run only. Saved Test Assets cannot acquire these transient permissions.
+- **Test-owned fixtures:** JSON `native-fixture` actions map only to a narrow allow-list of existing Probe managed UObject/Actor fixture operations. Actor fixtures may mark an Editor level dirty; no arbitrary live input or global-selection actions are exposed.
+- **Provider-specific native actions:** `reflected-action` requires a provider-owned native static UFUNCTION with `ProbeActionStart` metadata and a separate mandatory `ProbeActionCleanup` hook, validated before invocation. The plugin's own code must restrict side effects to reversible/test-owned state.
+- **Asynchronous providers:** `reflected-async` adds required Poll and Cancel hooks, 100 ms game-thread polling, bounded timeouts and cooperative `Probe.Portable.Cancel` requests. Cleanup is attempted even after failure, timeout, and cancellation; cleanup errors fail the test.
+- **Provider Browser/diagnostics:** Lists action counts, makes action runs distinct, supports cancellation and prints summary/diagnostic details on Refresh. No test executes during discovery.
+- **Independent sample:** `Examples/ProbeExampleProvider` includes JSON-only fixture actions and a native async sample that compiles with no Probe module dependency.
+
+**Documentation:** [Portable Actions Contract](Docs/PORTABLE_ACTIONS_DEV18.md), [Dev 18 QA Checklist](Docs/QA_CHECKLIST_0154_DEV18.md), [Dev 18 Design Decisions](Docs/DEV18_DESIGN_DECISIONS.md). This is still a **provisional pre-1.0 integration API**, not a native C++ security sandbox or release compatibility guarantee. Existing independent native Automation Framework tests remain required for other plugins.
+
+---
+
 # Probe 0.15.4-dev17
 
 ## Dev 17: Dependency-free JSON Provider API

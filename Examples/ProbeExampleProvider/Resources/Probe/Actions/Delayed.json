@@ -1,0 +1,13 @@
+{
+  "format": "ProbeAction/1",
+  "id": "ProbeExampleProvider.DelayedCheck",
+  "name": "Delayed provider check",
+  "kind": "reflected-async",
+  "permission": "provider-action",
+  "class": "/Script/ProbeExampleProviderEditor.ProbeExampleProviderChecks",
+  "startFunction": "BeginDelayedCheck",
+  "pollFunction": "PollDelayedCheck",
+  "cancelFunction": "CancelDelayedCheck",
+  "cleanupFunction": "CleanupDelayedCheck",
+  "description": "Exercises asynchronous polling, cancellation and guaranteed cleanup of a temporary in-memory token."
+}

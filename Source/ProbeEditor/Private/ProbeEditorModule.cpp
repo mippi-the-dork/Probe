@@ -17,6 +17,8 @@
 #include "ProbeDev14Authoring.h"
 #include "ProbeExtensions.h"
 #include "ProbePortableProviders.h"
+#include "ProbeDev19Authoring.h"
+#include "ProbeDev20Catalog.h"
 #include "ProbeSelfTest.h"
 #include "ProbeTestAssetFactory.h"
 #include "ProbeTestPack.h"
@@ -36,6 +38,7 @@
 #include "ContentBrowserModule.h"
 #include "IContentBrowserSingleton.h"
 #include "Misc/ConfigCacheIni.h"
+#include "Misc/App.h"
 #include "Misc/MessageDialog.h"
 #include "LevelEditor.h"
 #include "AssetRegistry/AssetRegistryModule.h"
@@ -63,6 +66,7 @@
 #include "Widgets/Text/STextBlock.h"
 #include "Widgets/Input/SButton.h"
 #include "Widgets/Input/SComboBox.h"
+#include "Widgets/Views/SListView.h"
 #include "Widgets/Input/SEditableTextBox.h"
 #include "Widgets/Input/SMultiLineEditableTextBox.h"
 #include "Widgets/Input/SCheckBox.h"
@@ -76,6 +80,7 @@
 #include "Framework/Application/SlateApplication.h"
 #include "Misc/PackageName.h"
 #include "HAL/PlatformTime.h"
+#include "HAL/PlatformProcess.h"
 #include "Containers/Ticker.h"
 #include "InputCoreTypes.h"
 #include "ScopedTransaction.h"
@@ -93,6 +98,7 @@
 #include "Misc/Paths.h"
 #include "Misc/DateTime.h"
 #include "Misc/EngineVersion.h"
+#include "Misc/AutomationTest.h"
 #include "HAL/FileManager.h"
 #include "HAL/IConsoleManager.h"
 #include "Misc/Crc.h"
@@ -2182,6 +2188,182 @@ private:
     FOnClicked DoubleClicked;
 };
 
+// Dev 20: source-aware inventory. The catalog never instantiates portable assets or
+// directly executes native Automation tests. Its host controls execution and results.
+DECLARE_DELEGATE_OneParam(FOnProbeCatalogEntry, const ProbeDev20::FEntry&);
+
+class SProbeUnifiedCatalog : public SCompoundWidget
+{
+public:
+    SLATE_BEGIN_ARGS(SProbeUnifiedCatalog) {}
+        SLATE_EVENT(FOnProbeCatalogEntry, OnOpen)
+        SLATE_EVENT(FOnProbeCatalogEntry, OnRun)
+    SLATE_END_ARGS()
+
+    void Construct(const FArguments& Args)
+    {
+        OpenEntry = Args._OnOpen;
+        RunEntry = Args._OnRun;
+        ChildSlot
+        [ SNew(SVerticalBox)
+          + SVerticalBox::Slot().AutoHeight().Padding(3, 2, 3, 4)
+            [ SNew(SHorizontalBox)
+              + SHorizontalBox::Slot().FillWidth(1.f).VAlign(VAlign_Center)
+                [ SNew(SSearchBox).HintText(LOCTEXT("Dev20Search", "Search all Tests, Packs, provider IDs and native Automation..."))
+                  .OnTextChanged_Lambda([this](const FText& Value) { Query = Value.ToString(); Filter(); }) ]
+              + SHorizontalBox::Slot().AutoWidth().Padding(5,0,0,0)
+                [ SNew(SComboButton).ToolTipText(LOCTEXT("Dev20SourceFilterTip", "Choose which Test source to browse"))
+                  .OnGetMenuContent(this, &SProbeUnifiedCatalog::BuildSources)
+                  .ButtonContent()[ SNew(STextBlock).Text_Lambda([this]() { return FText::FromString(SourceFilter); }) ] ]
+              + SHorizontalBox::Slot().AutoWidth().Padding(5,0,0,0)
+                [ SNew(SButton).Text(LOCTEXT("Dev20Refresh", "Refresh Library"))
+                  .ToolTipText(LOCTEXT("Dev20RefreshTip", "Refresh read-only asset, portable provider and native Automation discovery"))
+                  .OnClicked_Lambda([this]() { ProbePortable::Refresh(); Refresh(); return FReply::Handled(); }) ]
+              + SHorizontalBox::Slot().AutoWidth().Padding(5,0,0,0)
+                [ SNew(SButton).Text(LOCTEXT("Dev20RunSelected", "Run Selection"))
+                  .IsEnabled_Lambda([this]() { return Selected.IsValid(); })
+                  .OnClicked_Lambda([this]() { RunSelection(); return FReply::Handled(); }) ] ]
+          + SVerticalBox::Slot().AutoHeight().Padding(4,0,4,3)
+            [ SNew(STextBlock).ColorAndOpacity(FSlateColor::UseSubduedForeground())
+              .Text_Lambda([this]() { return FText::FromString(FString::Printf(
+                  TEXT("%d definitions | %d matching | showing %d (first 200) | %s"),
+                  Entries.Num(), MatchCount, Visible.Num(), *SourceFilter)); }) ]
+          + SVerticalBox::Slot().FillHeight(1.f)
+            [ SNew(SBorder).BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder")).Padding(2)
+              [ SAssignNew(List, SListView<TSharedPtr<ProbeDev20::FEntry>>)
+                .ListItemsSource(&Visible)
+                .SelectionMode(ESelectionMode::Single)
+                .OnGenerateRow(this, &SProbeUnifiedCatalog::MakeRow)
+                .OnSelectionChanged(this, &SProbeUnifiedCatalog::SelectionChanged) ] ]
+          + SVerticalBox::Slot().AutoHeight().Padding(4,3,4,1)
+            [ SNew(SBox).HeightOverride(82.f)
+              [ SNew(SBorder).BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder")).Padding(5)
+                [ SNew(SScrollBox) + SScrollBox::Slot()
+                  [ SNew(STextBlock).AutoWrapText(true)
+                    .Text_Lambda([this]() { return FText::FromString(PreviewSelected()); }) ] ] ] ] ];
+        Refresh();
+    }
+
+    TSharedPtr<ProbeDev20::FEntry> Selection() const { return Selected; }
+    void ClearSelection()
+    {
+        Selected.Reset();
+        if (List.IsValid()) { List->ClearSelection(); }
+    }
+    void Refresh()
+    {
+        const FString Previous = Selected.IsValid() ? ProbeDev20::Identity(*Selected) : FString();
+        Entries.Reset();
+        for (ProbeDev20::FEntry& Entry : ProbeDev20::Discover())
+        { Entries.Add(MakeShared<ProbeDev20::FEntry>(MoveTemp(Entry))); }
+        Filter();
+        if (!Previous.IsEmpty())
+        {
+            const TSharedPtr<ProbeDev20::FEntry>* Matching = Visible.FindByPredicate(
+                [&Previous](const TSharedPtr<ProbeDev20::FEntry>& Entry)
+                { return Entry.IsValid() && ProbeDev20::Identity(*Entry) == Previous; });
+            if (Matching && List.IsValid()) { List->SetSelection(*Matching, ESelectInfo::Direct); }
+        }
+    }
+
+private:
+    static constexpr int32 MaxRows = 200;
+    FOnProbeCatalogEntry OpenEntry;
+    FOnProbeCatalogEntry RunEntry;
+    TArray<TSharedPtr<ProbeDev20::FEntry>> Entries;
+    TArray<TSharedPtr<ProbeDev20::FEntry>> Visible;
+    TSharedPtr<SListView<TSharedPtr<ProbeDev20::FEntry>>> List;
+    TSharedPtr<ProbeDev20::FEntry> Selected;
+    FString Query;
+    FString SourceFilter = TEXT("All");
+    int32 MatchCount = 0;
+
+    FString PreviewSelected() const
+    {
+        if (!Selected.IsValid())
+        { return TEXT("Select a definition for its source, steps and authorization requirements. Run Selection executes it through its owner."); }
+        if (Selected->Source == ProbeDev20::ESource::NativeAutomation)
+        { return TEXT("Unreal Automation: ") + Selected->Id + TEXT("\n") + Selected->Detail
+            + TEXT("\nExecution and result history are managed by Unreal's Automation controller. This does not create a Probe Test Asset or a synthetic result."); }
+        if (Selected->Source == ProbeDev20::ESource::AuthoredTest || Selected->Source == ProbeDev20::ESource::AuthoredPack)
+        { return FString(ProbeDev20::SourceName(Selected->Source)) + TEXT(": ") + Selected->Locator
+            + TEXT("\nAuthor directly in Probe; results are recorded in Probe History."); }
+        for (const ProbePortable::FPortableProvider& Provider : ProbePortable::Providers())
+        {
+            if (Selected->Source == ProbeDev20::ESource::PortableTest)
+            {
+                if (const ProbePortable::FPortableTest* Definition = Provider.Tests.FindByPredicate(
+                    [this](const ProbePortable::FPortableTest& Item) { return Item.Id == Selected->Id; }))
+                { return ProbeDev19::PreviewTest(Provider, *Definition); }
+            }
+            else if (Selected->Source == ProbeDev20::ESource::PortablePack)
+            {
+                if (const ProbePortable::FPortablePack* Definition = Provider.Packs.FindByPredicate(
+                    [this](const ProbePortable::FPortablePack& Item) { return Item.Id == Selected->Id; }))
+                { return ProbeDev19::PreviewPack(Provider, *Definition); }
+            }
+        }
+        return TEXT("Definition is no longer discoverable. Refresh Library.");
+    }
+
+    void Filter()
+    {
+        Visible.Reset();
+        MatchCount = 0;
+        for (const TSharedPtr<ProbeDev20::FEntry>& Entry : Entries)
+        {
+            if (Entry.IsValid() && ProbeDev20::Matches(*Entry, Query, SourceFilter))
+            {
+                ++MatchCount;
+                if (Visible.Num() < MaxRows) { Visible.Add(Entry); }
+            }
+        }
+        if (List.IsValid()) { List->RequestListRefresh(); }
+        if (!Visible.Contains(Selected)) { Selected.Reset(); }
+    }
+
+    TSharedRef<SWidget> BuildSources()
+    {
+        FMenuBuilder Menu(true, nullptr);
+        for (const FString& FilterValue : {
+            FString(TEXT("All")), FString(TEXT("Authored Test")), FString(TEXT("Authored Pack")),
+            FString(TEXT("Portable Test")), FString(TEXT("Portable Pack")), FString(TEXT("Unreal Automation"))})
+        {
+            Menu.AddMenuEntry(FText::FromString(FilterValue), FText::GetEmpty(), FSlateIcon(),
+                FUIAction(FExecuteAction::CreateLambda([this, FilterValue]()
+                { SourceFilter = FilterValue; Filter(); })));
+        }
+        return Menu.MakeWidget();
+    }
+
+    TSharedRef<ITableRow> MakeRow(TSharedPtr<ProbeDev20::FEntry> Entry,
+                                  const TSharedRef<STableViewBase>& Owner)
+    {
+        return SNew(STableRow<TSharedPtr<ProbeDev20::FEntry>>, Owner)
+        [ SNew(SHorizontalBox)
+          + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(5,1,8,1)
+            [ SNew(STextBlock).ColorAndOpacity(FSlateColor::UseSubduedForeground())
+              .Text(FText::FromString(ProbeDev20::SourceName(Entry->Source))) ]
+          + SHorizontalBox::Slot().FillWidth(1.f).VAlign(VAlign_Center)
+            [ SNew(STextBlock).Text(FText::FromString(Entry->Name)).ToolTipText(FText::FromString(Entry->Id)) ]
+          + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(4,1)
+            [ SNew(STextBlock).ColorAndOpacity(FSlateColor::UseSubduedForeground())
+              .Text(FText::FromString(Entry->Owner)) ]
+          + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(3,0)
+            [ SNew(STextBlock).ColorAndOpacity(FLinearColor(0.95f, 0.72f, 0.3f))
+              .Text(Entry->bRequiresAuthorization ? LOCTEXT("Dev20Actions", "Actions") : FText::GetEmpty()) ] ];
+    }
+    void SelectionChanged(TSharedPtr<ProbeDev20::FEntry> Entry, ESelectInfo::Type)
+    {
+        Selected = Entry;
+        if (Selected.IsValid()) { OpenEntry.ExecuteIfBound(*Selected); }
+    }
+    void RunSelection()
+    {
+        if (Selected.IsValid()) { RunEntry.ExecuteIfBound(*Selected); }
+    }
+};
+
 class SProbeWorkspace : public SCompoundWidget
 {
 public:
@@ -2194,6 +2376,7 @@ public:
         DefinitionFraction = FMath::Clamp(DefinitionFraction, 0.20f, 0.85f);
         GConfig->GetBool(TEXT("ProbeWorkspace"), TEXT("Dev16SettingsExpanded"), bDev16SettingsExpanded, GEditorPerProjectIni);
         GConfig->GetBool(TEXT("ProbeWorkspace"), TEXT("Dev16ResultsCollapsed"), bDev16ResultsCollapsed, GEditorPerProjectIni);
+        GConfig->GetBool(TEXT("ProbeWorkspace"), TEXT("Dev20LibraryExpanded"), bDev20LibraryExpanded, GEditorPerProjectIni);
         // Configurable project-local retention. Existing history remains untouched
         // when saving is disabled (0); Clear History is always explicit.
         GConfig->GetInt(TEXT("ProbeWorkspace"), TEXT("MaxSavedHistoryRuns"), MaxSavedHistoryRuns, GEditorPerProjectIni);
@@ -2256,6 +2439,11 @@ public:
                                 .ButtonContent()
                                 [ SNew(STextBlock).Text(LOCTEXT("Templates", "Templates")) ]
                             ]
+                            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0,0,4,0)
+                            [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
+                              .ToolTipText(LOCTEXT("Dev19ExportSelectedTip", "Export selected read-only Test Asset to a validated Resources/Probe JSON starter under Saved/Probe/PortableExports. Action and live-input assets are refused."))
+                              .OnClicked(this, &SProbeWorkspace::ExportSelectedPortableJson)
+                              [ SNew(STextBlock).Text(LOCTEXT("Dev19ExportSelected", "Portable JSON")) ] ]
                             + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
                             [
                                 SNew(SButton)
@@ -2305,23 +2493,25 @@ public:
                                 .ButtonStyle(FAppStyle::Get(), "SimpleButton")
                                 .ToolTipText(LOCTEXT("StopAfterCurrentTip", "Finish the current test then safely skip queued tests."))
                                 .Visibility_Lambda([this]() { return bRunInProgress ? EVisibility::Visible : EVisibility::Collapsed; })
-                                .IsEnabled_Lambda([this]() { return bRunInProgress && !bStopAfterCurrentTest; })
-                                .OnClicked(this, &SProbeWorkspace::StopAfterCurrentTest)
-                                [ SNew(STextBlock).Text(LOCTEXT("StopAfterCurrent", "Stop After Test")) ]
+                                .IsEnabled_Lambda([this]() { return bRunInProgress && (bPortableRun || !bStopAfterCurrentTest); })
+                                .OnClicked(this, &SProbeWorkspace::StopOrCancel)
+                                [ SNew(STextBlock).Text_Lambda([this]() { return bPortableRun
+                                    ? LOCTEXT("Dev20CancelPortable", "Cancel Portable Run")
+                                    : LOCTEXT("StopAfterCurrent", "Stop After Test"); }) ]
                             ]
                             + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(4, 0, 3, 0)
                             [
                                 SNew(SButton)
-                                .ToolTipText(LOCTEXT("RunAllTip", "Run every discovered Probe test"))
+                                .ToolTipText(LOCTEXT("RunAllTip", "Run all authored Probe Test Assets; use Test Library for portable and Unreal Automation Tests"))
                                 .OnClicked(this, &SProbeWorkspace::RunAll)
-                                [ SNew(STextBlock).Text(LOCTEXT("RunAll", "Run All")) ]
+                                [ SNew(STextBlock).Text(LOCTEXT("RunAll", "Run All Authored")) ]
                             ]
                             + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
                             [
                                 SNew(SButton)
-                                .IsEnabled(this, &SProbeWorkspace::HasSelectedAsset)
+                                .IsEnabled_Lambda([this]() { return HasSelectedAsset() || (UnifiedCatalog.IsValid() && UnifiedCatalog->Selection().IsValid()); })
                                 .AddMetaData(MakeShared<FDriverIdMetaData>(FName(TEXT("Probe.Workspace.RunSelected"))))
-                                .ToolTipText(LOCTEXT("RunSelectedTip", "Run the selected test without saving its unsaved edits"))
+                                .ToolTipText(LOCTEXT("RunSelectedTip", "Run selected Test Library entry, or the currently open authored Test if none is chosen"))
                                 .OnClicked(this, &SProbeWorkspace::RunSelected)
                                 [
                                     SNew(SHorizontalBox)
@@ -2335,6 +2525,19 @@ public:
                     ]
                 ]
             ]
+            + SVerticalBox::Slot().AutoHeight().Padding(7, 4, 7, 1)
+            [ SNew(SExpandableArea).InitiallyCollapsed(!bDev20LibraryExpanded)
+              .OnAreaExpansionChanged_Lambda([this](bool bExpanded)
+              { bDev20LibraryExpanded = bExpanded;
+                GConfig->SetBool(TEXT("ProbeWorkspace"), TEXT("Dev20LibraryExpanded"), bExpanded, GEditorPerProjectIni); })
+              .HeaderContent()
+                [ SNew(STextBlock).Text(LOCTEXT("Dev20LibraryTitle", "Test Library  |  Authored  •  Portable  •  Unreal Automation"))
+                  .Font(FAppStyle::GetFontStyle("NormalFontBold")) ]
+              .BodyContent()
+                [ SNew(SBox).HeightOverride(270.f)
+                  [ SAssignNew(UnifiedCatalog, SProbeUnifiedCatalog)
+                    .OnOpen(FOnProbeCatalogEntry::CreateSP(this, &SProbeWorkspace::OpenCatalogEntry))
+                    .OnRun(FOnProbeCatalogEntry::CreateSP(this, &SProbeWorkspace::RunCatalogEntry)) ] ] ]
             + SVerticalBox::Slot().AutoHeight().Padding(8, 7, 8, 6)
             [
                 SNew(SVerticalBox)
@@ -2342,7 +2545,7 @@ public:
                 [
                     SNew(SHorizontalBox)
                     + SHorizontalBox::Slot().FillWidth(1.0f).VAlign(VAlign_Center)
-                    [ SNew(STextBlock).Text(LOCTEXT("SelectedTest", "Selected Test")) ]
+                    [ SNew(STextBlock).Text(LOCTEXT("SelectedTest", "Authored Test Editor")) ]
                     + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
                     [ SNew(STextBlock).Text(this, &SProbeWorkspace::DirtyStatusText) ]
                 ]
@@ -2632,6 +2835,7 @@ private:
     TArray<TSharedPtr<FAssetData>> Assets;
     TSharedPtr<FAssetData> Selected;
     TSharedPtr<SComboBox<TSharedPtr<FAssetData>>> TestSelector;
+    TSharedPtr<SProbeUnifiedCatalog> UnifiedCatalog;
     TSharedPtr<SVerticalBox> EditorRows;
     TSharedPtr<SScrollBox> DefinitionScroll;
     TMap<int32, TWeakPtr<SWidget>> StepRowWidgets;
@@ -2645,6 +2849,9 @@ private:
     TArray<int32> QueuedTestResultIndices;
     TMap<int32, Probe::FRunOptions> ScopedRunOptions;
     bool bRunInProgress = false;
+    bool bPortableRun = false;
+    bool bDev20LibraryExpanded = true;
+    bool bSelectingFromCatalog = false;
     bool bStopAfterCurrentTest = false;
     bool bStopDueToPackFailure = false;
     TStrongObjectPtr<UProbeTestPack> ActivePackForRun; // Retain policy asset until async queue drains.
@@ -2772,6 +2979,7 @@ private:
             TestSelector->SetSelectedItem(Selected);
         }
         RebuildTestEditor();
+        if (UnifiedCatalog.IsValid() && !bRunInProgress) { UnifiedCatalog->Refresh(); }
     }
 
 
@@ -5046,6 +5254,7 @@ private:
 
     void OnSelectionChanged(TSharedPtr<FAssetData> Item, ESelectInfo::Type)
     {
+        if (!bSelectingFromCatalog && UnifiedCatalog.IsValid()) { UnifiedCatalog->ClearSelection(); }
         Selected = Item;
         RebuildTestEditor();
         FeedbackMessage = LOCTEXT("SelectedHint", "Edit Steps here. Unsaved edits are retained when switching tests.");
@@ -5779,6 +5988,12 @@ private:
         if (!Results.IsValidIndex(SelectedResultIndex)) { return FReply::Handled(); }
         bResultsFocused = false;
         const FString Path = Results[SelectedResultIndex].AssetPath;
+        if (Path.StartsWith(TEXT("probe-json://")))
+        {
+            FGlobalTabmanager::Get()->TryInvokeTab(Probe::PortableTabId);
+            FeedbackMessage = LOCTEXT("Dev20PortableEdit", "Portable definitions are edited as Resources/Probe JSON. Use Probe Providers > Actions > Edit JSON; they are never modified through authored Test Assets.");
+            return FReply::Handled();
+        }
         for (const TSharedPtr<FAssetData>& Entry : Assets)
         {
             if (Entry.IsValid() && Entry->GetObjectPathString() == Path)
@@ -6458,8 +6673,148 @@ private:
         return FReply::Handled();
     }
 
+    void OpenCatalogEntry(const ProbeDev20::FEntry& Entry)
+    {
+        if (Entry.Source == ProbeDev20::ESource::AuthoredTest)
+        {
+            for (const TSharedPtr<FAssetData>& Item : Assets)
+            {
+                if (Item.IsValid() && Item->GetObjectPathString() == Entry.Locator)
+                {
+                    bSelectingFromCatalog = true;
+                    if (TestSelector.IsValid()) { TestSelector->SetSelectedItem(Item); }
+                    else { Selected = Item; RebuildTestEditor(); }
+                    bSelectingFromCatalog = false;
+                    break;
+                }
+            }
+        }
+        else if (Entry.Source == ProbeDev20::ESource::NativeAutomation)
+        {
+            FeedbackMessage = FText::FromString(TEXT("Native Automation test selected: ") + Entry.Id
+                + TEXT(". Run Selection delegates execution to Unreal's Automation system; results remain in its Automation panel."));
+        }
+        else
+        {
+            FeedbackMessage = FText::FromString(Entry.Name + TEXT(" | ") + Entry.Id
+                + (Entry.bRequiresAuthorization ? TEXT(" | Action authorization required on run") : TEXT(" | Read-only portable definition")));
+        }
+    }
+
+    void CompletePortableResults(const FString& Id, bool bPack, bool bActions, TArray<Probe::FTestResult> Completed)
+    {
+        bPortableRun = false;
+        bRunInProgress = false;
+        Results = MoveTemp(Completed);
+        ActiveResultFilter = EResultFilter::All;
+        SelectedResultIndex = INDEX_NONE;
+        LastComparison = ProbeDev10RunHistory::Compare(LastCompletedResults, Results);
+        LastCompletedResults = Results;
+        LastRunTime = FDateTime::Now();
+        LastRunDurationMs = 0.0;
+        bViewingSavedHistory = false;
+        for (const Probe::FTestResult& Item : Results) { LastRunDurationMs += Item.DurationMs; }
+        // Portable and authored runs share the same Results Explorer and saved
+        // history. Portable reports retain their existing richer JSON format.
+        if (MaxSavedHistoryRuns > 0 && !Results.IsEmpty())
+        {
+            ProbeDev11RunHistory::FSnapshot Snapshot;
+            Snapshot.TimestampUtc = FDateTime::UtcNow();
+            Snapshot.EngineVersion = FEngineVersion::Current().ToString();
+            Snapshot.PackPath = bPack ? TEXT("probe-json://") + Id : FString();
+            Snapshot.Results = Results;
+            if (!ProbeDev11RunHistory::Save(ProbeDev11RunHistory::DefaultDirectory(), Snapshot,
+                nullptr, MaxSavedHistoryRuns))
+            { UE_LOG(LogTemp, Warning, TEXT("Probe: failed to save portable run to unified history.")); }
+        }
+        FString ReportFile, Error;
+        const bool bSaved = ProbeDev19::SaveRunReport(Id, bPack, bActions, Results, ReportFile, Error);
+        FeedbackMessage = FText::FromString(TEXT("Portable ") + Id + TEXT(": ")
+            + ProbeDev19::Summarize(Results).ToString()
+            + (bSaved ? TEXT(" | Report: ") + ReportFile : TEXT(" | Report error: ") + Error));
+        ShowResults();
+    }
+
+    void RunCatalogEntry(const ProbeDev20::FEntry& Entry)
+    {
+        if (bRunInProgress)
+        {
+            FeedbackMessage = LOCTEXT("Dev20Busy", "A Probe run is already active. Cancel or finish it before starting another.");
+            return;
+        }
+        switch (Entry.Source)
+        {
+        case ProbeDev20::ESource::AuthoredTest:
+            RunAssetPaths({Entry.Locator});
+            return;
+        case ProbeDev20::ESource::AuthoredPack:
+            ExecutePackPath(Entry.Locator);
+            return;
+        case ProbeDev20::ESource::NativeAutomation:
+        {
+            // Unreal Automation owns test scheduling, events and result history.
+            // Do not record a fake PASS or build a synthetic Probe Test Asset.
+            const FString Command = TEXT("Automation RunTests ") + Entry.Locator;
+            const bool bIssued = GEditor && GLog && GEditor->Exec(GEditor->GetEditorWorldContext().World(), *Command, *GLog);
+            FeedbackMessage = FText::FromString(bIssued
+                ? TEXT("Submitted to Unreal Automation: ") + Entry.Locator
+                    + TEXT(". Inspect results in Tools > Test Automation (Sessions Frontend).")
+                : TEXT("Unreal Automation did not accept: ") + Entry.Locator);
+            return;
+        }
+        case ProbeDev20::ESource::PortableTest:
+        case ProbeDev20::ESource::PortablePack:
+        {
+            const bool bPack = Entry.Source == ProbeDev20::ESource::PortablePack;
+            const bool bActions = ProbePortable::RequiresAuthorization(Entry.Id, bPack);
+            if (bActions && FMessageDialog::Open(EAppMsgType::YesNo, EAppReturnType::No,
+                FText::FromString(FString::Printf(TEXT("Authorize portable %s '%s' to run provider actions?\n\nOnly approve trusted plugins. Cleanup is attempted, but arbitrary native code is not guaranteed reversible."),
+                bPack ? TEXT("Pack") : TEXT("Test"), *Entry.Id))) != EAppReturnType::Yes)
+            { return; }
+            bPortableRun = true;
+            bRunInProgress = true;
+            FeedbackMessage = FText::FromString(TEXT("Running portable definition: ") + Entry.Id);
+            const TWeakPtr<SProbeWorkspace> Weak = SharedThis(this);
+            const FString Id = Entry.Id;
+            const auto Done = [Weak, Id, bPack, bActions](TArray<Probe::FTestResult> Finished)
+            {
+                if (TSharedPtr<SProbeWorkspace> Self = Weak.Pin())
+                { Self->CompletePortableResults(Id, bPack, bActions, MoveTemp(Finished)); }
+            };
+            FString Error;
+            const bool bAccepted = bPack
+                ? ProbePortable::RunPack(Id, Done, Error, bActions)
+                : ProbePortable::RunTest(Id, Done, Error, bActions);
+            if (!bAccepted)
+            {
+                bPortableRun = false;
+                bRunInProgress = false;
+                FeedbackMessage = FText::FromString(TEXT("Portable execution rejected: ") + Error);
+            }
+            return;
+        }
+        }
+    }
+
+    FReply StopOrCancel()
+    {
+        if (bPortableRun)
+        {
+            FeedbackMessage = ProbePortable::RequestCancel()
+                ? LOCTEXT("Dev20CancelPending", "Cancellation requested. Provider cleanup remains active.")
+                : LOCTEXT("Dev20CancelMissing", "No active portable run to cancel.");
+            return FReply::Handled();
+        }
+        return StopAfterCurrentTest();
+    }
+
     FReply RunSelected()
     {
+        if (UnifiedCatalog.IsValid() && UnifiedCatalog->Selection().IsValid())
+        {
+            RunCatalogEntry(*UnifiedCatalog->Selection());
+            return FReply::Handled();
+        }
         if (bRunInProgress)
         {
             FeedbackMessage = LOCTEXT("ProbeRunAlreadyActive", "A Probe run is already in progress. Wait for it to finish before starting another.");
@@ -6504,6 +6859,15 @@ private:
 
     FReply RerunProblems()
     {
+        for (const Probe::FTestResult& Result : Results)
+        {
+            if (Result.AssetPath.StartsWith(TEXT("probe-json://"))
+                && (Result.Status == Probe::EResultStatus::Failed || Result.Status == Probe::EResultStatus::Error))
+            {
+                FeedbackMessage = LOCTEXT("Dev20PortableRerun", "Portable Tests require separate per-run authorization. Select the failed portable Test in Test Library and run it again; Probe will not silently convert or elevate it.");
+                return FReply::Handled();
+            }
+        }
         if (bRunInProgress)
         {
             FeedbackMessage = LOCTEXT("ProbeRunAlreadyActive", "A Probe run is already in progress. Wait for it to finish before starting another.");
@@ -6739,6 +7103,22 @@ private:
         LastComparison = ProbeDev10RunHistory::FComparison();
         FeedbackMessage = LOCTEXT("RunInProgress", "Running Probe tests. Native UI steps execute asynchronously; results are shown as they finish.");
         StartNextQueuedTest();
+    }
+
+    FReply ExportSelectedPortableJson()
+    {
+        const UProbeTestAsset* Asset = SelectedAsset();
+        if (!Asset)
+        { FeedbackMessage = LOCTEXT("Dev19ExportNoTest", "Select a Probe Test Asset to export."); return FReply::Handled(); }
+        // Authoring a *provider* requires an exact plugin name, not a friendly name.
+        // Use the project name for an independent draft. The resulting folder is
+        // never inserted into an installed plugin automatically.
+        FString Destination, Error;
+        const FString ProviderId = FApp::GetProjectName();
+        if (ProbeDev19::ExportReadOnlyTest(*Asset, ProviderId, Destination, Error))
+        { FeedbackMessage = FText::FromString(TEXT("Portable JSON exported: ") + Destination); }
+        else { FeedbackMessage = FText::FromString(TEXT("Portable JSON export refused: ") + Error); }
+        return FReply::Handled();
     }
 
     FReply ExportReport()
@@ -7788,6 +8168,8 @@ private:
 };
 
 // Dev 17: transparent read-only discovery and opt-in execution of plugin-shipped JSON.
+// Dev 19: one Provider Browser for discovery, diagnostics, previews, import,
+// source editing, JSON export and explicit authorized execution.
 class SProbePortableBrowser : public SCompoundWidget
 {
 public:
@@ -7798,123 +8180,308 @@ public:
         ChildSlot
         [ SNew(SBorder).BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder")).Padding(10)
           [ SNew(SVerticalBox)
-            + SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 8)
+            + SVerticalBox::Slot().AutoHeight().Padding(0,0,0,6)
               [ SNew(SHorizontalBox)
-                + SHorizontalBox::Slot().FillWidth(1.0f)
+                + SHorizontalBox::Slot().FillWidth(1.f).VAlign(VAlign_Center)
                   [ SNew(STextBlock).Text(LOCTEXT("PortableProviderTitle", "Portable Plugin Providers"))
                     .Font(FAppStyle::GetFontStyle("HeadingExtraSmall")) ]
-                + SHorizontalBox::Slot().AutoWidth()
-                  [ SNew(SButton).Text(LOCTEXT("PortableProviderRefresh", "Refresh Discovery"))
-                    .ToolTipText(LOCTEXT("PortableRefreshTip", "Validate Resources/Probe definitions from enabled plugins. No test runs during discovery."))
+                + SHorizontalBox::Slot().AutoWidth().Padding(3,0)
+                  [ SNew(SButton).Text(LOCTEXT("Dev19Starter", "New Provider Starter..."))
+                    .ToolTipText(LOCTEXT("Dev19StarterTip", "Generate validated, dependency-free JSON under Saved/Probe/ProviderStarters. Nothing is written to an installed plugin."))
+                    .OnClicked_Lambda([this]() { OpenStarterDialog(); return FReply::Handled(); }) ]
+                + SHorizontalBox::Slot().AutoWidth().Padding(3,0)
+                  [ SNew(SButton).Text(LOCTEXT("PortableProviderRefresh", "Validate & Refresh"))
+                    .ToolTipText(LOCTEXT("PortableRefreshTip", "Validate Resources/Probe definitions from enabled plugins; never execute tests during discovery."))
                     .IsEnabled_Lambda([this]() { return !bRunning; })
-                    .OnClicked_Lambda([this]() { ProbePortable::Refresh(); Rebuild(); return FReply::Handled(); }) ] ]
-            + SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 6)
+                    .OnClicked_Lambda([this]() { ProbePortable::Refresh(); Rebuild(); return FReply::Handled(); }) ]
+                + SHorizontalBox::Slot().AutoWidth().Padding(3,0)
+                  [ SNew(SButton).Text(LOCTEXT("PortableCancel", "Cancel Run"))
+                    .ToolTipText(LOCTEXT("PortableCancelTip", "Request cancellation at the next safe step boundary. Async actions receive cancellation callbacks and cleanup still runs."))
+                    .IsEnabled_Lambda([this]() { return bRunning; })
+                    .OnClicked_Lambda([this]() {
+                        if (ProbePortable::RequestCancel()) { Feedback = TEXT("Cancellation requested. Cleanup callbacks remain active."); }
+                        return FReply::Handled(); }) ] ]
+            + SVerticalBox::Slot().AutoHeight().Padding(0,0,0,5)
+              [ SNew(SSearchBox).HintText(LOCTEXT("Dev19SearchProviders", "Search providers, Tests, Packs, or IDs..."))
+                .OnTextChanged_Lambda([this](const FText& Text) { SearchText = Text.ToString(); Rebuild(); }) ]
+            + SVerticalBox::Slot().AutoHeight().Padding(0,0,0,6)
               [ SNew(STextBlock).AutoWrapText(true)
                 .Text_Lambda([this]() { return FText::FromString(Feedback); }) ]
-            + SVerticalBox::Slot().FillHeight(1.0f)
-              [ SNew(SScrollBox)
-                + SScrollBox::Slot()
-                  [ SAssignNew(Contents, SVerticalBox) ] ] ] ];
+            + SVerticalBox::Slot().FillHeight(1.f)
+              [ SNew(SSplitter).Orientation(Orient_Vertical)
+                + SSplitter::Slot().Value(.67f)
+                  [ SNew(SBorder).BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder")).Padding(4)
+                    [ SNew(SScrollBox) + SScrollBox::Slot() [ SAssignNew(Contents, SVerticalBox) ] ] ]
+                + SSplitter::Slot().Value(.33f)
+                  [ SNew(SBorder).BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder")).Padding(8)
+                    [ SNew(SScrollBox) + SScrollBox::Slot()
+                      [ SAssignNew(Preview, STextBlock).AutoWrapText(true)
+                        .Text(LOCTEXT("Dev19SelectPreview", "Select Preview on a Test or Pack to inspect steps, source and authorization requirements before running.")) ] ] ] ] ] ];
         Rebuild();
     }
 
 private:
     TSharedPtr<SVerticalBox> Contents;
-    FString Feedback = TEXT("Discovery only. Tests and Packs run only when you select Run.");
+    TSharedPtr<STextBlock> Preview;
+    FString SearchText;
+    FString Feedback = TEXT("No execution during discovery. Portable action permissions are always explicit per run.");
     bool bRunning = false;
+
+    bool Matches(const FString& Name, const FString& Id, const FString& ProviderName) const
+    {
+        return SearchText.IsEmpty() || Name.Contains(SearchText, ESearchCase::IgnoreCase)
+            || Id.Contains(SearchText, ESearchCase::IgnoreCase)
+            || ProviderName.Contains(SearchText, ESearchCase::IgnoreCase);
+    }
 
     void Rebuild()
     {
         if (!Contents.IsValid()) { return; }
         Contents->ClearChildren();
-        int32 TotalTests = 0, TotalPacks = 0;
+        int32 Visible = 0;
         for (const ProbePortable::FPortableProvider& Provider : ProbePortable::Providers())
         {
-            TotalTests += Provider.Tests.Num(); TotalPacks += Provider.Packs.Num();
-            const FString Header = FString::Printf(TEXT("%s  |  v%s  |  %d tests  |  %d packs"),
-                *Provider.PluginName, *Provider.Version, Provider.Tests.Num(), Provider.Packs.Num());
-            Contents->AddSlot().AutoHeight().Padding(0, 7, 0, 3)
-            [ SNew(STextBlock).Text(FText::FromString(Header))
-                .Font(FAppStyle::GetFontStyle("NormalFontBold")) ];
+            const bool bProviderMatches = SearchText.IsEmpty()
+                || Provider.PluginName.Contains(SearchText, ESearchCase::IgnoreCase)
+                || Provider.ProviderId.Contains(SearchText, ESearchCase::IgnoreCase);
+            bool bAny = bProviderMatches;
+            for (const ProbePortable::FPortableTest& Test : Provider.Tests)
+            { bAny |= Matches(Test.Name, Test.Id, Provider.PluginName); }
+            for (const ProbePortable::FPortablePack& Pack : Provider.Packs)
+            { bAny |= Matches(Pack.Name, Pack.Id, Provider.PluginName); }
+            if (!bAny) { continue; }
+            ++Visible;
+            const FString Header = FString::Printf(TEXT("%s  |  v%s  |  %d Tests  |  %d Packs  |  %d Actions"),
+                *Provider.PluginName, *Provider.Version, Provider.Tests.Num(), Provider.Packs.Num(), Provider.Actions.Num());
+            Contents->AddSlot().AutoHeight().Padding(2,7,2,3)
+            [ SNew(SHorizontalBox)
+              + SHorizontalBox::Slot().FillWidth(1.f).VAlign(VAlign_Center)
+                [ SNew(STextBlock).Text(FText::FromString(Header)).Font(FAppStyle::GetFontStyle("NormalFontBold")) ]
+              + SHorizontalBox::Slot().AutoWidth().Padding(4,0)
+                [ SNew(SButton).Text(LOCTEXT("Dev19ValidateProvider", "Validate"))
+                  .ToolTipText(LOCTEXT("Dev19ValidateProviderTip", "Re-parse the plugin's Resources/Probe definition files without running them."))
+                  .OnClicked_Lambda([this, Name=Provider.PluginName]() {
+                      FString Summary, Error;
+                      Feedback = ProbeDev19::ValidateInstalled(Name, Summary, Error) ? Summary : Error;
+                      return FReply::Handled(); }) ]
+              + SHorizontalBox::Slot().AutoWidth().Padding(4,0)
+                [ SNew(SButton).Text(LOCTEXT("Dev19OpenProviderFolder", "Open JSON Folder"))
+                  .ToolTipText(LOCTEXT("Dev19OpenProviderFolderTip", "Open this plugin's existing Resources/Probe folder for editing in your normal text editor."))
+                  .OnClicked_Lambda([Dir=Provider.Directory]() {
+                      FPlatformProcess::ExploreFolder(*Dir); return FReply::Handled(); }) ] ];
             for (const ProbePortable::FPortableTest& Test : Provider.Tests)
             {
-                AddRunRow(Test.Name + TEXT("  [") + Test.Id + TEXT("]"), Test.Id, false,
-                    Test.Description.IsEmpty() ? TEXT("Portable read-only Test") : Test.Description);
+                if (Matches(Test.Name, Test.Id, Provider.PluginName))
+                { AddRunRow(Test.Name + TEXT("  [") + Test.Id + TEXT("]"), Test.Id, false,
+                    Provider.PluginName, Test.Description); }
             }
             for (const ProbePortable::FPortablePack& Pack : Provider.Packs)
             {
-                AddRunRow(Pack.Name + TEXT("  [") + Pack.Id + TEXT("]"), Pack.Id, true,
-                    FString::Printf(TEXT("Pack of %d tests, %s"), Pack.TestIds.Num(),
-                        Pack.bStopOnFailure ? TEXT("Stop on Failure") : TEXT("Continue on Failure")));
+                if (Matches(Pack.Name, Pack.Id, Provider.PluginName))
+                { AddRunRow(Pack.Name + TEXT("  [") + Pack.Id + TEXT("]"), Pack.Id, true,
+                    Provider.PluginName, FString::Printf(TEXT("%d Tests, %s"), Pack.TestIds.Num(),
+                        Pack.bStopOnFailure ? TEXT("Stop on Failure") : TEXT("Continue on Failure"))); }
             }
         }
         for (const FString& Issue : ProbePortable::Diagnostics())
         {
-            Contents->AddSlot().AutoHeight().Padding(3)
+            if (!SearchText.IsEmpty() && !Issue.Contains(SearchText, ESearchCase::IgnoreCase)) { continue; }
+            ++Visible;
+            Contents->AddSlot().AutoHeight().Padding(4)
             [ SNew(STextBlock).ColorAndOpacity(FLinearColor(1.f, .5f, .4f))
-                .AutoWrapText(true).Text(FText::FromString(TEXT("Provider issue: ") + Issue)) ];
+              .AutoWrapText(true).Text(FText::FromString(TEXT("Provider issue: ") + Issue)) ];
         }
-        if (ProbePortable::Providers().IsEmpty() && ProbePortable::Diagnostics().IsEmpty())
+        if (Visible == 0)
         {
             Contents->AddSlot().AutoHeight().Padding(4)
             [ SNew(STextBlock).AutoWrapText(true)
-                .Text(LOCTEXT("NoPortableProviders", "No enabled plugins have a valid Resources/Probe/manifest.json. See Docs/PORTABLE_PROVIDER_SPEC_1.md.")) ];
+              .Text(LOCTEXT("Dev19NoProviders", "No matching providers or definitions. Enable a plugin containing Resources/Probe/manifest.json, or create a starter.")) ];
         }
         if (!bRunning)
-        {
-            Feedback = FString::Printf(TEXT("%d provider(s), %d tests, %d packs. Discovery never executes tests."),
-                ProbePortable::Providers().Num(), TotalTests, TotalPacks);
-        }
+        { Feedback = ProbePortable::DiscoverySummary() + TEXT(" Definitions are never executed during discovery."); }
     }
 
-    void AddRunRow(const FString& Label, const FString& Id, bool bPack, const FString& Tip)
+    void AddRunRow(const FString& Label, const FString& Id, bool bPack,
+        const FString& ProviderName, const FString& Tip)
     {
-        Contents->AddSlot().AutoHeight().Padding(3, 2)
+        Contents->AddSlot().AutoHeight().Padding(3,2)
         [ SNew(SHorizontalBox)
-            + SHorizontalBox::Slot().FillWidth(1.0f).VAlign(VAlign_Center)
-              [ SNew(STextBlock).Text(FText::FromString(Label))
-                .ToolTipText(FText::FromString(Tip)) ]
-            + SHorizontalBox::Slot().AutoWidth()
-              [ SNew(SButton).Text(LOCTEXT("RunPortableDefinition", "Run"))
-                .IsEnabled_Lambda([this]() { return !bRunning; })
-                .ToolTipText(LOCTEXT("RunPortableTip", "Explicitly execute this portable definition using Probe's existing runner; no .uasset is created."))
-                .OnClicked_Lambda([this, Id, bPack]() { return Execute(Id, bPack); }) ] ];
+          + SHorizontalBox::Slot().FillWidth(1.f).VAlign(VAlign_Center)
+            [ SNew(STextBlock).Text(FText::FromString(Label)).ToolTipText(FText::FromString(Tip)) ]
+          + SHorizontalBox::Slot().AutoWidth().Padding(2,0)
+            [ SNew(SButton).Text(LOCTEXT("Dev19Preview", "Preview"))
+              .OnClicked_Lambda([this, Id, bPack, ProviderName]() {
+                  ShowPreview(ProviderName, Id, bPack); return FReply::Handled(); }) ]
+          + SHorizontalBox::Slot().AutoWidth().Padding(2,0)
+            [ SNew(SComboButton)
+              .ToolTipText(LOCTEXT("Dev19ProviderActionsTip", "Edit the original source JSON, export an unchanged copy, or import read-only Tests into editable Probe assets."))
+              .OnGetMenuContent_Lambda([this, Id, bPack, ProviderName]() {
+                  return BuildDefinitionMenu(ProviderName, Id, bPack); })
+              .ButtonContent()
+              [ SNew(STextBlock).Text(LOCTEXT("Dev19ProviderActions", "Actions")) ] ]
+          + SHorizontalBox::Slot().AutoWidth().Padding(2,0)
+            [ SNew(SButton).Text(FText::FromString(
+                ProbePortable::RequiresAuthorization(Id, bPack) ? TEXT("Run Actions...") : TEXT("Run")))
+              .IsEnabled_Lambda([this]() { return !bRunning; })
+              .ToolTipText(LOCTEXT("RunPortableTip", "Explicitly execute this portable Test or Pack. Actions require separate confirmation; no .uasset is created."))
+              .OnClicked_Lambda([this, Id, bPack]() { return Execute(Id, bPack); }) ] ];
+    }
+
+    TSharedRef<SWidget> BuildDefinitionMenu(const FString& ProviderName, const FString& Id, bool bPack)
+    {
+        FMenuBuilder Menu(true, nullptr);
+        Menu.AddMenuEntry(LOCTEXT("Dev19EditJson", "Edit JSON"),
+            LOCTEXT("Dev19EditJsonTip", "Open the original JSON in your associated text editor. Validate & Refresh after saving."),
+            FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this, Id, bPack, ProviderName]()
+            { OpenSource(ProviderName, Id, bPack); })));
+        Menu.AddMenuEntry(LOCTEXT("Dev19ExportJson", "Export JSON"),
+            LOCTEXT("Dev19ExportJsonTip", "Copy the exact validated source definition to Saved/Probe/DefinitionExports, without modifying the provider."),
+            FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this, Id, bPack, ProviderName]()
+            { ExportJson(ProviderName, Id, bPack); })));
+        Menu.AddMenuSeparator();
+        Menu.AddMenuEntry(LOCTEXT("Dev19ImportEditable", "Import as Editable Test"),
+            LOCTEXT("Dev19ImportTip", "Create a disabled, Needs Review Test Asset. Unavailable for Packs or Tests with privileged actions."),
+            FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([this, Id, ProviderName]()
+            { ImportTest(ProviderName, Id); }),
+                FCanExecuteAction::CreateLambda([Id, bPack]()
+                { return !bPack && !ProbePortable::RequiresAuthorization(Id, false); })));
+        return Menu.MakeWidget();
+    }
+
+    const ProbePortable::FPortableProvider* FindProvider(const FString& Name) const
+    {
+        return ProbePortable::Providers().FindByPredicate(
+            [&Name](const ProbePortable::FPortableProvider& P) { return P.PluginName == Name; });
+    }
+
+    void ShowPreview(const FString& ProviderName, const FString& Id, bool bPack)
+    {
+        const ProbePortable::FPortableProvider* Provider = FindProvider(ProviderName);
+        if (!Provider || !Preview.IsValid()) { return; }
+        FString Detail;
+        if (bPack)
+        {
+            const ProbePortable::FPortablePack* Pack = Provider->Packs.FindByPredicate(
+                [&Id](const ProbePortable::FPortablePack& Item) { return Item.Id == Id; });
+            if (Pack) { Detail = ProbeDev19::PreviewPack(*Provider, *Pack); }
+        }
+        else
+        {
+            const ProbePortable::FPortableTest* Test = Provider->Tests.FindByPredicate(
+                [&Id](const ProbePortable::FPortableTest& Item) { return Item.Id == Id; });
+            if (Test) { Detail = ProbeDev19::PreviewTest(*Provider, *Test); }
+        }
+        Preview->SetText(FText::FromString(Detail));
+    }
+
+    void OpenSource(const FString& ProviderName, const FString& Id, bool bPack)
+    {
+        const ProbePortable::FPortableProvider* Provider = FindProvider(ProviderName);
+        if (!Provider) { return; }
+        FString Relative;
+        if (bPack)
+        {
+            if (const ProbePortable::FPortablePack* Pack = Provider->Packs.FindByPredicate(
+                [&Id](const ProbePortable::FPortablePack& Item) { return Item.Id == Id; }))
+            { Relative = Pack->SourcePath; }
+        }
+        else if (const ProbePortable::FPortableTest* Test = Provider->Tests.FindByPredicate(
+            [&Id](const ProbePortable::FPortableTest& Item) { return Item.Id == Id; }))
+        { Relative = Test->SourcePath; }
+        FString Error;
+        if (ProbePortable::ValidateRelativePath(Relative, Error))
+        { FPlatformProcess::LaunchFileInDefaultExternalApplication(*(Provider->Directory / Relative)); }
+        else { Feedback = Error; }
+    }
+
+    void ExportJson(const FString& ProviderName, const FString& Id, bool bPack)
+    {
+        const ProbePortable::FPortableProvider* Provider = FindProvider(ProviderName);
+        if (!Provider) { return; }
+        FString Path, Error;
+        Feedback = ProbeDev19::ExportSourceDefinition(*Provider, Id, bPack, Path, Error)
+            ? TEXT("Unmodified JSON exported: ") + Path : TEXT("Export failed: ") + Error;
+    }
+
+    void ImportTest(const FString& ProviderName, const FString& Id)
+    {
+        const ProbePortable::FPortableProvider* Provider = FindProvider(ProviderName);
+        if (!Provider) { return; }
+        const ProbePortable::FPortableTest* Test = Provider->Tests.FindByPredicate(
+            [&Id](const ProbePortable::FPortableTest& Item) { return Item.Id == Id; });
+        if (!Test) { return; }
+        UProbeTestAsset* Asset = nullptr;
+        FString Error;
+        Feedback = ProbeDev19::ImportReadOnlyTest(*Test, Asset, Error)
+            ? TEXT("Editable Test created (disabled, Needs Review): ") + Asset->GetPathName()
+            : TEXT("Import refused: ") + Error;
+    }
+
+    void OpenStarterDialog()
+    {
+        const TSharedRef<SWindow> Dialog = SNew(SWindow)
+            .Title(LOCTEXT("Dev19StarterTitle", "Create Probe Provider Starter"))
+            .ClientSize(FVector2D(520,170)).SupportsMinimize(false).SupportsMaximize(false);
+        TSharedPtr<SEditableTextBox> PluginInput;
+        Dialog->SetContent(
+            SNew(SVerticalBox)
+            + SVerticalBox::Slot().AutoHeight().Padding(12,12,12,7)
+              [ SNew(STextBlock).AutoWrapText(true).Text(LOCTEXT("Dev19StarterInstructions",
+                "Enter the EXACT .uplugin descriptor name. The starter is generated under Saved/Probe/ProviderStarters, never inside your installed plugin.")) ]
+            + SVerticalBox::Slot().AutoHeight().Padding(12,0,12,8)
+              [ SAssignNew(PluginInput, SEditableTextBox).HintText(LOCTEXT("Dev19StarterPlaceholder", "MyPlugin")) ]
+            + SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Right).Padding(12,0,12,10)
+              [ SNew(SHorizontalBox)
+                + SHorizontalBox::Slot().AutoWidth().Padding(3,0)
+                  [ SNew(SButton).Text(LOCTEXT("Dev19StarterCancel", "Cancel"))
+                    .OnClicked_Lambda([Dialog]() { FSlateApplication::Get().RequestDestroyWindow(Dialog); return FReply::Handled(); }) ]
+                + SHorizontalBox::Slot().AutoWidth().Padding(3,0)
+                  [ SNew(SButton).Text(LOCTEXT("Dev19StarterCreate", "Create Starter"))
+                    .OnClicked_Lambda([this, PluginInput, Dialog]() {
+                        FString Directory, Error;
+                        Feedback = ProbeDev19::CreateStarter(PluginInput->GetText().ToString(), Directory, Error)
+                            ? TEXT("Created validated provider starter: ") + Directory : TEXT("Starter creation refused: ") + Error;
+                        FSlateApplication::Get().RequestDestroyWindow(Dialog);
+                        return FReply::Handled(); }) ] ]);
+        FSlateApplication::Get().AddWindow(Dialog);
     }
 
     FReply Execute(const FString& Id, bool bPack)
     {
         if (bRunning) { return FReply::Handled(); }
+        const bool bActions = ProbePortable::RequiresAuthorization(Id, bPack);
+        if (bActions && FMessageDialog::Open(EAppMsgType::YesNo, EAppReturnType::No,
+            FText::FromString(FString::Printf(
+                TEXT("Allow portable Test/Pack '%s' to run provider actions?\n\nProvider functions may modify test-owned state. Cleanup functions are called, but arbitrary native code cannot be guaranteed reversible. Only authorize trusted providers."),
+                *Id))) != EAppReturnType::Yes)
+        { return FReply::Handled(); }
         bRunning = true;
         Feedback = TEXT("Running ") + Id;
         const TWeakPtr<SProbePortableBrowser> Weak = SharedThis(this);
-        const auto Done = [Weak](TArray<Probe::FTestResult> Results)
+        const auto Done = [Weak, Id, bPack, bActions](TArray<Probe::FTestResult> Results)
         {
+            for (const Probe::FTestResult& Result : Results)
+            { UE_LOG(LogTemp, Display, TEXT("Probe Portable %s: %s (%s)"),
+                *Result.Id, *ProbeDev19::DisplayStatus(Result), *Result.Detail); }
+            FString File, Error;
+            const bool bSaved = ProbeDev19::SaveRunReport(Id, bPack, bActions, Results, File, Error);
             if (const TSharedPtr<SProbePortableBrowser> Self = Weak.Pin())
             {
                 Self->bRunning = false;
-                int32 Passed = 0, Failed = 0, Skipped = 0;
-                for (const Probe::FTestResult& Result : Results)
-                {
-                    Passed += Result.Status == Probe::EResultStatus::Passed ? 1 : 0;
-                    Failed += Result.Status == Probe::EResultStatus::Failed || Result.Status == Probe::EResultStatus::Error ? 1 : 0;
-                    Skipped += Result.Status == Probe::EResultStatus::Skipped ? 1 : 0;
-                    UE_LOG(LogTemp, Display, TEXT("Probe Portable %s: %s (%s)"),
-                        *Result.Id, Probe::StatusName(Result.Status), *Result.Detail);
-                }
-                Self->Feedback = FString::Printf(TEXT("Run complete: %d passed, %d failed/errors, %d skipped. Details in Output Log (Probe Portable)."),
-                    Passed, Failed, Skipped);
+                Self->Feedback = TEXT("Run complete: ") + ProbeDev19::Summarize(Results).ToString()
+                    + (bSaved ? TEXT(". Report: ") + File : TEXT(". Report FAILED: ") + Error);
             }
         };
         FString Error;
         const bool bAccepted = bPack
-            ? ProbePortable::RunPack(Id, Done, Error)
-            : ProbePortable::RunTest(Id, Done, Error);
+            ? ProbePortable::RunPack(Id, Done, Error, bActions)
+            : ProbePortable::RunTest(Id, Done, Error, bActions);
         if (!bAccepted) { bRunning = false; Feedback = Error; }
         return FReply::Handled();
     }
 };
 
-static void ProbePortableConsoleRun(const TArray<FString>& Args, bool bPack)
+static void ProbePortableConsoleRun(const TArray<FString>& Args, bool bPack, bool bActions)
 {
     if (Args.Num() != 1)
     {
@@ -7922,24 +8489,98 @@ static void ProbePortableConsoleRun(const TArray<FString>& Args, bool bPack)
         return;
     }
     FString Error;
-    auto Done = [](TArray<Probe::FTestResult> Results)
+    const FString DefinitionId = Args[0];
+    auto Done = [DefinitionId, bPack, bActions](TArray<Probe::FTestResult> Results)
     {
         for (const Probe::FTestResult& Result : Results)
         {
             UE_LOG(LogTemp, Display, TEXT("Probe Portable %s => %s: %s"),
-                *Result.Id, Probe::StatusName(Result.Status), *Result.Detail);
+                *Result.Id, *ProbeDev19::DisplayStatus(Result), *Result.Detail);
         }
+        FString File, Error;
+        if (ProbeDev19::SaveRunReport(DefinitionId, bPack, bActions, Results, File, Error))
+        { UE_LOG(LogTemp, Display, TEXT("Probe Portable run: %s. JSON report: %s"),
+            *ProbeDev19::Summarize(Results).ToString(), *File); }
+        else { UE_LOG(LogTemp, Warning, TEXT("Probe Portable report export failed: %s"), *Error); }
     };
     const bool bAccepted = bPack
-        ? ProbePortable::RunPack(Args[0], Done, Error)
-        : ProbePortable::RunTest(Args[0], Done, Error);
+        ? ProbePortable::RunPack(Args[0], Done, Error, bActions)
+        : ProbePortable::RunTest(Args[0], Done, Error, bActions);
     if (!bAccepted) { UE_LOG(LogTemp, Error, TEXT("Probe Portable: %s"), *Error); }
 }
 
 static void ProbePortableConsoleRunTest(const TArray<FString>& Args)
-{ ProbePortableConsoleRun(Args, false); }
+{ ProbePortableConsoleRun(Args, false, false); }
 static void ProbePortableConsoleRunPack(const TArray<FString>& Args)
-{ ProbePortableConsoleRun(Args, true); }
+{ ProbePortableConsoleRun(Args, true, false); }
+static void ProbePortableConsoleRunTestActions(const TArray<FString>& Args)
+{ ProbePortableConsoleRun(Args, false, true); }
+static void ProbePortableConsoleRunPackActions(const TArray<FString>& Args)
+{ ProbePortableConsoleRun(Args, true, true); }
+static void ProbePortableConsoleRefresh()
+{
+    ProbePortable::Refresh();
+    UE_LOG(LogTemp, Display, TEXT("Probe Portable: %s"), *ProbePortable::DiscoverySummary());
+    for (const FString& Issue : ProbePortable::Diagnostics())
+    { UE_LOG(LogTemp, Warning, TEXT("Probe Portable discovery: %s"), *Issue); }
+}
+static void ProbePortableConsoleCancel()
+{
+    UE_LOG(LogTemp, Display, TEXT("Probe Portable: %s"),
+        ProbePortable::RequestCancel() ? TEXT("Cancellation requested.") : TEXT("No portable runs active."));
+}
+
+
+// Dev 19: developer tools never execute tests and never write inside installed plugins.
+static void ProbePortableConsoleValidate(const TArray<FString>& Args)
+{
+    if (Args.Num() != 1)
+    { UE_LOG(LogTemp, Warning, TEXT("Usage: Probe.Portable.Validate <ExactPluginName>")); return; }
+    FString Summary, Error;
+    if (ProbeDev19::ValidateInstalled(Args[0], Summary, Error))
+    { UE_LOG(LogTemp, Display, TEXT("Probe Portable: %s"), *Summary); }
+    else { UE_LOG(LogTemp, Error, TEXT("Probe Portable validation: %s"), *Error); }
+}
+static void ProbePortableConsoleStarter(const TArray<FString>& Args)
+{
+    if (Args.Num() != 1)
+    { UE_LOG(LogTemp, Warning, TEXT("Usage: Probe.Portable.CreateStarter <ExactPluginName>")); return; }
+    FString Directory, Error;
+    if (ProbeDev19::CreateStarter(Args[0], Directory, Error))
+    { UE_LOG(LogTemp, Display, TEXT("Probe Portable: Starter generated at %s"), *Directory); }
+    else { UE_LOG(LogTemp, Error, TEXT("Probe Portable starter: %s"), *Error); }
+}
+static void ProbePortableConsoleImport(const TArray<FString>& Args)
+{
+    if (Args.Num() != 1)
+    { UE_LOG(LogTemp, Warning, TEXT("Usage: Probe.Portable.ImportTest <Provider.TestId>")); return; }
+    for (const ProbePortable::FPortableProvider& Provider : ProbePortable::Providers())
+    {
+        for (const ProbePortable::FPortableTest& Test : Provider.Tests)
+        {
+            if (Test.Id != Args[0]) { continue; }
+            UProbeTestAsset* Asset = nullptr;
+            FString Error;
+            if (ProbeDev19::ImportReadOnlyTest(Test, Asset, Error))
+            { UE_LOG(LogTemp, Display, TEXT("Probe Portable imported disabled Test Asset: %s"), *Asset->GetPathName()); }
+            else { UE_LOG(LogTemp, Error, TEXT("Probe Portable import refused: %s"), *Error); }
+            return;
+        }
+    }
+    UE_LOG(LogTemp, Error, TEXT("Unknown portable Test: %s"), *Args[0]);
+}
+static void ProbePortableConsoleExportAsset(const TArray<FString>& Args)
+{
+    if (Args.Num() != 2)
+    { UE_LOG(LogTemp, Warning, TEXT("Usage: Probe.Portable.ExportAsset </Game/Path/Asset.Asset> <ExactProviderName>")); return; }
+    UProbeTestAsset* Asset = LoadObject<UProbeTestAsset>(nullptr, *Args[0]);
+    if (!Asset)
+    { UE_LOG(LogTemp, Error, TEXT("No Probe Test Asset found at %s"), *Args[0]); return; }
+    FString File, Error;
+    if (ProbeDev19::ExportReadOnlyTest(*Asset, Args[1], File, Error))
+    { UE_LOG(LogTemp, Display, TEXT("Probe Portable JSON exported: %s"), *File); }
+    else { UE_LOG(LogTemp, Error, TEXT("Probe Portable JSON export refused: %s"), *Error); }
+}
 
 class FProbeEditorModule : public IModuleInterface
 {
@@ -7969,13 +8610,34 @@ public:
         ProbePortable::Refresh();
         IConsoleManager::Get().RegisterConsoleCommand(TEXT("Probe.Portable.Refresh"),
             TEXT("Refresh dependency-free Resources/Probe JSON provider discovery; never executes tests."),
-            FConsoleCommandDelegate::CreateStatic(&ProbePortable::Refresh), ECVF_Default);
+            FConsoleCommandDelegate::CreateStatic(&ProbePortableConsoleRefresh), ECVF_Default);
         IConsoleManager::Get().RegisterConsoleCommand(TEXT("Probe.Portable.RunTest"),
             TEXT("Explicitly run a portable JSON Test by namespaced ID."),
             FConsoleCommandWithArgsDelegate::CreateStatic(&ProbePortableConsoleRunTest), ECVF_Default);
         IConsoleManager::Get().RegisterConsoleCommand(TEXT("Probe.Portable.RunPack"),
-            TEXT("Explicitly run a portable JSON Pack by namespaced ID."),
+            TEXT("Explicitly run a read-only portable JSON Pack by namespaced ID."),
             FConsoleCommandWithArgsDelegate::CreateStatic(&ProbePortableConsoleRunPack), ECVF_Default);
+        IConsoleManager::Get().RegisterConsoleCommand(TEXT("Probe.Portable.RunTestActions"),
+            TEXT("Explicitly authorize provider actions and fixture operations for this Test."),
+            FConsoleCommandWithArgsDelegate::CreateStatic(&ProbePortableConsoleRunTestActions), ECVF_Default);
+        IConsoleManager::Get().RegisterConsoleCommand(TEXT("Probe.Portable.RunPackActions"),
+            TEXT("Explicitly authorize provider actions and fixture operations for this Pack."),
+            FConsoleCommandWithArgsDelegate::CreateStatic(&ProbePortableConsoleRunPackActions), ECVF_Default);
+        IConsoleManager::Get().RegisterConsoleCommand(TEXT("Probe.Portable.Validate"),
+            TEXT("Validate a named enabled plugin's Resources/Probe files without executing tests."),
+            FConsoleCommandWithArgsDelegate::CreateStatic(&ProbePortableConsoleValidate), ECVF_Default);
+        IConsoleManager::Get().RegisterConsoleCommand(TEXT("Probe.Portable.CreateStarter"),
+            TEXT("Generate an isolated, validated provider starter under Saved/Probe/ProviderStarters."),
+            FConsoleCommandWithArgsDelegate::CreateStatic(&ProbePortableConsoleStarter), ECVF_Default);
+        IConsoleManager::Get().RegisterConsoleCommand(TEXT("Probe.Portable.ImportTest"),
+            TEXT("Import a read-only portable Test into a disabled, Needs Review Test Asset."),
+            FConsoleCommandWithArgsDelegate::CreateStatic(&ProbePortableConsoleImport), ECVF_Default);
+        IConsoleManager::Get().RegisterConsoleCommand(TEXT("Probe.Portable.ExportAsset"),
+            TEXT("Export a read-only Probe Test Asset as validated portable JSON under Saved/Probe."),
+            FConsoleCommandWithArgsDelegate::CreateStatic(&ProbePortableConsoleExportAsset), ECVF_Default);
+        IConsoleManager::Get().RegisterConsoleCommand(TEXT("Probe.Portable.Cancel"),
+            TEXT("Request cancellation of active portable runs at safe boundaries."),
+            FConsoleCommandDelegate::CreateStatic(&ProbePortableConsoleCancel), ECVF_Default);
         RegisterAssetAppearance();
 
         // Record only Probe assets affected by Undo/Redo. The post-transaction callback
@@ -8010,6 +8672,14 @@ public:
         IConsoleManager::Get().UnregisterConsoleObject(TEXT("Probe.Portable.Refresh"), false);
         IConsoleManager::Get().UnregisterConsoleObject(TEXT("Probe.Portable.RunTest"), false);
         IConsoleManager::Get().UnregisterConsoleObject(TEXT("Probe.Portable.RunPack"), false);
+        IConsoleManager::Get().UnregisterConsoleObject(TEXT("Probe.Portable.RunTestActions"), false);
+        IConsoleManager::Get().UnregisterConsoleObject(TEXT("Probe.Portable.RunPackActions"), false);
+        IConsoleManager::Get().UnregisterConsoleObject(TEXT("Probe.Portable.Cancel"), false);
+        IConsoleManager::Get().UnregisterConsoleObject(TEXT("Probe.Portable.Validate"), false);
+        IConsoleManager::Get().UnregisterConsoleObject(TEXT("Probe.Portable.CreateStarter"), false);
+        IConsoleManager::Get().UnregisterConsoleObject(TEXT("Probe.Portable.ImportTest"), false);
+        IConsoleManager::Get().UnregisterConsoleObject(TEXT("Probe.Portable.ExportAsset"), false);
+
         IConsoleManager::Get().UnregisterConsoleObject(TEXT("Probe.SelfTest"), false);
         IConsoleManager::Get().UnregisterConsoleObject(TEXT("Probe.GenerateTemplateTests"), false);
         for (const FName Id : Probe::GetExtensionTemplateIds())

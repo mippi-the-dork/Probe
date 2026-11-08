@@ -1,0 +1,15 @@
+{
+  "format": "ProbeTest/1",
+  "id": "ProbeExampleProvider.AsyncCancelable",
+  "name": "Slow async action for cancellation testing",
+  "description": "Explicitly authorized in-memory action. Run Probe.Portable.Cancel during polling to verify cancellation and cleanup.",
+  "steps": [
+    {
+      "action": "ProbeExampleProvider.DelayedCheck",
+      "target": "ExampleCancellationToken",
+      "expected": "slow",
+      "uiWaitTimeoutSeconds": 9.0,
+      "description": "Wait for slow provider poll, or cancel externally"
+    }
+  ]
+}

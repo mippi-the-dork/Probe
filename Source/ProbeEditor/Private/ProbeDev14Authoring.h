@@ -194,7 +194,7 @@ namespace ProbeDev14
             Add(EProbeStepType::UIWidgetVisible, TEXT("details:search"), TEXT(""), TEXT("UI Inspection"));
             break;
         case ERecipe::TransientFixture:
-            Add(EProbeStepType::FixtureCreateObject, TEXT("/Script/CoreUObject.Object"), TEXT("Dev14Fixture"), TEXT("Setup"));
+            Add(EProbeStepType::FixtureCreateObject, TEXT("/Script/ProbeEditor.ProbeTestAsset"), TEXT("Dev14Fixture"), TEXT("Setup"));
             Add(EProbeStepType::FixtureObjectExists, TEXT("Dev14Fixture"), TEXT(""), TEXT("Verify"));
             Add(EProbeStepType::FixtureDestroyObject, TEXT("Dev14Fixture"), TEXT(""), TEXT("Cleanup"));
             break;

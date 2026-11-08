@@ -1,0 +1,10 @@
+{
+  "format": "ProbePack/1",
+  "id": "ProbeExampleProvider.Actions",
+  "name": "Authorized provider actions",
+  "failurePolicy": "StopOnFailure",
+  "tests": [
+    "ProbeExampleProvider.FixtureLifecycle",
+    "ProbeExampleProvider.AsyncAction"
+  ]
+}

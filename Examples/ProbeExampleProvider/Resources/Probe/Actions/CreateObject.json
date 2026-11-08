@@ -1,0 +1,9 @@
+{
+  "format": "ProbeAction/1",
+  "id": "ProbeExampleProvider.CreateFixture",
+  "name": "Create test-owned object",
+  "kind": "native-fixture",
+  "permission": "transient-object",
+  "type": "FixtureCreateObject",
+  "description": "Creates only a transient UObject; never a project asset."
+}

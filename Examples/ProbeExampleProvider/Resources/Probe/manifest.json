@@ -1,7 +1,7 @@
 {
   "format": "ProbeProvider/1",
   "provider": "ProbeExampleProvider",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "assertions": [
     "Assertions/PluginPresent.json",
     "Assertions/ReflectedCheck.json"
@@ -10,9 +10,18 @@
     "Templates/Smoke.json"
   ],
   "tests": [
-    "Tests/ProbeAvailable.json"
+    "Tests/ProbeAvailable.json",
+    "Tests/FixtureLifecycle.json",
+    "Tests/AsyncAction.json",
+    "Tests/AsyncCancelable.json"
   ],
   "packs": [
-    "Packs/All.json"
+    "Packs/All.json",
+    "Packs/Actions.json"
+  ],
+  "actions": [
+    "Actions/CreateObject.json",
+    "Actions/DestroyObject.json",
+    "Actions/Delayed.json"
   ]
 }

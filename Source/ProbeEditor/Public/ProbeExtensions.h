@@ -20,6 +20,14 @@ namespace Probe
         FString Description;
         uint8 Fields = 0; // EProbeFieldFlags in ProbeAssertionCatalog.h
         TFunction<EResultStatus(const FProbeTestStep&, FString&)> Evaluate;
+        // Dev 18: these provider operations are callable ONLY by transient, explicitly
+        // authorized portable runs. Normal Test Assets cannot grant this permission.
+        bool bRequiresPortableActionAuthorization = false;
+        bool bPortableAsync = false;
+        // Poll returns whether polling succeeded; outputs report completion and result.
+        TFunction<bool(const FProbeTestStep&, bool&, bool&, FString&)> Poll;
+        TFunction<bool(const FProbeTestStep&, FString&)> Cancel;
+        TFunction<bool(const FProbeTestStep&, FString&)> Cleanup;
     };
 
     struct FExtensionTemplate

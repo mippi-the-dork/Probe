@@ -17,7 +17,15 @@ namespace ProbePortable
         FString Id;
         FString Name;
         FString Description;
+        FString SourcePath; // Relative validated JSON file from this provider manifest.
         bool bEnabled = true;
+        // True when a JSON action is explicitly declared. Discovery does not
+        // grant this authority; each execution must opt in separately.
+        bool bRequiresActionAuthorization = false;
+        bool bRequiresTransientActors = false;
+        // Parser-only provenance. An action must use the JSON 'action' selector;
+        // declaring it as a read-only assertion is rejected.
+        TSet<int32> ActionStepIndices;
         TArray<FProbeTestStep> Steps;
     };
 
@@ -25,6 +33,7 @@ namespace ProbePortable
     {
         FString Id;
         FString Name;
+        FString SourcePath; // Relative validated JSON file from this provider manifest.
         bool bStopOnFailure = false;
         TArray<FString> TestIds;
     };
@@ -42,6 +51,21 @@ namespace ProbePortable
         FString ReflectedFunction;
     };
 
+    struct FActionDefinition
+    {
+        FString Id;
+        FString Name;
+        FString Description;
+        FString Kind; // native-fixture, reflected-action, reflected-async
+        FString Permission; // transient-object, transient-actor, provider-action
+        FString NativeType;
+        FString ReflectedClass;
+        FString StartFunction;
+        FString PollFunction;
+        FString CancelFunction;
+        FString CleanupFunction;
+    };
+
     struct FPortableProvider
     {
         FString PluginName;
@@ -50,6 +74,7 @@ namespace ProbePortable
         FString Directory;
         TArray<FString> ModuleNames;
         TArray<FAssertionDefinition> Assertions;
+        TArray<FActionDefinition> Actions;
         TArray<FPortableTest> Tests;
         TArray<FPortableTest> Templates;
         TArray<FPortablePack> Packs;
@@ -66,11 +91,18 @@ namespace ProbePortable
     PROBEEDITOR_API void Clear();
     PROBEEDITOR_API const TArray<FPortableProvider>& Providers();
     PROBEEDITOR_API const TArray<FString>& Diagnostics();
+    PROBEEDITOR_API FString DiscoverySummary();
+    PROBEEDITOR_API bool RequiresAuthorization(const FString& Id, bool bPack);
+    // Requests cancellation of current portable execution at the earliest safe
+    // boundary. Provider async actions also receive their Cancel callback.
+    PROBEEDITOR_API bool RequestCancel();
     /** The following only run on an explicit user or caller request. No UAsset is created. */
     PROBEEDITOR_API bool RunTest(const FString& TestId,
-        TFunction<void(TArray<Probe::FTestResult>)> OnComplete, FString& Reason);
+        TFunction<void(TArray<Probe::FTestResult>)> OnComplete, FString& Reason,
+        bool bAuthorizeActions = false);
     PROBEEDITOR_API bool RunPack(const FString& PackId,
-        TFunction<void(TArray<Probe::FTestResult>)> OnComplete, FString& Reason);
+        TFunction<void(TArray<Probe::FTestResult>)> OnComplete, FString& Reason,
+        bool bAuthorizeActions = false);
     /** Copy a portable test into a new transient UProbeTestAsset for authoring/import. Never grants input permissions. */
-    PROBEEDITOR_API bool MakeTransientTest(const FPortableTest& Definition, UProbeTestAsset*& Out, FString& Reason);
+    PROBEEDITOR_API bool MakeTransientTest(const FPortableTest& Definition, UProbeTestAsset*& Out, FString& Reason, bool bAuthorizeActions = false);
 }

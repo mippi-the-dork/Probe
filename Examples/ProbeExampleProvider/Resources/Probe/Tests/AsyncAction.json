@@ -1,0 +1,20 @@
+{
+  "format": "ProbeTest/1",
+  "id": "ProbeExampleProvider.AsyncAction",
+  "name": "Portable asynchronous provider action",
+  "description": "Requires explicit action authorization. Uses a plugin-owned in-memory polling token.",
+  "steps": [
+    {
+      "action": "ProbeExampleProvider.DelayedCheck",
+      "target": "ExampleAsyncToken",
+      "expected": "complete",
+      "uiWaitTimeoutSeconds": 3.0,
+      "description": "Poll until provider reports done"
+    },
+    {
+      "type": "PluginInstalled",
+      "target": "ProbeExampleProvider",
+      "description": "Verify provider remains available"
+    }
+  ]
+}

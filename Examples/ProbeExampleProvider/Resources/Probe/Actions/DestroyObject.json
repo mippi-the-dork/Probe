@@ -1,0 +1,9 @@
+{
+  "format": "ProbeAction/1",
+  "id": "ProbeExampleProvider.DestroyFixture",
+  "name": "Destroy test-owned object",
+  "kind": "native-fixture",
+  "permission": "transient-object",
+  "type": "FixtureDestroyObject",
+  "description": "Removes only a previously-created fixture."
+}

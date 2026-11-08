@@ -1,0 +1,24 @@
+{
+  "format": "ProbeTest/1",
+  "id": "ProbeExampleProvider.FixtureLifecycle",
+  "name": "Portable test-owned fixture lifecycle",
+  "description": "Requires explicit action authorization. Creates and destroys an unsaved UObject.",
+  "steps": [
+    {
+      "action": "ProbeExampleProvider.CreateFixture",
+      "target": "/Script/ProbeExampleProviderEditor.ProbeExampleProviderFixture",
+      "expected": "ExampleFixture",
+      "description": "Create transient object"
+    },
+    {
+      "type": "FixtureObjectExists",
+      "target": "ExampleFixture",
+      "description": "Verify the object exists"
+    },
+    {
+      "action": "ProbeExampleProvider.DestroyFixture",
+      "target": "ExampleFixture",
+      "description": "Destroy transient object"
+    }
+  ]
+}

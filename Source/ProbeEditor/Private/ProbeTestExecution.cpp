@@ -254,6 +254,29 @@ namespace Probe
         TMap<FString, TWeakObjectPtr<AActor>> ActorFixtures;
         TWeakObjectPtr<UWorld> FixtureWorld;
         bool bAllowTransientEditorActors = false;
+        bool bPortableActionsAuthorized = false;
+        bool bInAsyncRun = false;
+        TArray<FProbeTestStep> PendingPortableCleanups;
+
+        bool CleanupPortableActions(FString& OutIssue)
+        {
+            check(IsInGameThread());
+            bool bAllSucceeded = true;
+            for (int32 CleanupIndex = PendingPortableCleanups.Num() - 1; CleanupIndex >= 0; --CleanupIndex)
+            {
+                const FProbeTestStep& Step = PendingPortableCleanups[CleanupIndex];
+                const FExtensionAssertion* Extension = FindExtensionAssertion(Step.AssertionId);
+                FString Detail;
+                if (!Extension || !Extension->Cleanup || !Extension->Cleanup(Step, Detail))
+                {
+                    bAllSucceeded = false;
+                    OutIssue += FString::Printf(TEXT(" | Provider cleanup '%s' failed: %s"),
+                        *Step.AssertionId.ToString(), *Detail);
+                }
+            }
+            PendingPortableCleanups.Reset();
+            return bAllSucceeded;
+        }
 
         AActor* GetActor(const FString& Id) const
         {
@@ -350,6 +373,9 @@ namespace Probe
         }
         ~FProbeRunContext()
         {
+            FString CleanupIssue;
+            if (!PendingPortableCleanups.IsEmpty() && !CleanupPortableActions(CleanupIssue))
+            { UE_LOG(LogTemp, Error, TEXT("Probe portable cleanup fallback: %s"), *CleanupIssue); }
             // Clean up ALL test-owned actors even when the first failing step
             // aborts execution. Never delete actors Probe did not create.
             TArray<FString> FixtureIds;
@@ -443,6 +469,22 @@ namespace Probe
                 Reason = FString::Printf(TEXT("Required assertion provider '%s' is unavailable. Enable its testing module."),
                     *Step.AssertionId.ToString());
                 return EResultStatus::Error;
+            }
+            if (Extension->bPortableAsync && !Context.bInAsyncRun)
+            {
+                Reason = TEXT("Asynchronous provider actions must use RunTestAsync; synchronous execution cannot perform bounded polling.");
+                return EResultStatus::Error;
+            }
+            if (Extension->bRequiresPortableActionAuthorization)
+            {
+                if (!Context.bPortableActionsAuthorized)
+                {
+                    Reason = TEXT("Portable provider actions require explicit authorization on a transient Probe Test. Saved Test Assets cannot grant it.");
+                    return EResultStatus::Error;
+                }
+                // Enqueue cleanup BEFORE invocation. A failed Begin/Execute may
+                // have already acquired state that must be released on every exit.
+                if (Extension->Cleanup) { Context.PendingPortableCleanups.Add(Step); }
             }
             if ((Extension->Fields & TargetField) && Step.Target.TrimStartAndEnd().IsEmpty())
             {
@@ -914,12 +956,25 @@ namespace Probe
             if (Id.IsEmpty()) { Reason = TEXT("Enter a New Fixture ID."); return EResultStatus::Error; }
             if (Context.Get(Id)) { Reason = FString::Printf(TEXT("Fixture ID '%s' already exists in this test."), *Id); return EResultStatus::Error; }
             UClass* Class = FindTestClass(Target);
-            if (!Class || Class->HasAnyClassFlags(CLASS_Abstract)
-                || Class->IsChildOf(AActor::StaticClass()) || Class->IsChildOf(UActorComponent::StaticClass())
-                || Class->IsChildOf(UWorld::StaticClass()) || Class->IsChildOf(UPackage::StaticClass())
-                || (Class->ClassWithin && !GetTransientPackage()->IsA(Class->ClassWithin.Get())))
+            if (!Class)
             {
-                Reason = TEXT("Choose a concrete non-Actor UObject class. Fixtures cannot spawn actors or alter loaded worlds.");
+                Reason = FString::Printf(TEXT("Fixture class '%s' was not found. Enter a concrete UObject class path such as /Script/ProbeEditor.ProbeTestAsset."), *Target);
+                return EResultStatus::Error;
+            }
+            if (Class->HasAnyClassFlags(CLASS_Abstract))
+            {
+                Reason = FString::Printf(TEXT("Fixture class '%s' is abstract and cannot be instantiated. Use a concrete UObject class such as /Script/ProbeEditor.ProbeTestAsset."), *Class->GetPathName());
+                return EResultStatus::Error;
+            }
+            if (Class->IsChildOf(AActor::StaticClass()) || Class->IsChildOf(UActorComponent::StaticClass())
+                || Class->IsChildOf(UWorld::StaticClass()) || Class->IsChildOf(UPackage::StaticClass()))
+            {
+                Reason = FString::Printf(TEXT("Fixture class '%s' is not an allowed transient UObject fixture type. Actors, components, worlds and packages cannot be created by this action."), *Class->GetPathName());
+                return EResultStatus::Error;
+            }
+            if (Class->ClassWithin && !GetTransientPackage()->IsA(Class->ClassWithin.Get()))
+            {
+                Reason = FString::Printf(TEXT("Fixture class '%s' requires an Outer incompatible with the transient package."), *Class->GetPathName());
                 return EResultStatus::Error;
             }
             UObject* Object = NewObject<UObject>(GetTransientPackage(), Class, NAME_None, RF_Transient);
@@ -2441,6 +2496,8 @@ namespace Probe
             Result.AssetPath = Asset->GetPathName();
             Result.VariationIndex = Options.VariationIndex;
             Context.bAllowTransientEditorActors = Asset->bAllowTransientEditorActors;
+            Context.bPortableActionsAuthorized = Asset->bPortableActionsAuthorized && Asset->HasAnyFlags(RF_Transient);
+            Context.bInAsyncRun = true;
             FString WorkflowError;
             if (!ProbeDev9Workflow::Resolve(*Asset, Options.VariationIndex, Definitions, Result.VariationName, WorkflowError))
             { Result.Status = EResultStatus::Error; Result.Detail = WorkflowError; Finish(); return; }
@@ -2498,6 +2555,24 @@ namespace Probe
                 return;
             }
             StepStartedAt = FPlatformTime::Seconds();
+            if (Test->bPortableCancellationRequested)
+            {
+                CompleteStep(EResultStatus::Error, TEXT("Portable run cancelled at step boundary; cleanup will execute."));
+                return;
+            }
+            if (!Step.AssertionId.IsNone())
+            {
+                const FExtensionAssertion* Extension = FindExtensionAssertion(Step.AssertionId);
+                if (Extension && Extension->bPortableAsync)
+                {
+                    FString StartDetail;
+                    const EResultStatus BeginStatus = ExecuteStep(Step, Context, StartDetail);
+                    if (BeginStatus != EResultStatus::Passed)
+                    { CompleteStep(BeginStatus, StartDetail); return; }
+                    BeginPortablePoll(Step, StartDetail);
+                    return;
+                }
+            }
             if (!Step.AssertionId.IsNone() || !IsNativeUIStep(Step.Type))
             {
                 FString Reason;
@@ -2576,6 +2651,52 @@ namespace Probe
             CompleteStep(bActive == bExpectActive ? EResultStatus::Passed : EResultStatus::Failed,
                 FString::Printf(TEXT("Details 1 HasActiveSearch=%s; expected %s."),
                     bActive ? TEXT("true") : TEXT("false"), bExpectActive ? TEXT("true") : TEXT("false")));
+        }
+
+        // Async provider operations are polled on the Editor game thread. No
+        // sleeping, blocking, or off-thread reflection. Deadline is bounded.
+        void BeginPortablePoll(const FProbeTestStep& Step, const FString& BeginDetail)
+        {
+            const double Started = FPlatformTime::Seconds();
+            const double Timeout = FMath::Clamp(Step.UIWaitTimeoutSeconds, 0.1, 30.0);
+            const TSharedRef<FAsyncProbeTestRun> Self = AsShared();
+            FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+                [Self, Step, Started, Timeout, BeginDetail](float)
+                {
+                    const FExtensionAssertion* Extension = FindExtensionAssertion(Step.AssertionId);
+                    if (!Extension || !Extension->Poll)
+                    {
+                        Self->CompleteStep(EResultStatus::Error, TEXT("Async provider poll handler is unavailable."));
+                        return false;
+                    }
+                    if (Self->Test->bPortableCancellationRequested || FPlatformTime::Seconds() - Started >= Timeout)
+                    {
+                        FString CancelDetail;
+                        if (Extension->Cancel) { Extension->Cancel(Step, CancelDetail); }
+                        const bool bCancelled = Self->Test->bPortableCancellationRequested;
+                        Self->CompleteStep(EResultStatus::Error, FString::Printf(
+                            TEXT("Portable action %s after %.2fs; cancellation: %s"),
+                            bCancelled ? TEXT("cancelled") : TEXT("timed out"),
+                            FPlatformTime::Seconds() - Started, *CancelDetail));
+                        return false;
+                    }
+                    bool bComplete = false;
+                    bool bPassed = false;
+                    FString PollDetail;
+                    if (!Extension->Poll(Step, bComplete, bPassed, PollDetail))
+                    {
+                        Self->CompleteStep(EResultStatus::Error,
+                            TEXT("Portable async provider polling failed: ") + PollDetail);
+                        return false;
+                    }
+                    if (bComplete)
+                    {
+                        Self->CompleteStep(bPassed ? EResultStatus::Passed : EResultStatus::Failed,
+                            PollDetail.IsEmpty() ? BeginDetail : PollDetail);
+                        return false;
+                    }
+                    return true;
+                }), 0.1f);
         }
 
         // Read-only inspection uses Automation Driver's standard ID discovery and
@@ -2939,6 +3060,12 @@ namespace Probe
             }
             if (bDriverEnabledByProbe && IAutomationDriverModule::Get().IsEnabled())
             { IAutomationDriverModule::Get().Disable(); }
+            FString CleanupIssue;
+            if (!Context.CleanupPortableActions(CleanupIssue))
+            {
+                Result.Status = EResultStatus::Error;
+                Result.Detail += CleanupIssue;
+            }
             Result.DurationMs = (FPlatformTime::Seconds() - StartedAt) * 1000.0;
             // Editor fixture context stays alive until the completion callback
             // returns; its RAII cleanup runs before the shared state is freed.
@@ -2951,7 +3078,12 @@ namespace Probe
     {
         check(IsInGameThread());
         if (!Asset || !Asset->Steps.ContainsByPredicate(
-            [](const FProbeTestStep& Step) { return Step.AssertionId.IsNone() && IsNativeUIStep(Step.Type); }))
+            [](const FProbeTestStep& Step)
+            {
+                if (Step.AssertionId.IsNone()) { return IsNativeUIStep(Step.Type); }
+                const FExtensionAssertion* Extension = FindExtensionAssertion(Step.AssertionId);
+                return Extension && Extension->bPortableAsync;
+            }))
         {
             if (OnProgress) { OnProgress(0, Asset ? Asset->Steps.Num() : 0); }
             FTestResult Finished = RunTest(Asset, Options); // Native assertions share the scoped contract.
@@ -3010,6 +3142,7 @@ namespace Probe
             const int32 LastIndex = FMath::Min(Options.LastStepIndex, Definitions.Num() - 1);
             FProbeRunContext Context; // RAII cleanup even if any step fails or errors.
             Context.bAllowTransientEditorActors = Asset->bAllowTransientEditorActors;
+            Context.bPortableActionsAuthorized = Asset->bPortableActionsAuthorized && Asset->HasAnyFlags(RF_Transient);
             Result.Status = EResultStatus::Passed;
             for (int32 Index = Options.FirstStepIndex; Index <= LastIndex; ++Index)
             {
@@ -3073,6 +3206,12 @@ namespace Probe
                 if (PassedCount == 0) { Result.Status = EResultStatus::Skipped; }
                 Result.Detail = SuccessfulRunDetail(Options, Asset->Steps.Num(),
                     LastIndex, PassedCount, Result.Steps.Num());
+            }
+            FString CleanupIssue;
+            if (!Context.CleanupPortableActions(CleanupIssue))
+            {
+                Result.Status = EResultStatus::Error;
+                Result.Detail += CleanupIssue;
             }
         }
         Result.DurationMs = (FPlatformTime::Seconds() - Start) * 1000.0;

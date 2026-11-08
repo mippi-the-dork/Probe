@@ -369,5 +369,12 @@ public:
     UPROPERTY(EditAnywhere, Category="Probe")
     TArray<FProbeTestStep> Steps;
 
+    // Never serialized into a .uasset. Only the portable launcher may set these
+    // on an explicitly authorized, RF_Transient test object.
+    UPROPERTY(Transient)
+    bool bPortableActionsAuthorized = false;
+    UPROPERTY(Transient)
+    bool bPortableCancellationRequested = false;
+
     virtual void PostInitProperties() override;
 };

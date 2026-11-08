@@ -1,9 +1,9 @@
 {
   "FileVersion": 3,
-  "Version": 54,
-  "VersionName": "0.15.4-dev17",
+  "Version": 59,
+  "VersionName": "0.15.4-dev20",
   "FriendlyName": "Probe",
-  "Description": "Unreal Editor QA, Test/Pack automation, native UI inspection, regression history, unified recipes, and dependency-free JSON plugin provider discovery and portable test execution.",
+  "Description": "Unreal Editor QA and native automation with optional JSON plugin providers, validated authoring, authorized actions, async execution and portable reports.",
   "Category": "Testing",
   "CreatedBy": "Mippi",
   "CanContainContent": true,
