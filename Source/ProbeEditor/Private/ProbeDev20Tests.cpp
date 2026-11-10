@@ -151,4 +151,16 @@ bool FProbeDev20NoAssetsCreated::RunTest(const FString&)
     return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FProbeDev21NativeCategorySearch,
+    "Probe.Editor.Dev21NativeCategorySearch", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FProbeDev21NativeCategorySearch::RunTest(const FString&)
+{
+    auto Native = Example(ProbeDev20::ESource::NativeAutomation, TEXT("Probe.Editor.Dev20NativeDiscovery"));
+    Native.Category = TEXT("Probe.Editor");
+    TestTrue(TEXT("Native categories are searchable"), ProbeDev20::Matches(Native, TEXT("Probe.Editor"), TEXT("Unreal Automation")));
+    TestFalse(TEXT("Native category excludes authored source"), ProbeDev20::Matches(Native, TEXT(""), TEXT("Authored Test")));
+    TestTrue(TEXT("Native full-path identity retains its namespace"), ProbeDev20::Identity(Native).Contains(TEXT("Probe.Editor.Dev20NativeDiscovery")));
+    return true;
+}
+
 #endif // WITH_DEV_AUTOMATION_TESTS

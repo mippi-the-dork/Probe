@@ -37,6 +37,7 @@ namespace ProbeDev20
             || Entry.Name.Contains(Query, ESearchCase::IgnoreCase)
             || Entry.Id.Contains(Query, ESearchCase::IgnoreCase)
             || Entry.Owner.Contains(Query, ESearchCase::IgnoreCase)
+            || Entry.Category.Contains(Query, ESearchCase::IgnoreCase)
             || Entry.Locator.Contains(Query, ESearchCase::IgnoreCase)
             || Entry.Detail.Contains(Query, ESearchCase::IgnoreCase)
             || Kind.Contains(Query, ESearchCase::IgnoreCase);
@@ -101,8 +102,17 @@ namespace ProbeDev20
         {
             FEntry Entry;
             Entry.Source = ESource::NativeAutomation;
-            Entry.Id = Native.GetTestName();
+            Entry.Id = Native.GetFullTestPath();
+            if (Entry.Id.IsEmpty()) { Entry.Id = Native.GetTestName(); }
             Entry.Locator = Entry.Id;
+            FString Remainder;
+            if (Entry.Id.Split(TEXT("."), &Entry.Category, &Remainder))
+            {
+                FString Second;
+                if (Remainder.Split(TEXT("."), &Second, nullptr))
+                { Entry.Category += TEXT(".") + Second; }
+            }
+            else { Entry.Category = TEXT("Other"); }
             Entry.Name = Native.GetDisplayName();
             if (Entry.Name.IsEmpty()) { Entry.Name = Native.GetFullTestPath(); }
             Entry.Owner = TEXT("Unreal Automation Framework");

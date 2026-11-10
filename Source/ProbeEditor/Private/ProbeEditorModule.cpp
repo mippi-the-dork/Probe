@@ -19,6 +19,7 @@
 #include "ProbePortableProviders.h"
 #include "ProbeDev19Authoring.h"
 #include "ProbeDev20Catalog.h"
+#include "ProbeDev23NativeBridge.h"
 #include "ProbeSelfTest.h"
 #include "ProbeTestAssetFactory.h"
 #include "ProbeTestPack.h"
@@ -2214,7 +2215,7 @@ public:
               + SHorizontalBox::Slot().AutoWidth().Padding(5,0,0,0)
                 [ SNew(SComboButton).ToolTipText(LOCTEXT("Dev20SourceFilterTip", "Choose which Test source to browse"))
                   .OnGetMenuContent(this, &SProbeUnifiedCatalog::BuildSources)
-                  .ButtonContent()[ SNew(STextBlock).Text_Lambda([this]() { return FText::FromString(SourceFilter); }) ] ]
+                  .ButtonContent()[ SNew(STextBlock).Text_Lambda([this]() { return FText::FromString(NativeCategoryFilter.IsEmpty() ? SourceFilter : NativeCategoryFilter); }) ] ]
               + SHorizontalBox::Slot().AutoWidth().Padding(5,0,0,0)
                 [ SNew(SButton).Text(LOCTEXT("Dev20Refresh", "Refresh Library"))
                   .ToolTipText(LOCTEXT("Dev20RefreshTip", "Refresh read-only asset, portable provider and native Automation discovery"))
@@ -2226,8 +2227,9 @@ public:
           + SVerticalBox::Slot().AutoHeight().Padding(4,0,4,3)
             [ SNew(STextBlock).ColorAndOpacity(FSlateColor::UseSubduedForeground())
               .Text_Lambda([this]() { return FText::FromString(FString::Printf(
-                  TEXT("%d definitions | %d matching | showing %d (first 200) | %s"),
-                  Entries.Num(), MatchCount, Visible.Num(), *SourceFilter)); }) ]
+                  TEXT("%d definitions | %d matching | showing %d of %d | %s%s%s"),
+                  Entries.Num(), MatchCount, Visible.Num(), MatchCount, *SourceFilter,
+                  NativeCategoryFilter.IsEmpty() ? TEXT("") : TEXT(" / "), *NativeCategoryFilter)); }) ]
           + SVerticalBox::Slot().FillHeight(1.f)
             [ SNew(SBorder).BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder")).Padding(2)
               [ SAssignNew(List, SListView<TSharedPtr<ProbeDev20::FEntry>>)
@@ -2276,6 +2278,7 @@ private:
     TSharedPtr<ProbeDev20::FEntry> Selected;
     FString Query;
     FString SourceFilter = TEXT("All");
+    FString NativeCategoryFilter;
     int32 MatchCount = 0;
 
     FString PreviewSelected() const
@@ -2284,7 +2287,7 @@ private:
         { return TEXT("Select a definition for its source, steps and authorization requirements. Run Selection executes it through its owner."); }
         if (Selected->Source == ProbeDev20::ESource::NativeAutomation)
         { return TEXT("Unreal Automation: ") + Selected->Id + TEXT("\n") + Selected->Detail
-            + TEXT("\nExecution and result history are managed by Unreal's Automation controller. This does not create a Probe Test Asset or a synthetic result."); }
+            + TEXT("\nDev 23 observes the Automation controller's exact-path completion record and adds the actual observed outcome to Probe Results and History. Submission alone never counts as success."); }
         if (Selected->Source == ProbeDev20::ESource::AuthoredTest || Selected->Source == ProbeDev20::ESource::AuthoredPack)
         { return FString(ProbeDev20::SourceName(Selected->Source)) + TEXT(": ") + Selected->Locator
             + TEXT("\nAuthor directly in Probe; results are recorded in Probe History."); }
@@ -2312,7 +2315,11 @@ private:
         MatchCount = 0;
         for (const TSharedPtr<ProbeDev20::FEntry>& Entry : Entries)
         {
-            if (Entry.IsValid() && ProbeDev20::Matches(*Entry, Query, SourceFilter))
+            if (Entry.IsValid() && ProbeDev20::Matches(*Entry, Query, SourceFilter)
+                && (NativeCategoryFilter.IsEmpty()
+                    || (Entry->Source == ProbeDev20::ESource::NativeAutomation
+                        && (Entry->Category == NativeCategoryFilter
+                            || Entry->Category.StartsWith(NativeCategoryFilter + TEXT("."))))))
             {
                 ++MatchCount;
                 if (Visible.Num() < MaxRows) { Visible.Add(Entry); }
@@ -2327,12 +2334,36 @@ private:
         FMenuBuilder Menu(true, nullptr);
         for (const FString& FilterValue : {
             FString(TEXT("All")), FString(TEXT("Authored Test")), FString(TEXT("Authored Pack")),
-            FString(TEXT("Portable Test")), FString(TEXT("Portable Pack")), FString(TEXT("Unreal Automation"))})
+            FString(TEXT("Portable Test")), FString(TEXT("Portable Pack"))})
         {
             Menu.AddMenuEntry(FText::FromString(FilterValue), FText::GetEmpty(), FSlateIcon(),
                 FUIAction(FExecuteAction::CreateLambda([this, FilterValue]()
-                { SourceFilter = FilterValue; Filter(); })));
+                { SourceFilter = FilterValue; NativeCategoryFilter.Empty(); Filter(); })));
         }
+        Menu.AddSubMenu(LOCTEXT("Dev21NativeSubmenu", "Unreal Automation"),
+            LOCTEXT("Dev21NativeSubmenuTip", "Filter native tests by their registered Automation path"),
+            FNewMenuDelegate::CreateLambda([this](FMenuBuilder& SubMenu)
+            {
+                SubMenu.AddMenuEntry(LOCTEXT("Dev21NativeAll", "All Unreal Automation"), FText::GetEmpty(), FSlateIcon(),
+                    FUIAction(FExecuteAction::CreateLambda([this]()
+                    { SourceFilter = TEXT("Unreal Automation"); NativeCategoryFilter.Empty(); Filter(); })));
+                TMap<FString, int32> Categories;
+                for (const TSharedPtr<ProbeDev20::FEntry>& Entry : Entries)
+                {
+                    if (Entry.IsValid() && Entry->Source == ProbeDev20::ESource::NativeAutomation)
+                    { ++Categories.FindOrAdd(Entry->Category.IsEmpty() ? TEXT("Other") : Entry->Category); }
+                }
+                TArray<FString> Keys;
+                Categories.GetKeys(Keys);
+                Keys.Sort();
+                for (const FString& Category : Keys)
+                {
+                    SubMenu.AddMenuEntry(FText::FromString(FString::Printf(TEXT("%s (%d)"), *Category, Categories.FindRef(Category))),
+                        FText::FromString(TEXT("Show native Automation tests in this registered category")), FSlateIcon(),
+                        FUIAction(FExecuteAction::CreateLambda([this, Category]()
+                        { SourceFilter = TEXT("Unreal Automation"); NativeCategoryFilter = Category; Filter(); })));
+                }
+            }));
         return Menu.MakeWidget();
     }
 
@@ -2497,6 +2528,7 @@ public:
                                 .OnClicked(this, &SProbeWorkspace::StopOrCancel)
                                 [ SNew(STextBlock).Text_Lambda([this]() { return bPortableRun
                                     ? LOCTEXT("Dev20CancelPortable", "Cancel Portable Run")
+                                    : bNativeRun ? LOCTEXT("Dev23StopMonitoring", "Stop Monitoring")
                                     : LOCTEXT("StopAfterCurrent", "Stop After Test"); }) ]
                             ]
                             + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(4, 0, 3, 0)
@@ -2525,8 +2557,21 @@ public:
                     ]
                 ]
             ]
-            + SVerticalBox::Slot().AutoHeight().Padding(7, 4, 7, 1)
-            [ SNew(SExpandableArea).InitiallyCollapsed(!bDev20LibraryExpanded)
+            + SVerticalBox::Slot().FillHeight(1.0f).Padding(7, 0, 7, 0)
+            [
+                SNew(SSplitter).Orientation(Orient_Vertical)
+                + SSplitter::Slot().Value(TAttribute<float>::Create(
+                    TAttribute<float>::FGetter::CreateLambda([this]() { return bResultsFocused ? 0.0f : (bDev16ResultsCollapsed ? 1.0f : DefinitionFraction); })))
+                .OnSlotResized(SSplitter::FOnSlotResized::CreateSP(this, &SProbeWorkspace::OnDefinitionResized))
+                [
+                    SNew(SBox)
+                // A zero-height splitter slot does not suppress children's desired sizes.
+                // Collapse the entire upper workspace while Results has focus.
+                .Visibility_Lambda([this]() { return bResultsFocused ? EVisibility::Collapsed : EVisibility::Visible; })
+                [ SNew(SSplitter).Orientation(Orient_Horizontal)
+                    + SSplitter::Slot().Value(0.36f)
+                    [
+                        SNew(SExpandableArea).InitiallyCollapsed(!bDev20LibraryExpanded)
               .OnAreaExpansionChanged_Lambda([this](bool bExpanded)
               { bDev20LibraryExpanded = bExpanded;
                 GConfig->SetBool(TEXT("ProbeWorkspace"), TEXT("Dev20LibraryExpanded"), bExpanded, GEditorPerProjectIni); })
@@ -2534,13 +2579,18 @@ public:
                 [ SNew(STextBlock).Text(LOCTEXT("Dev20LibraryTitle", "Test Library  |  Authored  •  Portable  •  Unreal Automation"))
                   .Font(FAppStyle::GetFontStyle("NormalFontBold")) ]
               .BodyContent()
-                [ SNew(SBox).HeightOverride(270.f)
+                [ SNew(SBox).MinDesiredHeight(340.f)
                   [ SAssignNew(UnifiedCatalog, SProbeUnifiedCatalog)
                     .OnOpen(FOnProbeCatalogEntry::CreateSP(this, &SProbeWorkspace::OpenCatalogEntry))
-                    .OnRun(FOnProbeCatalogEntry::CreateSP(this, &SProbeWorkspace::RunCatalogEntry)) ] ] ]
-            + SVerticalBox::Slot().AutoHeight().Padding(8, 7, 8, 6)
-            [
-                SNew(SVerticalBox)
+                    .OnRun(FOnProbeCatalogEntry::CreateSP(this, &SProbeWorkspace::RunCatalogEntry)) ] ]
+                    ]
+                    + SSplitter::Slot().Value(0.64f)
+                    [
+                    SNew(SVerticalBox)
+                    .Visibility_Lambda([this]() { return bResultsFocused ? EVisibility::Collapsed : EVisibility::Visible; })
+                    + SVerticalBox::Slot().AutoHeight().Padding(2, 3, 2, 6)
+                    [
+                                        SNew(SVerticalBox)
                 + SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 4)
                 [
                     SNew(SHorizontalBox)
@@ -2560,16 +2610,7 @@ public:
                     .OnSelectionChanged(this, &SProbeWorkspace::OnSelectionChanged)
                     [ SNew(STextBlock).Text(this, &SProbeWorkspace::SelectedName) ]
                 ]
-            ]
-            + SVerticalBox::Slot().FillHeight(1.0f).Padding(7, 0, 7, 0)
-            [
-                SNew(SSplitter).Orientation(Orient_Vertical)
-                + SSplitter::Slot().Value(TAttribute<float>::Create(
-                    TAttribute<float>::FGetter::CreateLambda([this]() { return bResultsFocused ? 0.0f : (bDev16ResultsCollapsed ? 1.0f : DefinitionFraction); })))
-                .OnSlotResized(SSplitter::FOnSlotResized::CreateSP(this, &SProbeWorkspace::OnDefinitionResized))
-                [
-                    SNew(SVerticalBox)
-                    .Visibility_Lambda([this]() { return bResultsFocused ? EVisibility::Collapsed : EVisibility::Visible; })
+                    ]
                     + SVerticalBox::Slot().AutoHeight().Padding(2, 3, 2, 6)
                     [
                         SNew(SHorizontalBox)
@@ -2625,7 +2666,8 @@ public:
                             [ SAssignNew(EditorRows, SVerticalBox) ]
                         ]
                     ]
-                ]
+                    ]
+                ] ]
                 + SSplitter::Slot().Value(TAttribute<float>::Create(
                     TAttribute<float>::FGetter::CreateLambda([this]() { return bResultsFocused ? 1.0f : (bDev16ResultsCollapsed ? 0.0f : 1.0f - DefinitionFraction); })))
                 [
@@ -2761,6 +2803,7 @@ public:
 
     virtual ~SProbeWorkspace() override
     {
+        NativeBridge.Stop();
         FEditorDelegates::PostUndoRedo.RemoveAll(this);
     }
 
@@ -2831,7 +2874,61 @@ public:
         bResultsFocused = true;
     }
 
+public:
+    void Tick(const FGeometry& AllottedGeometry, const double InCurrentTime, const float InDeltaTime) override
+    {
+        SCompoundWidget::Tick(AllottedGeometry, InCurrentTime, InDeltaTime);
+        if (!bNativeRun) { return; }
+        ProbeDev23::FObservedRun Observation;
+        if (NativeBridge.Read(Observation))
+        {
+            FinishNativeRun(Observation, FString());
+        }
+        else if (FPlatformTime::Seconds() >= NativeDeadline)
+        {
+            FinishNativeRun(Observation, TEXT("Unreal Automation did not report completion before the 180-second monitoring deadline. The test might still be running in Unreal; Probe did not infer a result."));
+        }
+    }
+
 private:
+    void FinishNativeRun(const ProbeDev23::FObservedRun& Observation, const FString& Interruption)
+    {
+        NativeBridge.Stop();
+        bNativeRun = false;
+        bRunInProgress = false;
+        Probe::FTestResult Result;
+        Result.Name = NativePath;
+        Result.Id = NativePath;
+        Result.AssetPath = TEXT("unreal-automation://") + NativePath;
+        Result.DurationMs = Observation.DurationMs;
+        Result.Status = Interruption.IsEmpty() ? ProbeDev23::StatusFromOutcome(Observation.Outcome) : Probe::EResultStatus::Error;
+        Result.Detail = Interruption.IsEmpty() ? TEXT("AutomationController reported ") + Observation.Outcome : Interruption;
+        for (const FString& Event : Observation.Events)
+        { Result.Detail += TEXT("\n") + Event; }
+        Results.Reset();
+        Results.Add(MoveTemp(Result));
+        ActiveResultFilter = EResultFilter::All;
+        SelectedResultIndex = INDEX_NONE;
+        LastComparison = ProbeDev10RunHistory::Compare(LastCompletedResults, Results);
+        LastCompletedResults = Results;
+        LastRunTime = FDateTime::Now();
+        LastRunDurationMs = Results[0].DurationMs;
+        bViewingSavedHistory = false;
+        if (MaxSavedHistoryRuns > 0)
+        {
+            ProbeDev11RunHistory::FSnapshot Snapshot;
+            Snapshot.TimestampUtc = FDateTime::UtcNow();
+            Snapshot.EngineVersion = FEngineVersion::Current().ToString();
+            Snapshot.Results = Results;
+            if (!ProbeDev11RunHistory::Save(ProbeDev11RunHistory::DefaultDirectory(), Snapshot,
+                nullptr, MaxSavedHistoryRuns))
+            { UE_LOG(LogTemp, Warning, TEXT("Probe: could not save native Automation result.")); }
+        }
+        FeedbackMessage = FText::FromString(Results[0].Detail);
+        ShowResults();
+        NativePath.Empty();
+    }
+
     TArray<TSharedPtr<FAssetData>> Assets;
     TSharedPtr<FAssetData> Selected;
     TSharedPtr<SComboBox<TSharedPtr<FAssetData>>> TestSelector;
@@ -2850,6 +2947,10 @@ private:
     TMap<int32, Probe::FRunOptions> ScopedRunOptions;
     bool bRunInProgress = false;
     bool bPortableRun = false;
+    bool bNativeRun = false;
+    ProbeDev23::FNativeLogBridge NativeBridge;
+    double NativeDeadline = 0.0;
+    FString NativePath;
     bool bDev20LibraryExpanded = true;
     bool bSelectingFromCatalog = false;
     bool bStopAfterCurrentTest = false;
@@ -6691,8 +6792,8 @@ private:
         }
         else if (Entry.Source == ProbeDev20::ESource::NativeAutomation)
         {
-            FeedbackMessage = FText::FromString(TEXT("Native Automation test selected: ") + Entry.Id
-                + TEXT(". Run Selection delegates execution to Unreal's Automation system; results remain in its Automation panel."));
+            FeedbackMessage = FText::FromString(TEXT("Native Automation selected: ") + Entry.Id
+                + TEXT(". Run Selection tracks authoritative controller completion in Probe Results and History."));
         }
         else
         {
@@ -6752,14 +6853,28 @@ private:
             return;
         case ProbeDev20::ESource::NativeAutomation:
         {
-            // Unreal Automation owns test scheduling, events and result history.
-            // Do not record a fake PASS or build a synthetic Probe Test Asset.
+            // Capture the controller's full-path completion message, not command acceptance.
+            // Results are never marked passed unless the controller reports success.
+            if (!NativeBridge.Start(Entry.Locator))
+            {
+                FeedbackMessage = FText::FromString(TEXT("Native Automation monitoring unavailable: ") + Entry.Locator);
+                return;
+            }
+            NativePath = Entry.Locator;
+            bNativeRun = true;
+            bRunInProgress = true;
+            NativeDeadline = FPlatformTime::Seconds() + 180.0;
             const FString Command = TEXT("Automation RunTests ") + Entry.Locator;
             const bool bIssued = GEditor && GLog && GEditor->Exec(GEditor->GetEditorWorldContext().World(), *Command, *GLog);
-            FeedbackMessage = FText::FromString(bIssued
-                ? TEXT("Submitted to Unreal Automation: ") + Entry.Locator
-                    + TEXT(". Inspect results in Tools > Test Automation (Sessions Frontend).")
-                : TEXT("Unreal Automation did not accept: ") + Entry.Locator);
+            if (!bIssued)
+            {
+                ProbeDev23::FObservedRun Observation;
+                FinishNativeRun(Observation, TEXT("Unreal did not accept the Automation command."));
+            }
+            else
+            {
+                FeedbackMessage = FText::FromString(TEXT("Awaiting authoritative Unreal Automation result for: ") + Entry.Locator);
+            }
             return;
         }
         case ProbeDev20::ESource::PortableTest:
@@ -6798,6 +6913,12 @@ private:
 
     FReply StopOrCancel()
     {
+        if (bNativeRun)
+        {
+            ProbeDev23::FObservedRun Observation;
+            FinishNativeRun(Observation, TEXT("Probe stopped monitoring this native run at user request. Unreal may still be executing it; no success result is inferred."));
+            return FReply::Handled();
+        }
         if (bPortableRun)
         {
             FeedbackMessage = ProbePortable::RequestCancel()
@@ -7410,10 +7531,16 @@ public:
         if (SelectedPack.IsValid() && PackSelector.IsValid()) { PackSelector->SetSelectedItem(SelectedPack); }
         RebuildMembers();
         FEditorDelegates::PostUndoRedo.AddSP(this, &SProbePackWorkspace::OnUndoRedo);
+        FAssetRegistryModule& RegistryModule = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry");
+        PackRemovedDelegate = RegistryModule.Get().OnAssetRemoved().AddSP(this, &SProbePackWorkspace::HandleAssetRemoved);
     }
     virtual ~SProbePackWorkspace() override
     {
         FEditorDelegates::PostUndoRedo.RemoveAll(this);
+        if (FAssetRegistryModule* RegistryModule = FModuleManager::GetModulePtr<FAssetRegistryModule>("AssetRegistry"))
+        {
+            RegistryModule->Get().OnAssetRemoved().Remove(PackRemovedDelegate);
+        }
     }
     virtual bool SupportsKeyboardFocus() const override { return true; }
     virtual FReply OnKeyDown(const FGeometry& Geometry, const FKeyEvent& Event) override
@@ -7462,6 +7589,29 @@ public:
         }
     }
 private:
+    FDelegateHandle PackRemovedDelegate;
+    void HandleAssetRemoved(const FAssetData& Removed)
+    {
+        if (Removed.AssetClassPath != UProbeTestPack::StaticClass()->GetClassPathName()) { return; }
+        const FString RemovedPath = Removed.GetObjectPathString();
+        if (SelectedPack.IsValid() && SelectedPack->GetObjectPathString() == RemovedPath)
+        {
+            // Drop the stale FAssetData before any Slate text/enable bindings run.
+            SelectedPack.Reset();
+            SelectedMemberPaths.Reset();
+            Message = TEXT("The selected Probe Pack was deleted. Choose another Pack or create a new one.");
+            InvalidateAudit();
+            if (PackSelector.IsValid()) { PackSelector->ClearSelection(); }
+            if (MemberRows.IsValid()) { MemberRows->ClearChildren(); }
+        }
+        // Re-query on the next Slate tick, after the registry finishes dispatching deletion.
+        RegisterActiveTimer(0.0f, FWidgetActiveTimerDelegate::CreateLambda(
+            [this](double, float) -> EActiveTimerReturnType
+            {
+                RefreshPacks();
+                return EActiveTimerReturnType::Stop;
+            }));
+    }
     TArray<TSharedPtr<FAssetData>> Packs;
     TSharedPtr<FAssetData> SelectedPack;
     TSharedPtr<SComboBox<TSharedPtr<FAssetData>>> PackSelector;

@@ -24,6 +24,7 @@ namespace ProbeDev20
         FString Id;
         FString Name;
         FString Owner;
+        FString Category; // Hierarchical Automation category derived from its registered full path.
         FString Detail;
         FString Locator; // Asset object path, portable ID, or exact native Automation name.
         bool bRequiresAuthorization = false;
