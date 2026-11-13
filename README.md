@@ -1,3 +1,18 @@
+# Probe 0.15.4-dev25
+
+## Dev 25: Controller-owned structured native report enrichment
+
+**Verified baseline:** Dev 24 compiled and passed 142 Probe automation tests plus 3 additional Metric/Orbit tests, with successful native execution and interruption manual checks. Dev 25 is a source package pending local UE 5.8.3 validation.
+
+- **Structured read-only reporting:** after an exact native completion-log match, Probe checks the AutomationController module's `IAutomationReport` tree for that test's full path and copies terminal `FAutomationTestResults` data: result state, duration, warnings, errors, execution events, device cluster and game instance when provided.
+- **Safety:** a mismatched structured outcome (e.g., cached results) does not override the current execution's completion status. When a report is not available, Probe retains its previously verified controller-log completion fallback. Interrupted runs never inherit structured success.
+- **Unified presentation:** the richer details flow into existing Results Explorer and saved History without modifying Test Assets, portable provider contracts, or Pack policies.
+- **Test coverage:** three new Dev 25 native regression tests for state mapping, exact report identity and completion/status consistency.
+
+See [Dev 25 QA checklist](Docs/QA_CHECKLIST_0154_DEV25.md). Full API-driven native orchestration and mixed-source Pack scheduling remain future milestones.
+
+---
+
 # Probe 0.15.4-dev20
 
 ## Dev 20: Unified Test Library in the main Probe workspace
@@ -516,3 +531,7 @@ Add Step, Change Assertion, and Templates now use a shared category/subcategory 
 The `Probe.Editor.StepDuplicationSafety` Automation Framework test can be run via Unreal's Output Log command input using `Automation RunTests Probe.Editor.StepDuplicationSafety`.
 
 See `Docs/QA_CHECKLIST_014.md` for first-run checks. Plugin-specific Focus automation will be based on the current Focus source rather than the outdated public repository version.
+
+### Dev 24 — Native monitoring status and diagnostics
+
+A user-initiated **Stop Monitoring** now produces **Interrupted**, not Error or Failed. This status persists in the Results Explorer, History, report status, and regression comparisons without manufacturing a test failure or recovery. A monitoring label on the main toolbar shows the test and observation time. The bounded AutomationController diagnostic capture also records controller event lines; this is not yet the fully structured AutomationController event API. See [Dev 24 acceptance tests](Docs/QA_CHECKLIST_0154_DEV24.md).

@@ -36,6 +36,7 @@ namespace ProbeDev10RunHistory
             if (Result.AssetPath.IsEmpty()) { continue; }
             const Probe::EResultStatus* Old = PreviousStatuses.Find(Identity(Result));
             if (!Old) { ++Comparison.NewlyObserved; continue; }
+            if (*Old == Probe::EResultStatus::Interrupted || Result.Status == Probe::EResultStatus::Interrupted) { continue; }
             const bool bPreviousProblem = ProbeDev10PackPolicy::IsProblem(*Old);
             const bool bCurrentProblem = ProbeDev10PackPolicy::IsProblem(Result.Status);
             if (bCurrentProblem && !bPreviousProblem && *Old == Probe::EResultStatus::Passed)
@@ -52,6 +53,7 @@ namespace ProbeDev10RunHistory
     {
         if (Result.Status == Probe::EResultStatus::Passed) { return TEXT("None"); }
         if (Result.Status == Probe::EResultStatus::Skipped) { return TEXT("Skipped"); }
+        if (Result.Status == Probe::EResultStatus::Interrupted) { return TEXT("Interrupted"); }
         for (const Probe::FStepResult& Step : Result.Steps)
         {
             if (!ProbeDev10PackPolicy::IsProblem(Step.Status)) { continue; }

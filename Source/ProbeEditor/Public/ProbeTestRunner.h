@@ -11,7 +11,8 @@ namespace Probe
         Passed,
         Failed,
         Skipped,
-        Error
+        Error,
+        Interrupted // User stopped observing; outcome remains unknown. Append to preserve existing values.
     };
 
     // Inclusive zero-based range. The default runs every step. A scoped run

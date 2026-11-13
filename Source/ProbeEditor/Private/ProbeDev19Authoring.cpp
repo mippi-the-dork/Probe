@@ -340,6 +340,7 @@ FRunSummary Summarize(const TArray<Probe::FTestResult>& Results)
         else if (Status == TEXT("FAILED")) { ++Sum.Failed; }
         else if (Status == TEXT("CANCELLED")) { ++Sum.Cancelled; }
         else if (Status == TEXT("SKIPPED")) { ++Sum.Skipped; }
+        else if (Status == TEXT("INTERRUPTED")) { ++Sum.Interrupted; }
         else { ++Sum.Errors; }
     }
     return Sum;
@@ -347,8 +348,9 @@ FRunSummary Summarize(const TArray<Probe::FTestResult>& Results)
 
 FString FRunSummary::ToString() const
 {
-    return FString::Printf(TEXT("%d passed, %d failed, %d errors, %d cancelled, %d skipped"),
+    const FString Base = FString::Printf(TEXT("%d passed, %d failed, %d errors, %d cancelled, %d skipped"),
         Passed, Failed, Errors, Cancelled, Skipped);
+    return Interrupted > 0 ? Base + FString::Printf(TEXT(", %d interrupted"), Interrupted) : Base;
 }
 
 TSharedRef<FJsonObject> BuildRunReport(const FString& DefinitionId, bool bPack,
@@ -367,6 +369,7 @@ TSharedRef<FJsonObject> BuildRunReport(const FString& DefinitionId, bool bPack,
     Totals->SetNumberField(TEXT("errors"), Summary.Errors);
     Totals->SetNumberField(TEXT("cancelled"), Summary.Cancelled);
     Totals->SetNumberField(TEXT("skipped"), Summary.Skipped);
+    Totals->SetNumberField(TEXT("interrupted"), Summary.Interrupted);
     Root->SetObjectField(TEXT("summary"), Totals);
     TArray<TSharedPtr<FJsonValue>> Tests;
     for (const Probe::FTestResult& Test : Results)

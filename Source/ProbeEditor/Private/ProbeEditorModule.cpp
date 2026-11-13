@@ -20,6 +20,8 @@
 #include "ProbeDev19Authoring.h"
 #include "ProbeDev20Catalog.h"
 #include "ProbeDev23NativeBridge.h"
+#include "ProbeDev25StructuredResults.h"
+#include "ProbeDev26NativeExecution.h"
 #include "ProbeSelfTest.h"
 #include "ProbeTestAssetFactory.h"
 #include "ProbeTestPack.h"
@@ -2519,16 +2521,23 @@ public:
                               .OnGetMenuContent(this, &SProbeWorkspace::BuildPackMenu)
                               .ButtonContent()[ SNew(STextBlock).Text(LOCTEXT("RunPack", "Run Pack")) ] ]
                             + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(4, 0, 3, 0)
+                            [ SNew(STextBlock)
+                              .Visibility_Lambda([this]() { return bNativeRun ? EVisibility::Visible : EVisibility::Collapsed; })
+                              .Text_Lambda([this]() { return FText::FromString(FString::Printf(TEXT("%s: %s (%.1fs)"), *NativeExecution.PhaseLabel(), *FPaths::GetCleanFilename(NativePath), FMath::Max(0.0, FPlatformTime::Seconds() - NativeStartSeconds))); })
+                              .ColorAndOpacity(FSlateColor::UseSubduedForeground()) ]
+                            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(4, 0, 3, 0)
                             [
                                 SNew(SButton)
                                 .ButtonStyle(FAppStyle::Get(), "SimpleButton")
-                                .ToolTipText(LOCTEXT("StopAfterCurrentTip", "Finish the current test then safely skip queued tests."))
+                                .ToolTipText_Lambda([this]() { return bNativeRun
+                                    ? LOCTEXT("StopNativeMonitoringTip", "Stop the controller-owned test (if running), or stop discovery. Probe records Interrupted without claiming a test passed or was fully cancelled.")
+                                    : LOCTEXT("StopAfterCurrentTip", "Finish the current test then safely skip queued tests."); })
                                 .Visibility_Lambda([this]() { return bRunInProgress ? EVisibility::Visible : EVisibility::Collapsed; })
                                 .IsEnabled_Lambda([this]() { return bRunInProgress && (bPortableRun || !bStopAfterCurrentTest); })
                                 .OnClicked(this, &SProbeWorkspace::StopOrCancel)
                                 [ SNew(STextBlock).Text_Lambda([this]() { return bPortableRun
                                     ? LOCTEXT("Dev20CancelPortable", "Cancel Portable Run")
-                                    : bNativeRun ? LOCTEXT("Dev23StopMonitoring", "Stop Monitoring")
+                                    : bNativeRun ? LOCTEXT("Dev26StopNative", "Stop Native Run")
                                     : LOCTEXT("StopAfterCurrent", "Stop After Test"); }) ]
                             ]
                             + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(4, 0, 3, 0)
@@ -2804,6 +2813,7 @@ public:
     virtual ~SProbeWorkspace() override
     {
         NativeBridge.Stop();
+        NativeExecution.Reset();
         FEditorDelegates::PostUndoRedo.RemoveAll(this);
     }
 
@@ -2879,14 +2889,38 @@ public:
     {
         SCompoundWidget::Tick(AllottedGeometry, InCurrentTime, InDeltaTime);
         if (!bNativeRun) { return; }
+        NativeExecution.Tick();
         ProbeDev23::FObservedRun Observation;
-        if (NativeBridge.Read(Observation))
+        const bool bLogCompleted = NativeBridge.Read(Observation);
+        if (NativeExecution.Phase() == ProbeDev26::EPhase::Error)
         {
-            FinishNativeRun(Observation, FString());
+            FinishNativeRun(Observation, NativeExecution.Error());
+        }
+        else if (NativeExecution.Phase() == ProbeDev26::EPhase::Complete)
+        {
+            ProbeDev25::FStructuredResult Structured;
+            if (ProbeDev25::TryReadCompletedReport(NativePath, Structured))
+            {
+                // Completion delegate for this exact API-owned run plus exact-path structured
+                // report is sufficient; log messages are supplemental, not required.
+                Observation.bCompleted = true;
+                Observation.Outcome = Structured.State;
+                Observation.DurationMs = Structured.DurationMs;
+                FinishNativeRun(Observation, FString());
+            }
+            else if (bLogCompleted)
+            {
+                FinishNativeRun(Observation, FString());
+            }
+            else if (FPlatformTime::Seconds() >= NativeDeadline)
+            {
+                FinishNativeRun(Observation, TEXT("Controller completion arrived, but no exact-path terminal report was available. Probe cannot infer an outcome."));
+            }
         }
         else if (FPlatformTime::Seconds() >= NativeDeadline)
         {
-            FinishNativeRun(Observation, TEXT("Unreal Automation did not report completion before the 180-second monitoring deadline. The test might still be running in Unreal; Probe did not infer a result."));
+            NativeExecution.Stop();
+            FinishNativeRun(Observation, TEXT("Native Automation exceeded the 180-second execution deadline. Probe did not infer success."));
         }
     }
 
@@ -2900,9 +2934,33 @@ private:
         Result.Name = NativePath;
         Result.Id = NativePath;
         Result.AssetPath = TEXT("unreal-automation://") + NativePath;
-        Result.DurationMs = Observation.DurationMs;
-        Result.Status = Interruption.IsEmpty() ? ProbeDev23::StatusFromOutcome(Observation.Outcome) : Probe::EResultStatus::Error;
+        Result.DurationMs = Observation.bCompleted ? Observation.DurationMs
+            : FMath::Max(0.0, (FPlatformTime::Seconds() - NativeStartSeconds) * 1000.0);
+        Result.Status = Interruption.IsEmpty() ? ProbeDev23::StatusFromOutcome(Observation.Outcome)
+            : (bUserStoppedNativeObservation ? Probe::EResultStatus::Interrupted : Probe::EResultStatus::Error);
+        bUserStoppedNativeObservation = false;
         Result.Detail = Interruption.IsEmpty() ? TEXT("AutomationController reported ") + Observation.Outcome : Interruption;
+        // Read the controller's structured result only AFTER a matching completion event.
+        // This prevents a cached success from an earlier run being attributed to this one.
+        ProbeDev25::FStructuredResult Structured;
+        if (Interruption.IsEmpty() && Observation.bCompleted
+            && ProbeDev25::TryReadCompletedReport(NativePath, Structured)
+            && ProbeDev25::ConvertState(Structured.State) == ProbeDev23::StatusFromOutcome(Observation.Outcome))
+        {
+            Result.Status = ProbeDev25::ConvertState(Structured.State);
+            Result.DurationMs = Structured.DurationMs;
+            Result.Detail = FString::Printf(TEXT("AutomationController structured report: %s | %d warnings | %d errors"),
+                *Structured.State, Structured.Warnings, Structured.Errors);
+            if (!Structured.Device.IsEmpty()) { Result.Detail += TEXT("\nDevice cluster: ") + Structured.Device; }
+            if (!Structured.GameInstance.IsEmpty()) { Result.Detail += TEXT("\nGame instance: ") + Structured.GameInstance; }
+            for (const FString& Event : Structured.Events) { Result.Detail += TEXT("\n") + Event; }
+        }
+        else if (Interruption.IsEmpty() && Observation.bCompleted)
+        {
+            Result.Detail += TEXT("\nStructured controller report unavailable; authoritative completion-log fallback used.");
+        }
+        if (Observation.bStarted) { Result.Detail += TEXT("\nAutomationController confirmed test start."); }
+        if (Observation.Events.Num() > 0) { Result.Detail += FString::Printf(TEXT("\nController diagnostic events (%d, capped at 64):"), Observation.Events.Num()); }
         for (const FString& Event : Observation.Events)
         { Result.Detail += TEXT("\n") + Event; }
         Results.Reset();
@@ -2926,6 +2984,7 @@ private:
         }
         FeedbackMessage = FText::FromString(Results[0].Detail);
         ShowResults();
+        NativeExecution.Reset();
         NativePath.Empty();
     }
 
@@ -2948,7 +3007,10 @@ private:
     bool bRunInProgress = false;
     bool bPortableRun = false;
     bool bNativeRun = false;
+    bool bUserStoppedNativeObservation = false;
+    double NativeStartSeconds = 0.0;
     ProbeDev23::FNativeLogBridge NativeBridge;
+    ProbeDev26::FNativeExecution NativeExecution;
     double NativeDeadline = 0.0;
     FString NativePath;
     bool bDev20LibraryExpanded = true;
@@ -2957,7 +3019,7 @@ private:
     bool bStopDueToPackFailure = false;
     TStrongObjectPtr<UProbeTestPack> ActivePackForRun; // Retain policy asset until async queue drains.
     TMap<int32, int32> PackCompletedAttempts;
-    enum class EResultFilter : uint8 { All, Passed, Failed, Skipped, Error };
+    enum class EResultFilter : uint8 { All, Passed, Failed, Skipped, Error, Interrupted };
     EResultFilter ActiveResultFilter = EResultFilter::All;
     int32 SelectedResultIndex = INDEX_NONE;
     bool bProblemsFirst = true;
@@ -5740,6 +5802,7 @@ private:
         case Probe::EResultStatus::Passed: return Style->GetBrush(TEXT("Probe.StatusPassed"));
         case Probe::EResultStatus::Failed: return Style->GetBrush(TEXT("Probe.StatusFailed"));
         case Probe::EResultStatus::Skipped: return Style->GetBrush(TEXT("Probe.StatusSkipped"));
+        case Probe::EResultStatus::Interrupted: return Style->GetBrush(TEXT("Probe.StatusSkipped"));
         default: return Style->GetBrush(TEXT("Probe.StatusError"));
         }
     }
@@ -5751,6 +5814,7 @@ private:
         case Probe::EResultStatus::Passed: return FLinearColor(0.30f, 0.70f, 0.36f);
         case Probe::EResultStatus::Failed: return FLinearColor(0.90f, 0.34f, 0.31f);
         case Probe::EResultStatus::Skipped: return FLinearColor(0.62f, 0.62f, 0.62f);
+        case Probe::EResultStatus::Interrupted: return FLinearColor(0.88f, 0.70f, 0.30f);
         default: return FLinearColor(0.95f, 0.36f, 0.27f);
         }
     }
@@ -5849,7 +5913,8 @@ private:
         {
         case Probe::EResultStatus::Error: return 0;
         case Probe::EResultStatus::Failed: return 1;
-        case Probe::EResultStatus::Skipped: return 2;
+        case Probe::EResultStatus::Interrupted: return 2;
+        case Probe::EResultStatus::Skipped: return 3;
         case Probe::EResultStatus::Passed: return 3;
         }
         return 4;
@@ -5863,6 +5928,7 @@ private:
         case EResultFilter::Failed: return Status == Probe::EResultStatus::Failed;
         case EResultFilter::Skipped: return Status == Probe::EResultStatus::Skipped;
         case EResultFilter::Error: return Status == Probe::EResultStatus::Error;
+        case EResultFilter::Interrupted: return Status == Probe::EResultStatus::Interrupted;
         default: return true;
         }
     }
@@ -5904,7 +5970,7 @@ private:
               .Text(LOCTEXT("NoRunsSummary", "No tests run")) ];
             return;
         }
-        int32 Passed = 0, Failed = 0, Skipped = 0, Errors = 0;
+        int32 Passed = 0, Failed = 0, Skipped = 0, Errors = 0, Interrupted = 0;
         for (const Probe::FTestResult& Result : Results)
         {
             switch (Result.Status)
@@ -5912,6 +5978,7 @@ private:
             case Probe::EResultStatus::Passed: ++Passed; break;
             case Probe::EResultStatus::Failed: ++Failed; break;
             case Probe::EResultStatus::Skipped: ++Skipped; break;
+            case Probe::EResultStatus::Interrupted: ++Interrupted; break;
             default: ++Errors; break;
             }
         }
@@ -5925,6 +5992,8 @@ private:
             FLinearColor(0.62f, 0.62f, 0.62f));
         AddSummaryFilter(Errors, TEXT("Errors"), EResultFilter::Error,
             FLinearColor(0.90f, 0.30f, 0.28f));
+        AddSummaryFilter(Interrupted, TEXT("Interrupted"), EResultFilter::Interrupted,
+            ResultColor(Probe::EResultStatus::Interrupted));
     }
 
     FReply ChooseResultView(bool bLog)
@@ -6853,28 +6922,21 @@ private:
             return;
         case ProbeDev20::ESource::NativeAutomation:
         {
-            // Capture the controller's full-path completion message, not command acceptance.
-            // Results are never marked passed unless the controller reports success.
-            if (!NativeBridge.Start(Entry.Locator))
+            FString DispatchError;
+            if (!NativeExecution.Start(Entry.Locator, DispatchError))
             {
-                FeedbackMessage = FText::FromString(TEXT("Native Automation monitoring unavailable: ") + Entry.Locator);
+                FeedbackMessage = FText::FromString(TEXT("Native Automation dispatch unavailable: ") + DispatchError);
                 return;
             }
+            // Optional diagnostic listener; the controller's structured completion is authoritative.
+            // If log observation is unavailable, API execution still proceeds.
+            NativeBridge.Start(Entry.Locator);
             NativePath = Entry.Locator;
             bNativeRun = true;
             bRunInProgress = true;
-            NativeDeadline = FPlatformTime::Seconds() + 180.0;
-            const FString Command = TEXT("Automation RunTests ") + Entry.Locator;
-            const bool bIssued = GEditor && GLog && GEditor->Exec(GEditor->GetEditorWorldContext().World(), *Command, *GLog);
-            if (!bIssued)
-            {
-                ProbeDev23::FObservedRun Observation;
-                FinishNativeRun(Observation, TEXT("Unreal did not accept the Automation command."));
-            }
-            else
-            {
-                FeedbackMessage = FText::FromString(TEXT("Awaiting authoritative Unreal Automation result for: ") + Entry.Locator);
-            }
+            NativeStartSeconds = FPlatformTime::Seconds();
+            NativeDeadline = NativeStartSeconds + 180.0;
+            FeedbackMessage = FText::FromString(TEXT("Discovering and dispatching via AutomationController: ") + Entry.Locator);
             return;
         }
         case ProbeDev20::ESource::PortableTest:
@@ -6916,7 +6978,26 @@ private:
         if (bNativeRun)
         {
             ProbeDev23::FObservedRun Observation;
-            FinishNativeRun(Observation, TEXT("Probe stopped monitoring this native run at user request. Unreal may still be executing it; no success result is inferred."));
+            if (NativeExecution.Phase() == ProbeDev26::EPhase::Complete)
+            {
+                ProbeDev25::FStructuredResult Structured;
+                if (ProbeDev25::TryReadCompletedReport(NativePath, Structured))
+                {
+                    Observation.bCompleted = true;
+                    Observation.Outcome = Structured.State;
+                    Observation.DurationMs = Structured.DurationMs;
+                    FinishNativeRun(Observation, FString());
+                    return FReply::Handled();
+                }
+            }
+            // StopTests only targets a run that this Probe workspace dispatched.
+            // It is a stop request, not proof that workers ceased immediately.
+            const bool bOwnedRun = NativeExecution.OwnsRun();
+            NativeExecution.Stop();
+            bUserStoppedNativeObservation = true;
+            FinishNativeRun(Observation, bOwnedRun
+                ? TEXT("Probe requested AutomationController StopTests for this native run. Worker shutdown is not assumed; result recorded as Interrupted.")
+                : TEXT("Probe cancelled native worker/test discovery before dispatch. No test success was inferred."));
             return FReply::Handled();
         }
         if (bPortableRun)

@@ -24,7 +24,7 @@ namespace ProbeDev19
         const ProbePortable::FPortablePack& Pack);
     struct FRunSummary
     {
-        int32 Passed = 0, Failed = 0, Errors = 0, Cancelled = 0, Skipped = 0;
+        int32 Passed = 0, Failed = 0, Errors = 0, Cancelled = 0, Skipped = 0, Interrupted = 0;
         FString ToString() const;
     };
     FString DisplayStatus(const Probe::FTestResult& Test);

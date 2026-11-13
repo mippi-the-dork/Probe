@@ -45,6 +45,7 @@ namespace ProbeDev11RunHistory
         if (Text == TEXT("FAILED")) { Out = Probe::EResultStatus::Failed; return true; }
         if (Text == TEXT("SKIPPED")) { Out = Probe::EResultStatus::Skipped; return true; }
         if (Text == TEXT("ERROR")) { Out = Probe::EResultStatus::Error; return true; }
+        if (Text == TEXT("INTERRUPTED")) { Out = Probe::EResultStatus::Interrupted; return true; }
         return false;
     }
 
@@ -234,13 +235,14 @@ namespace ProbeDev11RunHistory
 
     inline FString Label(const FSnapshot& Snapshot)
     {
-        int32 Passed = 0, Problems = 0;
+        int32 Passed = 0, Problems = 0, Interrupted = 0;
         for (const Probe::FTestResult& Result : Snapshot.Results)
         {
             if (Result.Status == Probe::EResultStatus::Passed) { ++Passed; }
+            else if (Result.Status == Probe::EResultStatus::Interrupted) { ++Interrupted; }
             else if (Result.Status == Probe::EResultStatus::Failed || Result.Status == Probe::EResultStatus::Error) { ++Problems; }
         }
-        return FString::Printf(TEXT("%s  |  %d tests, %d passed, %d problems"),
-            *Snapshot.TimestampUtc.ToString(TEXT("%Y-%m-%d %H:%M UTC")), Snapshot.Results.Num(), Passed, Problems);
+        return FString::Printf(TEXT("%s  |  %d tests, %d passed, %d problems, %d interrupted"),
+            *Snapshot.TimestampUtc.ToString(TEXT("%Y-%m-%d %H:%M UTC")), Snapshot.Results.Num(), Passed, Problems, Interrupted);
     }
 }

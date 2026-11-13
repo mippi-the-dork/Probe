@@ -20,13 +20,14 @@ namespace ProbeDev13History
         int32 Passed = 0;
         int32 Problems = 0;
         int32 Skipped = 0;
+        int32 Interrupted = 0;
         int32 Errors = 0;
         bool HasProblems() const { return Problems > 0; }
         FString Label() const
         {
-            return FString::Printf(TEXT("%s  [%s]  |  %d passed, %d problems, %d skipped"),
+            return FString::Printf(TEXT("%s  [%s]  |  %d passed, %d problems, %d skipped, %d interrupted"),
                 *Snapshot.TimestampUtc.ToString(TEXT("%Y-%m-%d %H:%M:%S UTC")),
-                *FPaths::GetBaseFilename(Path).Right(8), Passed, Problems, Skipped);
+                *FPaths::GetBaseFilename(Path).Right(8), Passed, Problems, Skipped, Interrupted);
         }
     };
 
@@ -40,6 +41,7 @@ namespace ProbeDev13History
         {
             if (Result.Status == Probe::EResultStatus::Passed) { ++Run.Passed; }
             else if (Result.Status == Probe::EResultStatus::Skipped) { ++Run.Skipped; }
+            else if (Result.Status == Probe::EResultStatus::Interrupted) { ++Run.Interrupted; }
             else if (IsProblem(Result.Status))
             {
                 ++Run.Problems;
@@ -70,7 +72,7 @@ namespace ProbeDev13History
             || ProbeDev12History::Matches(Run.Snapshot, Search, EStatusFilter::All);
     }
 
-    enum class EDeltaKind : uint8 { NewFailure, Recovered, StillFailing, NewlyObserved, Unchanged, Skipped };
+    enum class EDeltaKind : uint8 { NewFailure, Recovered, StillFailing, NewlyObserved, Unchanged, Skipped, Interrupted };
     struct FDelta
     {
         FString Identity;
@@ -90,6 +92,7 @@ namespace ProbeDev13History
         case EDeltaKind::StillFailing: return TEXT("STILL FAILING");
         case EDeltaKind::NewlyObserved: return TEXT("NEW TEST");
         case EDeltaKind::Skipped: return TEXT("SKIPPED");
+        case EDeltaKind::Interrupted: return TEXT("INTERRUPTED");
         default: return TEXT("UNCHANGED");
         }
     }
@@ -110,8 +113,10 @@ namespace ProbeDev13History
             Row.Identity = Id; Row.Name = Result.Name; Row.AssetPath = Result.AssetPath;
             Row.VariationName = Result.VariationName; Row.Current = Result.Status; Row.Detail = Result.Detail;
             const Probe::EResultStatus* Before = Prior.Find(Id);
-            if (Result.Status == Probe::EResultStatus::Skipped) { Row.Kind = EDeltaKind::Skipped; }
+            if (Result.Status == Probe::EResultStatus::Interrupted) { Row.Kind = EDeltaKind::Interrupted; }
+            else if (Result.Status == Probe::EResultStatus::Skipped) { Row.Kind = EDeltaKind::Skipped; }
             else if (!Before) { Row.Kind = EDeltaKind::NewlyObserved; }
+            else if (*Before == Probe::EResultStatus::Interrupted) { Row.Kind = EDeltaKind::Unchanged; }
             else if (IsProblem(Result.Status) && *Before == Probe::EResultStatus::Passed)
             { Row.Kind = EDeltaKind::NewFailure; }
             else if (Result.Status == Probe::EResultStatus::Passed && IsProblem(*Before))

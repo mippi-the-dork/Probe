@@ -63,6 +63,7 @@ namespace Probe
         case EResultStatus::Passed: return TEXT("PASSED");
         case EResultStatus::Failed: return TEXT("FAILED");
         case EResultStatus::Skipped: return TEXT("SKIPPED");
+        case EResultStatus::Interrupted: return TEXT("INTERRUPTED");
         default: return TEXT("ERROR");
         }
     }

@@ -35,6 +35,12 @@ Probe::EResultStatus StatusFromOutcome(const FString& Outcome)
         || Outcome.Equals(TEXT("Failed"), ESearchCase::IgnoreCase)) { return Probe::EResultStatus::Failed; }
     return Probe::EResultStatus::Error;
 }
+bool IsControllerDiagnostic(const FString& Line)
+{
+    return Line.Contains(TEXT("BeginEvents:")) || Line.Contains(TEXT("EndEvents:"))
+        || Line.Contains(TEXT("Error:")) || Line.Contains(TEXT("Warning:"))
+        || Line.Contains(TEXT("Event:")) || Line.Contains(TEXT("Test Event"));
+}
 bool FNativeLogBridge::Start(const FString& FullPath)
 {
     if (FullPath.IsEmpty() || !GLog) { return false; }
@@ -85,9 +91,8 @@ void FNativeLogBridge::Serialize(const TCHAR* V, ELogVerbosity::Type, const FNam
         const double Since = TestStartSeconds > 0 ? TestStartSeconds : StartSeconds;
         Current.DurationMs = FMath::Max(0.0, (FPlatformTime::Seconds() - Since) * 1000.0);
     }
-    else if (Current.bStarted && Current.Events.Num() < 64
-        && (Line.Contains(TEXT("BeginEvents:")) || Line.Contains(TEXT("EndEvents:"))
-            || Line.Contains(TEXT("Error:")) || Line.Contains(TEXT("Warning:"))))
+    else if (Current.bStarted && Current.Events.Num() < 64 && IsControllerDiagnostic(Line)
+        && (!Line.Contains(TEXT("Path={")) || Line.Contains(FString::Printf(TEXT("Path={%s}"), *Current.Path))))
     { Current.Events.Add(Line.Left(1000)); }
 }
 }

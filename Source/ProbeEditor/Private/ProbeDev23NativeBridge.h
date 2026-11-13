@@ -22,6 +22,8 @@ struct FObservedRun
 PROBEEDITOR_API bool ParseStarted(const FString& Line, FString& Path);
 PROBEEDITOR_API bool ParseCompleted(const FString& Line, FString& Path, FString& Outcome);
 PROBEEDITOR_API Probe::EResultStatus StatusFromOutcome(const FString& Outcome);
+// Controller-only diagnostic events; avoids collecting arbitrary plugin output.
+PROBEEDITOR_API bool IsControllerDiagnostic(const FString& Line);
 
 class FNativeLogBridge final : public FOutputDevice
 {

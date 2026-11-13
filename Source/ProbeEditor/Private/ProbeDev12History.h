@@ -77,6 +77,7 @@ namespace ProbeDev12History
         int32 Passes = 0;
         int32 Problems = 0;
         int32 Skipped = 0;
+        int32 Interrupted = 0;
         int32 Transitions = 0; // Between adjacent observed pass/problem outcomes.
         bool bHasPrior = false;
         bool bPriorProblem = false;
@@ -118,6 +119,8 @@ namespace ProbeDev12History
                 else { Index = *Existing; }
                 FTrend& Row = Rows[Index];
                 if (Result.Status == Probe::EResultStatus::Skipped) { ++Row.Skipped; continue; }
+                if (Result.Status == Probe::EResultStatus::Interrupted)
+                { ++Row.Interrupted; continue; } // Unobserved outcome is neither pass nor failure.
                 const bool bProblem = Result.Status == Probe::EResultStatus::Error || Result.Status == Probe::EResultStatus::Failed;
                 if (bProblem) { ++Row.Problems; } else { ++Row.Passes; }
                 if (Row.bHasPrior && Row.bPriorProblem != bProblem) { ++Row.Transitions; }
@@ -152,7 +155,7 @@ namespace ProbeDev12History
     {
         FString Output = FString::Printf(TEXT("Probe Historical Trends | %d saved run(s) | %d test identity/variation(s)\n"),
             RunCount, Trends.Num());
-        Output += TEXT("Skipped outcomes are excluded from failure rates. Flaky requires 2+ pass/fail transitions.\n\n");
+        Output += TEXT("Skipped and interrupted observations are excluded from failure rates. Flaky requires 2+ pass/fail transitions.\n\n");
         if (Trends.IsEmpty()) { return Output + TEXT("No matching historical test results.\n"); }
         for (const FTrend& Trend : Trends)
         {
@@ -160,6 +163,8 @@ namespace ProbeDev12History
                 Trend.IsFlaky() ? TEXT("[FLAKY]") : TEXT("[TREND]"), *Trend.AssetPath,
                 Trend.VariationName.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(" [%s]"), *Trend.VariationName),
                 Trend.Passes, Trend.Problems, Trend.Skipped, Trend.FailureRate(), Trend.Transitions);
+            if (Trend.Interrupted > 0)
+            { Output += FString::Printf(TEXT("  %d interrupted observation(s) (excluded)\n"), Trend.Interrupted); }
         }
         return Output;
     }

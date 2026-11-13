@@ -8,7 +8,7 @@ public class ProbeEditor : ModuleRules
         PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine" });
         PrivateDependencyModuleNames.AddRange(new string[] {
             "Slate", "SlateCore", "UnrealEd", "LevelEditor", "ToolMenus",
-            "Projects", "ApplicationCore", "AssetRegistry", "AssetTools", "AssetDefinition", "ContentBrowser", "PropertyEditor", "EditorFramework", "Json", "JsonUtilities", "AutomationDriver"
+            "Projects", "ApplicationCore", "AssetRegistry", "AssetTools", "AssetDefinition", "ContentBrowser", "PropertyEditor", "EditorFramework", "Json", "JsonUtilities", "AutomationDriver", "AutomationController"
         });
 
         // Slate list and combo widgets refer to EKeys symbols exported by InputCore.
