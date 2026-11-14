@@ -109,19 +109,29 @@ void FNativeExecution::Tick()
     {
         if (!FDecision::CanStart(Controller->GetTestState()))
         { Fail(TEXT("Another AutomationController run started during test discovery; Probe did not take over.")); return; }
-        TArray<FString> Available;
-        Controller->GetFilteredTestNames(Available);
-        if (Available.Contains(Path))
+        // GetFilteredTestNames is an AutomationController UI-filtered view, not an
+        // authoritative inventory.  The requested path may exist in the controller's
+        // reports while being hidden by the Session Frontend's active filters.
+        // Wait for the discovery response to populate *some* test reports, then
+        // ask the controller to select the exact full path and verify its answer.
+        TArray<FString> VisibleNames;
+        Controller->GetFilteredTestNames(VisibleNames);
+        const bool bReportsReady = !VisibleNames.IsEmpty() || !Controller->GetFilteredReports().IsEmpty();
+        if (bReportsReady)
         {
             Controller->GetEnabledTestNames(PreviousEnabled);
             PreviousPasses = Controller->GetNumPasses();
+            bChangedSelection = true; // Restore even if selection validation fails.
             Controller->SetEnabledTests({Path});
-            bChangedSelection = true;
             TArray<FString> Enabled;
             Controller->GetEnabledTestNames(Enabled);
             if (!FDecision::ExactSelection(Enabled, Path))
-            { Fail(TEXT("AutomationController could not isolate exactly the selected test; execution was blocked.")); return; }
-            // This controller owns the enabled selection only for this dispatch.
+            {
+                Fail(TEXT("AutomationController received the test list but could not enable exactly the requested full path: ") + Path
+                    + FString::Printf(TEXT(" (enabled count: %d; visible count: %d). Check native test flags and controller filters."), Enabled.Num(), VisibleNames.Num()));
+                return;
+            }
+            // Only one exact controller-confirmed test may be executed.
             Controller->SetNumPasses(1);
             bOwnsRun = true;
             bTestsComplete = false;
@@ -130,7 +140,9 @@ void FNativeExecution::Tick()
             PhaseStart = Now;
         }
         else if (Now - PhaseStart > 30.0)
-        { Fail(TEXT("Selected test was not returned by AutomationController discovery within 30 seconds: ") + Path); }
+        {
+            Fail(TEXT("AutomationController did not publish a test report tree within 30 seconds after requesting tests: ") + Path);
+        }
         return;
     }
     if (CurrentPhase == EPhase::Running && bTestsComplete)
