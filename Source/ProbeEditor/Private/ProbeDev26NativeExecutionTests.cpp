@@ -40,4 +40,17 @@ bool FProbeDev26DispatchSafety::RunTest(const FString&)
     TestTrue(TEXT("Stop on idle is harmless"), Dispatch.Phase() == ProbeDev26::EPhase::Idle);
     return true;
 }
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FProbeDev26UnfilteredDiscovery,
+    "Probe.Editor.Dev26UnfilteredDiscovery", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FProbeDev26UnfilteredDiscovery::RunTest(const FString&)
+{
+    using ProbeDev26::FDecision;
+    TestFalse(TEXT("Do not probe before requesting a fresh test list"), FDecision::ShouldProbeSelection(false, true, 60.0));
+    TestFalse(TEXT("Do not probe before refresh or retry interval"), FDecision::ShouldProbeSelection(true, false, 0.1));
+    TestTrue(TEXT("Controller test refresh triggers immediate exact-selection probe even when the filtered tree is empty"), FDecision::ShouldProbeSelection(true, true, 0.1));
+    TestTrue(TEXT("Periodic exact-selection probe works without refresh callback"), FDecision::ShouldProbeSelection(true, false, 0.5));
+    TestFalse(TEXT("No filtered-list requirement; incorrect enabled identity is rejected"), FDecision::ExactSelection({TEXT("Different.Test")}, TEXT("Probe.Editor.Dev23NativeCompletionParsing")));
+    TestTrue(TEXT("Exact enabled identity remains the only dispatch authority"), FDecision::ExactSelection({TEXT("Probe.Editor.Dev23NativeCompletionParsing")}, TEXT("Probe.Editor.Dev23NativeCompletionParsing")));
+    return true;
+}
 #endif

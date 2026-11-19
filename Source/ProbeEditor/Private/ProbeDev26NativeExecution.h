@@ -13,6 +13,7 @@ struct FDecision
     static bool ExactSelection(const TArray<FString>& Enabled, const FString& Path);
     static bool CanStart(EAutomationControllerModuleState::Type State);
     static bool IsTerminal(EPhase Phase);
+    static bool ShouldProbeSelection(bool bRequested, bool bRefreshed, double SecondsSinceAttempt);
 };
 class FNativeExecution
 {
@@ -30,14 +31,19 @@ public:
 private:
     void Fail(const FString& Reason);
     void OnTestsComplete();
+    void OnTestsRefreshed();
     IAutomationControllerManagerPtr Controller;
     FDelegateHandle CompletionHandle;
+    FDelegateHandle RefreshHandle;
     FString Path;
     FString LastError;
     EPhase CurrentPhase = EPhase::Idle;
     bool bOwnsRun = false;
     bool bTestsComplete = false;
     bool bRequestedTests = false;
+    bool bTestRefreshObserved = false;
+    int32 SelectionAttempts = 0;
+    double LastSelectionAttempt = 0.0;
     bool bChangedSelection = false;
     int32 PreviousPasses = 1;
     TArray<FString> PreviousEnabled;

@@ -1,3 +1,9 @@
+## Dev 27 — Mixed-source Probe Packs (development)
+
+Probe Packs can now explicitly opt into a unified ordered list of **authored Probe Tests, portable JSON Tests/Packs, and native Unreal Automation Tests**. In the Packs workspace, choose **+ Add From Library...** to search and append an entry; reorder or remove entries in the mixed list. Adding the first entry to a legacy authored-only Pack converts its Test list, preserving order, only when no prerequisites are present. Packs with prerequisites refuse conversion rather than dropping dependency semantics.
+
+Mixed runs dispatch entries one at a time using their existing permission and controller contracts; authorization for action-bearing portable entries is requested **before any entry executes**. All outcomes are combined into one Results Explorer view and one saved History run. Continue/Stop on Failure remains supported. See [Dev 27 QA checklist](Docs/QA_CHECKLIST_0154_DEV27.md). This source package has not been compiled in UE 5.8.3; live execution and manual acceptance are required.
+
 # Probe 0.15.4-dev25
 
 ## Dev 25: Controller-owned structured native report enrichment

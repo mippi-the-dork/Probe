@@ -14,12 +14,20 @@ bool FDecision::CanStart(EAutomationControllerModuleState::Type State)
 {
     return State != EAutomationControllerModuleState::Running;
 }
+bool FDecision::ShouldProbeSelection(bool bRequested, bool bRefreshed, double SecondsSinceAttempt)
+{
+    // The UI-filtered report view is not discovery authority.  A controller
+    // notification can prompt an immediate attempt, but also probe periodically
+    // because some engine paths do not broadcast a refresh for test discovery.
+    return bRequested && (bRefreshed || SecondsSinceAttempt >= 0.5);
+}
 bool FDecision::IsTerminal(EPhase Phase)
 {
     return Phase == EPhase::Complete || Phase == EPhase::Interrupted || Phase == EPhase::Error;
 }
 FNativeExecution::~FNativeExecution() { Reset(); }
 void FNativeExecution::OnTestsComplete() { bTestsComplete = true; }
+void FNativeExecution::OnTestsRefreshed() { bTestRefreshObserved = true; }
 void FNativeExecution::Fail(const FString& Reason)
 {
     LastError = Reason;
@@ -32,6 +40,11 @@ void FNativeExecution::Reset()
         Controller->OnTestsComplete().Remove(CompletionHandle);
     }
     CompletionHandle.Reset();
+    if (Controller.IsValid() && RefreshHandle.IsValid())
+    {
+        Controller->OnTestsRefreshed().Remove(RefreshHandle);
+    }
+    RefreshHandle.Reset();
     // Preserve Session Frontend's previous selection once our own run is finished.
     // Do not change selection while a worker remains active (including shutdown).
     if (Controller.IsValid() && bChangedSelection && Controller->GetTestState() != EAutomationControllerModuleState::Running)
@@ -46,6 +59,9 @@ void FNativeExecution::Reset()
     bOwnsRun = false;
     bTestsComplete = false;
     bRequestedTests = false;
+    bTestRefreshObserved = false;
+    SelectionAttempts = 0;
+    LastSelectionAttempt = 0.0;
     bChangedSelection = false;
     PreviousEnabled.Reset();
     PreviousPasses = 1;
@@ -75,9 +91,11 @@ bool FNativeExecution::Start(const FString& FullPath, FString& OutError)
     Path = FullPath;
     PhaseStart = FPlatformTime::Seconds();
     CompletionHandle = Controller->OnTestsComplete().AddRaw(this, &FNativeExecution::OnTestsComplete);
+    RefreshHandle = Controller->OnTestsRefreshed().AddRaw(this, &FNativeExecution::OnTestsRefreshed);
     if (Controller->GetNumDeviceClusters() > 0 && Controller->IsReadyForTests())
     {
         Controller->RequestTests();
+        LastSelectionAttempt = PhaseStart;
         CurrentPhase = EPhase::DiscoveringTests;
         bRequestedTests = true;
     }
@@ -99,6 +117,7 @@ void FNativeExecution::Tick()
             Controller->RequestTests();
             bRequestedTests = true;
             PhaseStart = Now;
+            LastSelectionAttempt = Now;
             CurrentPhase = EPhase::DiscoveringTests;
         }
         else if (Now - PhaseStart > 30.0)
@@ -109,39 +128,45 @@ void FNativeExecution::Tick()
     {
         if (!FDecision::CanStart(Controller->GetTestState()))
         { Fail(TEXT("Another AutomationController run started during test discovery; Probe did not take over.")); return; }
-        // GetFilteredTestNames is an AutomationController UI-filtered view, not an
-        // authoritative inventory.  The requested path may exist in the controller's
-        // reports while being hidden by the Session Frontend's active filters.
-        // Wait for the discovery response to populate *some* test reports, then
-        // ask the controller to select the exact full path and verify its answer.
-        TArray<FString> VisibleNames;
-        Controller->GetFilteredTestNames(VisibleNames);
-        const bool bReportsReady = !VisibleNames.IsEmpty() || !Controller->GetFilteredReports().IsEmpty();
-        if (bReportsReady)
+        // Never gate discovery on GetFilteredReports/GetFilteredTestNames: both
+        // are Session Frontend presentation views and can remain empty with a
+        // populated controller test tree.  Selection is the authoritative test.
+        // The refresh delegate accelerates polling, but selection also gets a
+        // bounded retry cadence for controller versions without that callback.
+        if (FDecision::ShouldProbeSelection(bRequestedTests, bTestRefreshObserved,
+                                           Now - LastSelectionAttempt))
         {
-            Controller->GetEnabledTestNames(PreviousEnabled);
-            PreviousPasses = Controller->GetNumPasses();
-            bChangedSelection = true; // Restore even if selection validation fails.
+            bTestRefreshObserved = false;
+            LastSelectionAttempt = Now;
+            ++SelectionAttempts;
+            if (!bChangedSelection)
+            {
+                Controller->GetEnabledTestNames(PreviousEnabled);
+                PreviousPasses = Controller->GetNumPasses();
+                bChangedSelection = true;
+            }
             Controller->SetEnabledTests({Path});
             TArray<FString> Enabled;
             Controller->GetEnabledTestNames(Enabled);
-            if (!FDecision::ExactSelection(Enabled, Path))
+            if (FDecision::ExactSelection(Enabled, Path))
             {
-                Fail(TEXT("AutomationController received the test list but could not enable exactly the requested full path: ") + Path
-                    + FString::Printf(TEXT(" (enabled count: %d; visible count: %d). Check native test flags and controller filters."), Enabled.Num(), VisibleNames.Num()));
+                Controller->SetNumPasses(1);
+                bOwnsRun = true;
+                bTestsComplete = false;
+                Controller->RunTests(true);
+                CurrentPhase = EPhase::Running;
+                PhaseStart = Now;
                 return;
             }
-            // Only one exact controller-confirmed test may be executed.
-            Controller->SetNumPasses(1);
-            bOwnsRun = true;
-            bTestsComplete = false;
-            Controller->RunTests(true);
-            CurrentPhase = EPhase::Running;
-            PhaseStart = Now;
         }
-        else if (Now - PhaseStart > 30.0)
+        if (Now - PhaseStart > 30.0)
         {
-            Fail(TEXT("AutomationController did not publish a test report tree within 30 seconds after requesting tests: ") + Path);
+            TArray<FString> Enabled;
+            Controller->GetEnabledTestNames(Enabled);
+            const int32 FilteredCount = Controller->GetFilteredReports().Num();
+            const int32 EnabledReportCount = Controller->GetEnabledReports().Num();
+            Fail(FString::Printf(TEXT("AutomationController did not confirm the requested native test after %d selection attempts (workers: %d; enabled names: %d; enabled reports: %d; filtered reports: %d). Full path: %s. Check requested test flags and worker availability."),
+                SelectionAttempts, Controller->GetNumDeviceClusters(), Enabled.Num(), EnabledReportCount, FilteredCount, *Path));
         }
         return;
     }
