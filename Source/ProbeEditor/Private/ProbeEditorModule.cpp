@@ -24,6 +24,7 @@
 #include "ProbeDev26NativeExecution.h"
 #include "ProbeDev27MixedPolicy.h"
 #include "ProbeDev29MixedRecovery.h"
+#include "ProbeDev30ExecutionPresentation.h"
 #include "ProbeSelfTest.h"
 #include "ProbeTestAssetFactory.h"
 #include "ProbeTestPack.h"
@@ -2551,26 +2552,6 @@ public:
                               .OnClicked(this, &SProbeWorkspace::RetryMixedPack)
                               [ SNew(STextBlock).Text(LOCTEXT("Dev29RetryPack", "Retry Mixed Problems")) ] ]
                             + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(4, 0, 3, 0)
-                            [ SNew(STextBlock)
-                              .Visibility_Lambda([this]() { return bNativeRun ? EVisibility::Visible : EVisibility::Collapsed; })
-                              .Text_Lambda([this]() { return FText::FromString(FString::Printf(TEXT("%s: %s (%.1fs)"), *NativeExecution.PhaseLabel(), *FPaths::GetCleanFilename(NativePath), FMath::Max(0.0, FPlatformTime::Seconds() - NativeStartSeconds))); })
-                              .ColorAndOpacity(FSlateColor::UseSubduedForeground()) ]
-                            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(4, 0, 3, 0)
-                            [
-                                SNew(SButton)
-                                .ButtonStyle(FAppStyle::Get(), "SimpleButton")
-                                .ToolTipText_Lambda([this]() { return bNativeRun
-                                    ? LOCTEXT("StopNativeMonitoringTip", "Stop the controller-owned test (if running), or stop discovery. Probe records Interrupted without claiming a test passed or was fully cancelled.")
-                                    : LOCTEXT("StopAfterCurrentTip", "Finish the current test then safely skip queued tests."); })
-                                .Visibility_Lambda([this]() { return bRunInProgress ? EVisibility::Visible : EVisibility::Collapsed; })
-                                .IsEnabled_Lambda([this]() { return bRunInProgress && (bPortableRun || !bStopAfterCurrentTest); })
-                                .OnClicked(this, &SProbeWorkspace::StopOrCancel)
-                                [ SNew(STextBlock).Text_Lambda([this]() { return bPortableRun
-                                    ? LOCTEXT("Dev20CancelPortable", "Cancel Portable Run")
-                                    : bNativeRun ? LOCTEXT("Dev26StopNative", "Stop Native Run")
-                                    : LOCTEXT("StopAfterCurrent", "Stop After Test"); }) ]
-                            ]
-                            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(4, 0, 3, 0)
                             [
                                 SNew(SButton)
                                 .ToolTipText(LOCTEXT("RunAllTip", "Run all authored Probe Test Assets; use Test Library for portable and Unreal Automation Tests"))
@@ -2767,17 +2748,19 @@ public:
                     [ SNew(SExpandableArea).InitiallyCollapsed(false)
                       .Visibility_Lambda([this]() { return MixedProgressEntries.IsEmpty() ? EVisibility::Collapsed : EVisibility::Visible; })
                       .HeaderContent()
-                      [ SNew(SHorizontalBox)
-                        + SHorizontalBox::Slot().FillWidth(1.f).VAlign(VAlign_Center)
-                        [ SNew(STextBlock).Text_Lambda([this]() { return MixedProgressSummary(); })
-                          .Font(FAppStyle::GetFontStyle("SmallFont")) ]
-                        + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
-                        [ SNew(SProgressBar).Percent_Lambda([this]() -> TOptional<float>
-                          { if (MixedProgressStates.IsEmpty()) { return 0.f; }
-                            int32 Done = 0;
-                            for (const ProbeDev29::EMemberState State : MixedProgressStates)
-                            { if (State != ProbeDev29::EMemberState::Queued && State != ProbeDev29::EMemberState::Starting && State != ProbeDev29::EMemberState::Running) { ++Done; } }
-                            return static_cast<float>(Done) / MixedProgressStates.Num(); }) ] ]
+                      [ SNew(SVerticalBox)
+                        + SVerticalBox::Slot().AutoHeight().Padding(2,2)
+                        [ SNew(SHorizontalBox)
+                          + SHorizontalBox::Slot().FillWidth(1.f).VAlign(VAlign_Center)
+                          [ SNew(STextBlock).Text_Lambda([this]() { return MixedProgressSummary(); })
+                            .Font(FAppStyle::GetFontStyle("SmallFont")) ]
+                          + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(8,0)
+                          [ SNew(STextBlock).Text_Lambda([this]() { return MixedProgressCounts(); })
+                            .ColorAndOpacity(FSlateColor::UseSubduedForeground()) ] ]
+                        + SVerticalBox::Slot().AutoHeight().Padding(2,3,2,4)
+                        [ SNew(SBox).HeightOverride(12.f)
+                          [ SNew(SProgressBar).Percent_Lambda([this]() -> TOptional<float>
+                            { return MixedProgressFraction(); }) ] ] ]
                       .BodyContent()
                       [ SNew(SBox).HeightOverride(140.f)
                         [ SNew(SScrollBox)
@@ -2836,6 +2819,27 @@ public:
                         Results.Num(), bRunInProgress ? TEXT("Running") : Results.IsEmpty() ? TEXT("No results yet") : TEXT("Click to inspect"))); }) ]
                   + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
                   [ SNew(STextBlock).Text(LOCTEXT("Dev16ExpandResults", "Expand")) ] ] ] ]
+            + SVerticalBox::Slot().AutoHeight().Padding(2, 1, 2, 5)
+                    [ SNew(SBorder)
+                      .Visibility_Lambda([this]() { return bRunInProgress ? EVisibility::Visible : EVisibility::Collapsed; })
+                      .BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
+                      .Padding(FMargin(8.f, 5.f))
+                      [ SNew(SHorizontalBox)
+                        + SHorizontalBox::Slot().FillWidth(1.f).VAlign(VAlign_Center)
+                        [ SNew(STextBlock)
+                          .Text_Lambda([this]() { return ExecutionPhaseText(); })
+                          .AutoWrapText(true) ]
+                        + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(8,0,0,0)
+                        [ SNew(SButton)
+                          .ToolTipText_Lambda([this]() { return bNativeRun
+                              ? LOCTEXT("Dev30StopNativeTip", "Request AutomationController cancellation; interruption does not guarantee the worker has terminated.")
+                              : LOCTEXT("Dev30StopAfterTip", "Stop the current portable run or skip queued work after the current test."); })
+                          .IsEnabled_Lambda([this]() { return bRunInProgress && (bPortableRun || !bStopAfterCurrentTest); })
+                          .OnClicked(this, &SProbeWorkspace::StopOrCancel)
+                          [ SNew(STextBlock).Text_Lambda([this]() { return bPortableRun
+                              ? LOCTEXT("Dev30CancelPortable", "Cancel Portable Run")
+                              : bNativeRun ? LOCTEXT("Dev30StopNative", "Stop Native Run")
+                              : LOCTEXT("Dev30StopAfter", "Stop After Test"); }) ] ] ] ]
             + SVerticalBox::Slot().AutoHeight().Padding(8, 1, 8, 1)
             [ SNew(SBox).Visibility_Lambda([this]() { return bRunInProgress ? EVisibility::Visible : EVisibility::Collapsed; })
               [ SNew(SHorizontalBox)
@@ -5979,6 +5983,7 @@ private:
 
     TOptional<float> Dev14LiveProgressFraction() const
     {
+        if (bMixedRun && !MixedProgressStates.IsEmpty()) { return MixedProgressFraction(); }
         if (!bRunInProgress || Results.IsEmpty()) { return 0.0f; }
         const int32 Finished = Results.Num() - QueuedTestResultIndices.Num()
             - (ActiveExecutionResult != INDEX_NONE ? 1 : 0);
@@ -5989,6 +5994,9 @@ private:
 
     FText Dev14LiveProgressText() const
     {
+        if (bMixedRun && !MixedProgressStates.IsEmpty())
+        { return FText::FromString(FString::Printf(TEXT("Mixed Pack | %s | %s"),
+              *MixedProgressCounts().ToString(), *MixedProgressActiveName())); }
         if (!bRunInProgress) { return LOCTEXT("Dev14MonitorIdle", "Execution monitor: idle"); }
         const int32 Finished = FMath::Max(0, Results.Num() - QueuedTestResultIndices.Num()
             - (ActiveExecutionResult != INDEX_NONE ? 1 : 0));
@@ -6550,13 +6558,39 @@ private:
     }
 
 private:
+    float MixedProgressFraction() const
+    { return ProbeDev30::Summarize(MixedProgressStates).Fraction(); }
+
+    FText MixedProgressCounts() const
+    {
+        const ProbeDev30::FProgress P = ProbeDev30::Summarize(MixedProgressStates);
+        return FText::FromString(FString::Printf(TEXT("%d passed | %d problems | %d skipped | %d pending"),
+            P.Passed, P.Problems, P.Skipped, P.Pending));
+    }
+
+    FString MixedProgressActiveName() const
+    {
+        const ProbeDev30::FProgress P = ProbeDev30::Summarize(MixedProgressStates);
+        if (MixedProgressEntries.IsValidIndex(P.ActiveIndex))
+        { return FString::Printf(TEXT("#%d %s (%s)"), P.ActiveIndex + 1,
+             *ProbeDev29::DisplayName(MixedProgressEntries[P.ActiveIndex]), ProbeDev29::StateLabel(MixedProgressStates[P.ActiveIndex])); }
+        return TEXT("waiting for next member");
+    }
+
+    FText ExecutionPhaseText() const
+    {
+        if (bNativeRun)
+        { return FText::FromString(FString::Printf(TEXT("%s: %s (%.1fs)"), *NativeExecution.PhaseLabel(),
+            *FPaths::GetCleanFilename(NativePath), FMath::Max(0.0, FPlatformTime::Seconds() - NativeStartSeconds))); }
+        if (bMixedRun) { return FText::FromString(TEXT("Mixed Pack: ") + MixedProgressActiveName()); }
+        return Dev14LiveProgressText();
+    }
+
     FText MixedProgressSummary() const
     {
-        int32 Done = 0;
-        for (const ProbeDev29::EMemberState State : MixedProgressStates)
-        { if (State != ProbeDev29::EMemberState::Queued && State != ProbeDev29::EMemberState::Starting && State != ProbeDev29::EMemberState::Running) { ++Done; } }
+        const ProbeDev30::FProgress P = ProbeDev30::Summarize(MixedProgressStates);
         return FText::FromString(FString::Printf(TEXT("Mixed Pack | %d/%d completed | %s"),
-            Done, MixedProgressStates.Num(), bMixedRun ? TEXT("Executing") : TEXT("Finished")));
+            P.Completed, P.Total, bMixedRun ? TEXT("Executing") : TEXT("Finished")));
     }
 
     void SetMixedMemberState(const FString& Identity, ProbeDev29::EMemberState State, const FString& Reason = FString())
@@ -6592,7 +6626,20 @@ private:
                 { return MixedProgressStates.IsValidIndex(Index)
                     ? FText::FromString(ProbeDev29::StateLabel(MixedProgressStates[Index])) : FText::GetEmpty(); })
                 .ToolTipText_Lambda([this, Index]()
-                { return MixedProgressReasons.IsValidIndex(Index) ? FText::FromString(MixedProgressReasons[Index]) : FText::GetEmpty(); }) ] ];
+                { return MixedProgressReasons.IsValidIndex(Index) ? FText::FromString(MixedProgressReasons[Index]) : FText::GetEmpty(); })
+                .ColorAndOpacity_Lambda([this, Index]() -> FSlateColor
+                {
+                    if (!MixedProgressStates.IsValidIndex(Index)) { return FSlateColor::UseSubduedForeground(); }
+                    switch (MixedProgressStates[Index])
+                    {
+                    case ProbeDev29::EMemberState::Passed:
+                    case ProbeDev29::EMemberState::Reused: return FSlateColor(FLinearColor(0.32f, 0.80f, 0.43f));
+                    case ProbeDev29::EMemberState::Failed:
+                    case ProbeDev29::EMemberState::Error: return FSlateColor(FLinearColor(0.92f, 0.36f, 0.34f));
+                    case ProbeDev29::EMemberState::Running: return FSlateColor(FLinearColor(0.35f, 0.65f, 1.0f));
+                    default: return FSlateColor::UseSubduedForeground();
+                    }
+                }) ] ];
         }
     }
 
