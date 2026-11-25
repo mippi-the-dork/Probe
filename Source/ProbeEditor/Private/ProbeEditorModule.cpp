@@ -17,6 +17,7 @@
 #include "ProbeDev14Authoring.h"
 #include "ProbeExtensions.h"
 #include "ProbePortableProviders.h"
+#include "ProbeDev37ProviderAudit.h"
 #include "ProbeDev19Authoring.h"
 #include "ProbeDev20Catalog.h"
 #include "ProbeDev23NativeBridge.h"
@@ -25,6 +26,12 @@
 #include "ProbeDev27MixedPolicy.h"
 #include "ProbeDev29MixedRecovery.h"
 #include "ProbeDev30ExecutionPresentation.h"
+#include "ProbeDev32Presentation.h"
+#include "ProbeDev33PackAuthoring.h"
+#include "ProbeDev34PackReuse.h"
+#include "ProbeDev35Impact.h"
+#include "ProbeDev36ReleaseAudit.h"
+#include "ProbeDev31MemberInspection.h"
 #include "ProbeSelfTest.h"
 #include "ProbeTestAssetFactory.h"
 #include "ProbeTestPack.h"
@@ -2521,7 +2528,8 @@ public:
                                 [ SNew(SImage).Image(FAppStyle::GetBrush("Icons.Refresh")) ]
                             ]
                             + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(6,0)
-                            [ SNew(SSeparator).Orientation(Orient_Vertical) ]
+                            [ SNew(STextBlock).Text(FText::FromString(TEXT("|")))
+                .ColorAndOpacity(FSlateColor::UseSubduedForeground()) ]
                             + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(3, 0, 2, 0)
                             [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
                               .ToolTipText(LOCTEXT("ManagePacksTip", "Open the Probe Packs workspace to edit, validate and run Packs"))
@@ -2759,13 +2767,35 @@ public:
                             .ColorAndOpacity(FSlateColor::UseSubduedForeground()) ] ]
                         + SVerticalBox::Slot().AutoHeight().Padding(2,3,2,4)
                         [ SNew(SBox).HeightOverride(12.f)
-                          [ SNew(SProgressBar).Percent_Lambda([this]() -> TOptional<float>
-                            { return MixedProgressFraction(); }) ] ] ]
+                          [ SNew(SOverlay)
+                            + SOverlay::Slot()
+                            [ SNew(SProgressBar).Percent_Lambda([this]() -> TOptional<float>
+                              { return MixedProgressFraction(); })
+                              .Visibility_Lambda([this]() { return bMixedRun ? EVisibility::Visible : EVisibility::Collapsed; }) ]
+                            + SOverlay::Slot()
+                            [ SNew(SBorder)
+                              .BorderImage(FAppStyle::GetBrush("WhiteBrush"))
+                              .BorderBackgroundColor_Lambda([this]() { return ProbeDev32::CompletedTint(MixedProgressStates); })
+                              .Visibility_Lambda([this]() { return bMixedRun ? EVisibility::Collapsed : EVisibility::Visible; }) ] ] ] ]
                       .BodyContent()
-                      [ SNew(SBox).HeightOverride(140.f)
-                        [ SNew(SScrollBox)
-                          + SScrollBox::Slot()
-                          [ SAssignNew(MixedProgressRows, SVerticalBox) ] ] ] ]
+                      [ SNew(SVerticalBox)
+                        + SVerticalBox::Slot().AutoHeight()
+                        [ SNew(SBox).HeightOverride(140.f)
+                          [ SNew(SScrollBox)
+                            + SScrollBox::Slot()
+                            [ SAssignNew(MixedProgressRows, SVerticalBox) ] ] ]
+                        + SVerticalBox::Slot().AutoHeight().Padding(5,5,5,1)
+                        [ SNew(SBorder)
+                          .BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
+                          .Visibility_Lambda([this]() { return MixedSelectedMemberIndex == INDEX_NONE
+                              ? EVisibility::Collapsed : EVisibility::Visible; })
+                          .Padding(6)
+                          [ SNew(SBox).HeightOverride(95.f)
+                            [ SNew(SScrollBox)
+                              + SScrollBox::Slot()
+                              [ SNew(STextBlock)
+                                .Text_Lambda([this]() { return MixedSelectedMemberText(); })
+                                .AutoWrapText(true) ] ] ] ] ] ]
                     + SVerticalBox::Slot().AutoHeight().Padding(2, 0, 2, 4)
                     [ SAssignNew(ResultTabs, SHorizontalBox) ]
                     + SVerticalBox::Slot().FillHeight(1.0f)
@@ -3117,6 +3147,7 @@ private:
     TArray<FString> MixedProgressReasons;
     TSharedPtr<SVerticalBox> MixedProgressRows;
     bool bMixedWasRetried = false;
+    int32 MixedSelectedMemberIndex = INDEX_NONE;
 
     bool bDev20LibraryExpanded = true;
     bool bSelectingFromCatalog = false;
@@ -6572,8 +6603,12 @@ private:
     {
         const ProbeDev30::FProgress P = ProbeDev30::Summarize(MixedProgressStates);
         if (MixedProgressEntries.IsValidIndex(P.ActiveIndex))
-        { return FString::Printf(TEXT("#%d %s (%s)"), P.ActiveIndex + 1,
-             *ProbeDev29::DisplayName(MixedProgressEntries[P.ActiveIndex]), ProbeDev29::StateLabel(MixedProgressStates[P.ActiveIndex])); }
+        {
+            const FString Phase = bNativeRun && NativeExecution.Phase() != ProbeDev26::EPhase::Running
+                ? NativeExecution.PhaseLabel() : ProbeDev29::StateLabel(MixedProgressStates[P.ActiveIndex]);
+            return FString::Printf(TEXT("#%d %s (%s)"), P.ActiveIndex + 1,
+                 *ProbeDev29::DisplayName(MixedProgressEntries[P.ActiveIndex]), *Phase);
+        }
         return TEXT("waiting for next member");
     }
 
@@ -6590,7 +6625,7 @@ private:
     {
         const ProbeDev30::FProgress P = ProbeDev30::Summarize(MixedProgressStates);
         return FText::FromString(FString::Printf(TEXT("Mixed Pack | %d/%d completed | %s"),
-            P.Completed, P.Total, bMixedRun ? TEXT("Executing") : TEXT("Finished")));
+            P.Completed, P.Total, bMixedRun ? TEXT("Executing") : ProbeDev32::CompletionLabel(MixedProgressStates)));
     }
 
     void SetMixedMemberState(const FString& Identity, ProbeDev29::EMemberState State, const FString& Reason = FString())
@@ -6614,7 +6649,10 @@ private:
         {
             const FProbePackMixedEntry& Entry = MixedProgressEntries[Index];
             MixedProgressRows->AddSlot().AutoHeight().Padding(5,2,5,2)
-            [ SNew(SHorizontalBox)
+            [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
+              .ToolTipText(LOCTEXT("Dev31MemberClickTip", "Select this Pack member. Completed members can be inspected; after the Pack finishes this also selects the corresponding Results Explorer entry."))
+              .OnClicked_Lambda([this, Index]() { return SelectMixedMember(Index); })
+              [ SNew(SHorizontalBox)
               + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0,0,8,0)
               [ SNew(STextBlock).Text(FText::AsNumber(Index + 1))
                 .ColorAndOpacity(FSlateColor::UseSubduedForeground()) ]
@@ -6624,7 +6662,11 @@ private:
               + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(5,0)
               [ SNew(STextBlock).Text_Lambda([this, Index]()
                 { return MixedProgressStates.IsValidIndex(Index)
-                    ? FText::FromString(ProbeDev29::StateLabel(MixedProgressStates[Index])) : FText::GetEmpty(); })
+                    ? FText::FromString(bNativeRun && MixedProgressEntries.IsValidIndex(Index)
+                        && ProbeDev27::Identity(MixedProgressEntries[Index]) == MixedActiveIdentity
+                        && NativeExecution.Phase() != ProbeDev26::EPhase::Running
+                        ? NativeExecution.PhaseLabel() : ProbeDev29::StateLabel(MixedProgressStates[Index]))
+                    : FText::GetEmpty(); })
                 .ToolTipText_Lambda([this, Index]()
                 { return MixedProgressReasons.IsValidIndex(Index) ? FText::FromString(MixedProgressReasons[Index]) : FText::GetEmpty(); })
                 .ColorAndOpacity_Lambda([this, Index]() -> FSlateColor
@@ -6639,8 +6681,51 @@ private:
                     case ProbeDev29::EMemberState::Running: return FSlateColor(FLinearColor(0.35f, 0.65f, 1.0f));
                     default: return FSlateColor::UseSubduedForeground();
                     }
-                }) ] ];
+                }) ] ] ];
         }
+    }
+
+    FText MixedSelectedMemberText() const
+    {
+        if (!MixedProgressEntries.IsValidIndex(MixedSelectedMemberIndex)) { return FText::GetEmpty(); }
+        const FProbePackMixedEntry& Member = MixedProgressEntries[MixedSelectedMemberIndex];
+        const FString Id = ProbeDev27::Identity(Member);
+        const auto& Completed = bMixedRun ? MixedMemberResults : LastMixedMemberResults;
+        const TArray<Probe::FTestResult>* Group = Completed.Find(Id);
+        FString Text = FString::Printf(TEXT("#%d %s | %s"), MixedSelectedMemberIndex + 1,
+            *ProbeDev29::DisplayName(Member), MixedProgressStates.IsValidIndex(MixedSelectedMemberIndex)
+            ? ProbeDev29::StateLabel(MixedProgressStates[MixedSelectedMemberIndex]) : TEXT("Unknown"));
+        if (MixedProgressReasons.IsValidIndex(MixedSelectedMemberIndex) && !MixedProgressReasons[MixedSelectedMemberIndex].IsEmpty())
+        { Text += TEXT("\n") + MixedProgressReasons[MixedSelectedMemberIndex]; }
+        if (bMixedRun && bNativeRun && Id == MixedActiveIdentity)
+        { Text += FString::Printf(TEXT("\nNative phase: %s | %.1f seconds since dispatch"),
+              *NativeExecution.PhaseLabel(), FMath::Max(0.0, FPlatformTime::Seconds() - NativeStartSeconds)); }
+        Text += TEXT("\n") + ProbeDev31::MemberSummary(Group);
+        if (Group && Group->Num() > 1)
+        { Text += TEXT("\nMultiple results belong to this Pack member; use Results Explorer for individual steps."); }
+        return FText::FromString(Text);
+    }
+
+    FReply SelectMixedMember(int32 Index)
+    {
+        if (!MixedProgressEntries.IsValidIndex(Index)) { return FReply::Handled(); }
+        MixedSelectedMemberIndex = Index;
+        if (!bMixedRun && !bRunInProgress)
+        {
+            const int32 ResultIndex = ProbeDev31::ResultOffset(MixedProgressEntries, LastMixedMemberResults, Index);
+            if (Results.IsValidIndex(ResultIndex))
+            {
+                bShowLog = false;
+                if (ResultViewSwitcher.IsValid()) { ResultViewSwitcher->SetActiveWidgetIndex(0); }
+                ActiveResultFilter = EResultFilter::All;
+                bDev16ResultsCollapsed = false;
+                bResultsFocused = false;
+                BuildResultTabs();
+                ShowResults();
+                SelectResult(ResultIndex);
+            }
+        }
+        return FReply::Handled();
     }
 
     bool CanRetryMixedPack() const
@@ -6700,6 +6785,7 @@ private:
         }
         bMixedWasRetried = Reuse != nullptr;
         MixedProgressEntries = Pack.MixedEntries;
+        MixedSelectedMemberIndex = INDEX_NONE;
         MixedProgressStates.Init(ProbeDev29::EMemberState::Queued, MixedProgressEntries.Num());
         MixedProgressReasons.Init(FString(), MixedProgressEntries.Num());
         RebuildMixedProgress();
@@ -7905,7 +7991,7 @@ public:
         ChildSlot
         [
             SNew(SVerticalBox)
-            + SVerticalBox::Slot().AutoHeight().Padding(8, 6)
+            + SVerticalBox::Slot().AutoHeight().Padding(8, 5, 8, 2)
             [ SNew(SHorizontalBox)
               + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0,0,6,0)
               [ SNew(SButton).ToolTipText(LOCTEXT("NewPackTooltip", "Create a new Probe Pack asset."))
@@ -7925,6 +8011,32 @@ public:
                   [ SNew(SImage).Image(FAppStyle::GetBrush("Icons.Save")) ]
                   + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
                   [ SNew(STextBlock).Text(LOCTEXT("SaveCurrentPack", "Save")) ] ] ]
+              + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0,0,6,0)
+              [ SNew(SButton).OnClicked(this, &SProbePackWorkspace::RunPack)
+                .ToolTipText(LOCTEXT("RunPackTooltip", "Run the tests in this Pack in their listed order, and show results in Probe."))
+                .IsEnabled_Lambda([this]() { return ProbeDev27::HasRunMembers(GetPack()); })
+                [ SNew(SHorizontalBox)
+                  + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0,0,4,0)
+                  [ SNew(SImage).Image(FAppStyle::GetBrush("Icons.Play")) ]
+                  + SHorizontalBox::Slot().AutoWidth()
+                  [ SNew(STextBlock).Text(LOCTEXT("RunSelectedPack", "Run Pack")) ] ] ]
+              + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0,0,10,0)
+              [ SNew(SButton).OnClicked(this, &SProbePackWorkspace::RunSelectedTests)
+                .IsEnabled_Lambda([this]() { return GetPack() && GetPack()->MixedEntries.IsEmpty() && !SelectedMemberPaths.IsEmpty(); })
+                .ToolTipText(LOCTEXT("RunSelectedPackTip", "Run only the checked tests in this Pack, preserving Pack order."))
+                [ SNew(STextBlock).Text(LOCTEXT("RunSelectedPackLabel", "Run Selected")) ] ]
+              + SHorizontalBox::Slot().FillWidth(1) [ SNullWidget::NullWidget ]
+              + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+              [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
+                .ToolTipText(LOCTEXT("RefreshPacksTip", "Refresh the available Probe Packs."))
+                .OnClicked_Lambda([this]() { RefreshPacks(); return FReply::Handled(); })
+                [ SNew(SImage).Image(FAppStyle::GetBrush("Icons.Refresh")) ] ]
+            ]
+            + SVerticalBox::Slot().AutoHeight().Padding(8, 2, 8, 6)
+            [ SNew(SHorizontalBox)
+              + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0,0,12,0)
+              [ SNew(STextBlock).Text(LOCTEXT("Dev32PolicyHeading", "Run Policies"))
+                .ColorAndOpacity(FSlateColor::UseSubduedForeground()) ]
               + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0,0,8,0)
               [ SNew(SCheckBox)
                 .ToolTipText(LOCTEXT("PackStopPolicyHelp", "Stop a Pack after a failed/errored test. Pending tests are skipped; the current test always finishes."))
@@ -7955,25 +8067,18 @@ public:
                     }
                 })
                 [ SNew(STextBlock).Text(LOCTEXT("PackRetryReadOnly", "Retry Read-Only Once")) ] ]
-              + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0,0,6,0)
-              [ SNew(SButton).OnClicked(this, &SProbePackWorkspace::RunPack)
-                .ToolTipText(LOCTEXT("RunPackTooltip", "Run the tests in this Pack in their listed order, and show results in Probe."))
-                .IsEnabled_Lambda([this]() { return ProbeDev27::HasRunMembers(GetPack()); })
-                [ SNew(SHorizontalBox)
-                  + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0,0,4,0)
-                  [ SNew(SImage).Image(FAppStyle::GetBrush("Icons.Play")) ]
-                  + SHorizontalBox::Slot().AutoWidth()
-                  [ SNew(STextBlock).Text(LOCTEXT("RunSelectedPack", "Run Pack")) ] ] ]
-              + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0,0,10,0)
-              [ SNew(SButton).OnClicked(this, &SProbePackWorkspace::RunSelectedTests)
-                .IsEnabled_Lambda([this]() { return GetPack() && GetPack()->MixedEntries.IsEmpty() && !SelectedMemberPaths.IsEmpty(); })
-                .ToolTipText(LOCTEXT("RunSelectedPackTip", "Run only the checked tests in this Pack, preserving Pack order."))
-                [ SNew(STextBlock).Text(LOCTEXT("RunSelectedPackLabel", "Run Selected")) ] ]
+              + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(12,0,12,0)
+              [ SNew(SSeparator).Orientation(Orient_Vertical) ]
               + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0,0,4,0)
               [ SNew(SButton).OnClicked(this, &SProbePackWorkspace::ShowDev14PackReadiness)
                 .ToolTipText(LOCTEXT("Dev14PackReadinessTip", "Preflight all Pack members and prerequisite rules, without executing tests."))
                 .IsEnabled_Lambda([this]() { return GetPack() != nullptr; })
                 [ SNew(STextBlock).Text(LOCTEXT("Dev14PackReadiness", "Readiness Overview")) ] ]
+              + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0,0,4,0)
+              [ SNew(SButton).OnClicked(this, &SProbePackWorkspace::RunReleaseAudit)
+                .ToolTipText(LOCTEXT("Dev36ReleaseAuditTip", "Audit Pack structure and authored assets without executing tests. Deferred worker/provider checks are explicitly marked unverified. Results appear in Reference Diagnostics and can be exported."))
+                .IsEnabled_Lambda([this]() { return GetPack() != nullptr; })
+                [ SNew(STextBlock).Text(LOCTEXT("Dev36ReleaseAudit", "Release Audit")) ] ]
               + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0,0,4,0)
               [ SNew(SButton).OnClicked(this, &SProbePackWorkspace::ValidateCurrentReferences)
                 .ToolTipText(LOCTEXT("ValidateCurrentPackTip", "Validate only the selected Pack's test references."))
@@ -7989,11 +8094,6 @@ public:
                 .ToolTipText(LOCTEXT("Dev15PackBrowserTip", "Open the project-wide QA Browser and readiness dashboard."))
                 [ SNew(STextBlock).Text(LOCTEXT("Dev15PackBrowser", "QA Browser")) ] ]
               + SHorizontalBox::Slot().FillWidth(1) [ SNullWidget::NullWidget ]
-              + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
-              [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
-                .ToolTipText(LOCTEXT("RefreshPacksTip", "Refresh the available Probe Packs."))
-                .OnClicked_Lambda([this]() { RefreshPacks(); return FReply::Handled(); })
-                [ SNew(SImage).Image(FAppStyle::GetBrush("Icons.Refresh")) ] ]
             ]
             + SVerticalBox::Slot().AutoHeight().Padding(8, 4, 8, 8)
             [ SNew(SBorder).BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder")).Padding(9)
@@ -8020,7 +8120,7 @@ public:
                     .OnGenerateWidget_Lambda([](TSharedPtr<FAssetData> Item)
                     { return SNew(STextBlock).Text(FText::FromName(Item.IsValid() ? Item->AssetName : NAME_None)); })
                     .OnSelectionChanged_Lambda([this](TSharedPtr<FAssetData> Item, ESelectInfo::Type)
-                    { SelectedPack = Item; SelectedMemberPaths.Reset(); RebuildMembers(); })
+                    { SelectedPack = Item; SelectedMemberPaths.Reset(); MixedSelectedIdentities.Reset(); RebuildMembers(); })
                     [ SNew(STextBlock).Text_Lambda([this]()
                     { return FText::FromString(SelectedPack.IsValid() ? SelectedPack->AssetName.ToString() : TEXT("Create or choose a Probe Pack")); }) ] ]
                   + SVerticalBox::Slot().AutoHeight().Padding(0,4,0,0)
@@ -8054,7 +8154,7 @@ public:
             [ SNew(SHorizontalBox)
               + SHorizontalBox::Slot().FillWidth(1.0f).VAlign(VAlign_Center)
               [ SNew(STextBlock).Text_Lambda([this]()
-                { const UProbeTestPack* Pack = GetPack(); return FText::FromString(FString::Printf(TEXT("Tests (%d) | %s"), Pack ? (Pack->MixedEntries.IsEmpty() ? Pack->Tests.Num() : Pack->MixedEntries.Num()) : 0, Pack && !Pack->MixedEntries.IsEmpty() ? TEXT("Mixed sources") : TEXT("Authored"))); }) ]
+                { const UProbeTestPack* Pack = GetPack(); return FText::FromString(ProbeDev32::PackSourceSummary(Pack)); }) ]
               + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0,0,6,0)
               [ SNew(SButton).IsEnabled_Lambda([this]() { return GetPack() && !SelectedMemberPaths.IsEmpty(); })
                 .ToolTipText(LOCTEXT("RemoveSelectedPackTestsTip", "Remove the selected references from this Pack. The Test Assets are not deleted."))
@@ -8071,15 +8171,115 @@ public:
                 .OnClicked(this, &SProbePackWorkspace::OpenAddTestsDialog)
                 [ SNew(STextBlock).Text(LOCTEXT("BulkAddPackTests", "+ Add Tests...")) ] ]
               + SHorizontalBox::Slot().AutoWidth().Padding(5,0,0,0)
+              [ SNew(SComboButton).IsEnabled_Lambda([this]() { return GetPack() != nullptr; })
+                .ToolTipText(LOCTEXT("Dev34ImportPackTip", "Reuse members from an existing Pack, copying references without nesting Packs at runtime. Existing members are not duplicated."))
+                .OnGetMenuContent(this, &SProbePackWorkspace::MakeReusePackMenu)
+                .ButtonContent()[ SNew(STextBlock).Text(LOCTEXT("Dev34ImportPack", "+ From Pack...")) ] ]
+              + SHorizontalBox::Slot().AutoWidth().Padding(5,0,0,0)
               [ SNew(SButton).IsEnabled_Lambda([this]() { return GetPack() != nullptr; })
                 .ToolTipText(LOCTEXT("MixedAddTip", "Pick authored, portable JSON, or native Unreal Automation tests. The first mixed entry converts legacy members to an ordered mixed-source Pack."))
                 .OnClicked(this, &SProbePackWorkspace::OpenMixedPicker)
                 [ SNew(STextBlock).Text(LOCTEXT("MixedAdd", "+ Add From Library...")) ] ] ]
+            + SVerticalBox::Slot().AutoHeight().Padding(9,1,9,5)
+            [ SNew(SHorizontalBox)
+              .Visibility_Lambda([this]() { const UProbeTestPack* Pack = GetPack(); return Pack && !Pack->MixedEntries.IsEmpty() ? EVisibility::Visible : EVisibility::Collapsed; })
+              + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0,0,7,0)
+              [ SNew(STextBlock).Text_Lambda([this]()
+                  { const UProbeTestPack* Pack = GetPack();
+                    return FText::FromString(Pack && !Pack->MixedEntries.IsEmpty()
+                        ? FString::Printf(TEXT("%d selected"), MixedSelectedIdentities.Num()) : TEXT("")); })
+                .ColorAndOpacity(FSlateColor::UseSubduedForeground()) ]
+              + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0,0,4,0)
+              [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
+                .ToolTipText(LOCTEXT("Dev33SelectVisibleTip", "Select only visible mixed-source members, respecting the search and source filter."))
+                .Visibility_Lambda([this]() { const UProbeTestPack* Pack = GetPack(); return Pack && !Pack->MixedEntries.IsEmpty() ? EVisibility::Visible : EVisibility::Collapsed; })
+                .OnClicked(this, &SProbePackWorkspace::SelectVisibleMixedMembers)
+                [ SNew(STextBlock).Text(LOCTEXT("Dev33SelectVisible", "Select Visible")) ] ]
+              + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0,0,4,0)
+              [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
+                .IsEnabled_Lambda([this]() { return !MixedSelectedIdentities.IsEmpty(); })
+                .Visibility_Lambda([this]() { const UProbeTestPack* Pack = GetPack(); return Pack && !Pack->MixedEntries.IsEmpty() ? EVisibility::Visible : EVisibility::Collapsed; })
+                .OnClicked(this, &SProbePackWorkspace::ClearMixedSelection)
+                [ SNew(STextBlock).Text(LOCTEXT("Dev33ClearMixedSelection", "Clear")) ] ]
+              + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0,0,4,0)
+              [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
+                .IsEnabled_Lambda([this]() { return !MixedSelectedIdentities.IsEmpty(); })
+                .Visibility_Lambda([this]() { const UProbeTestPack* Pack = GetPack(); return Pack && !Pack->MixedEntries.IsEmpty() ? EVisibility::Visible : EVisibility::Collapsed; })
+                .OnClicked_Lambda([this]() { return MoveMixedSelection(-1); })
+                [ SNew(STextBlock).Text(LOCTEXT("Dev33BulkMoveUp", "Move Up")) ] ]
+              + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0,0,4,0)
+              [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
+                .IsEnabled_Lambda([this]() { return !MixedSelectedIdentities.IsEmpty(); })
+                .Visibility_Lambda([this]() { const UProbeTestPack* Pack = GetPack(); return Pack && !Pack->MixedEntries.IsEmpty() ? EVisibility::Visible : EVisibility::Collapsed; })
+                .OnClicked_Lambda([this]() { return MoveMixedSelection(1); })
+                [ SNew(STextBlock).Text(LOCTEXT("Dev33BulkMoveDown", "Move Down")) ] ]
+              + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0,0,4,0)
+              [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
+                .IsEnabled_Lambda([this]() { return !MixedSelectedIdentities.IsEmpty(); })
+                .Visibility_Lambda([this]() { const UProbeTestPack* Pack = GetPack(); return Pack && !Pack->MixedEntries.IsEmpty() ? EVisibility::Visible : EVisibility::Collapsed; })
+                .ToolTipText(LOCTEXT("Dev34SelectPrerequisitesTip", "Expand selection to all prerequisite members, including indirect prerequisites."))
+                .OnClicked_Lambda([this]() { return ExpandMixedSelection(true); })
+                [ SNew(STextBlock).Text(LOCTEXT("Dev34SelectPrerequisites", "+ Prerequisites")) ] ]
+              + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0,0,8,0)
+              [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
+                .IsEnabled_Lambda([this]() { return !MixedSelectedIdentities.IsEmpty(); })
+                .Visibility_Lambda([this]() { const UProbeTestPack* Pack = GetPack(); return Pack && !Pack->MixedEntries.IsEmpty() ? EVisibility::Visible : EVisibility::Collapsed; })
+                .ToolTipText(LOCTEXT("Dev34SelectDependentsTip", "Expand selection to every member that directly or indirectly requires a selected member."))
+                .OnClicked_Lambda([this]() { return ExpandMixedSelection(false); })
+                [ SNew(STextBlock).Text(LOCTEXT("Dev34SelectDependents", "+ Dependents")) ] ]
+              + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0,0,8,0)
+              [ SNew(SCheckBox)
+                .Visibility_Lambda([this]() { const UProbeTestPack* Pack = GetPack(); return Pack && !Pack->MixedEntries.IsEmpty() ? EVisibility::Visible : EVisibility::Collapsed; })
+                .ToolTipText(LOCTEXT("Dev34ShowDependenciesTip", "Show readable incoming prerequisites and count of dependent members below each Pack row."))
+                .IsChecked_Lambda([this]() { return bShowMixedDependencies ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+                .OnCheckStateChanged_Lambda([this](ECheckBoxState State)
+                { bShowMixedDependencies = State == ECheckBoxState::Checked; RebuildMembers(); })
+                [ SNew(STextBlock).Text(LOCTEXT("Dev34ShowDependencies", "Show Dependencies")) ] ]
+              + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0,0,6,0)
+              [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
+                .IsEnabled_Lambda([this]() { return !MixedSelectedIdentities.IsEmpty(); })
+                .Visibility_Lambda([this]() { const UProbeTestPack* Pack = GetPack(); return Pack && !Pack->MixedEntries.IsEmpty() ? EVisibility::Visible : EVisibility::Collapsed; })
+                .OnClicked(this, &SProbePackWorkspace::RemoveMixedSelection)
+                [ SNew(STextBlock).Text(LOCTEXT("Dev33BulkRemove", "Remove Selected")) ] ]
+              + SHorizontalBox::Slot().FillWidth(1) [ SNullWidget::NullWidget ]
+            ]
+            + SVerticalBox::Slot().AutoHeight().Padding(9,1,9,5)
+            [ SNew(SHorizontalBox)
+              .Visibility_Lambda([this]() { const UProbeTestPack* Pack = GetPack(); return Pack && !Pack->MixedEntries.IsEmpty() ? EVisibility::Visible : EVisibility::Collapsed; })
+              + SHorizontalBox::Slot().FillWidth(1.0f).VAlign(VAlign_Center)
+              [ SNew(STextBlock).Text_Lambda([this]()
+                { const UProbeTestPack* Pack = GetPack();
+                  if (!Pack) { return FText::GetEmpty(); }
+                  const ProbeDev35::FGraphSummary S = ProbeDev35::Analyze(Pack->MixedEntries);
+                  return FText::FromString(FString::Printf(TEXT("Dependencies: %d links | %d roots | %d leaves | longest chain %d"),
+                    S.Links, S.Roots, S.Leaves, S.LongestChain)); })
+                .ColorAndOpacity(FSlateColor::UseSubduedForeground()) ]
+              + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(8,0,4,0)
+              [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
+                .ToolTipText(LOCTEXT("Dev35ImpactTip", "Inspect the selected members' transitive downstream impact before modifying dependencies. Read-only."))
+                .OnClicked(this, &SProbePackWorkspace::ShowMixedImpact)
+                [ SNew(STextBlock).Text(LOCTEXT("Dev35Impact", "Impact Overview")) ] ]
+              + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+              [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
+                .IsEnabled_Lambda([this]() { return !MixedSelectedIdentities.IsEmpty(); })
+                .ToolTipText(LOCTEXT("Dev35RemoveBranchTip", "Remove selected members and all transitive dependents. Unlike Remove Selected, no survivor loses a prerequisite. Confirmation and Undo provided."))
+                .OnClicked(this, &SProbePackWorkspace::RemoveMixedBranch)
+                [ SNew(STextBlock).Text(LOCTEXT("Dev35RemoveBranch", "Remove + Dependents")) ] ]
+            ]
             + SVerticalBox::Slot().AutoHeight().Padding(9,0,9,5)
-            [ SAssignNew(MemberSearch, SSearchBox)
-              .HintText(LOCTEXT("PackListSearchHint", "Search tests already in this Pack..."))
-              .OnTextChanged_Lambda([this](const FText& Text)
-              { MemberQuery = Text.ToString(); RebuildMembers(); }) ]
+            [ SNew(SHorizontalBox)
+              + SHorizontalBox::Slot().FillWidth(1.0f)
+              [ SAssignNew(MemberSearch, SSearchBox)
+                .HintText(LOCTEXT("PackListSearchHint", "Search tests already in this Pack..."))
+                .OnTextChanged_Lambda([this](const FText& Text)
+                { MemberQuery = Text.ToString(); RebuildMembers(); }) ]
+              + SHorizontalBox::Slot().AutoWidth().Padding(8,0,0,0)
+              [ SNew(SComboButton)
+                .Visibility_Lambda([this]() { const UProbeTestPack* Pack = GetPack(); return Pack && !Pack->MixedEntries.IsEmpty() ? EVisibility::Visible : EVisibility::Collapsed; })
+                .OnGetMenuContent(this, &SProbePackWorkspace::MakeMixedSourceFilterMenu)
+                .ButtonContent()[ SNew(STextBlock).Text_Lambda([this]()
+                  { const TCHAR* Labels[] = { TEXT("All Sources"), TEXT("Authored"), TEXT("Portable"), TEXT("Native") };
+                    return FText::FromString(Labels[FMath::Clamp(MixedSourceFilter, 0, 3)]); }) ] ] ]
             + SVerticalBox::Slot().FillHeight(1).Padding(8,3)
             [ SNew(SBorder).BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder")).Padding(4)
               [ SNew(SScrollBox) + SScrollBox::Slot() [ SAssignNew(MemberRows, SVerticalBox) ] ] ]
@@ -8097,6 +8297,11 @@ public:
                   { if (AuditOutput.IsValid()) { FPlatformApplicationMisc::ClipboardCopy(*AuditOutput->GetText().ToString()); }
                     return FReply::Handled(); })
                   [ SNew(STextBlock).Text(LOCTEXT("CopyPackValidation", "Copy Report")) ] ]
+                + SVerticalBox::Slot().AutoHeight().Padding(0,0,0,4)
+                [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
+                  .IsEnabled_Lambda([this]() { return bHasAudit && AuditOutput.IsValid(); })
+                  .OnClicked(this, &SProbePackWorkspace::ExportReleaseAudit)
+                  [ SNew(STextBlock).Text(LOCTEXT("Dev36ExportAudit", "Export Report to Saved/Probe/Reports")) ] ]
                 + SVerticalBox::Slot().AutoHeight()
                 [ SNew(SBox).HeightOverride(115.0f)
                   [ SAssignNew(AuditOutput, SMultiLineEditableTextBox)
@@ -8179,7 +8384,7 @@ private:
         {
             // Drop the stale FAssetData before any Slate text/enable bindings run.
             SelectedPack.Reset();
-            SelectedMemberPaths.Reset();
+            SelectedMemberPaths.Reset(); MixedSelectedIdentities.Reset();
             Message = TEXT("The selected Probe Pack was deleted. Choose another Pack or create a new one.");
             InvalidateAudit();
             if (PackSelector.IsValid()) { PackSelector->ClearSelection(); }
@@ -8205,6 +8410,9 @@ private:
     FString MixedPickerQuery;
     TWeakPtr<SWindow> MixedPickerWindow;
     TSet<FString> SelectedMemberPaths;
+    TSet<FString> MixedSelectedIdentities;
+    bool bShowMixedDependencies = false;
+    int32 MixedSourceFilter = 0;
     TArray<FAssetData> PickerCandidates;
     TSet<FString> PickerSelection;
     TSharedPtr<SVerticalBox> PickerRows;
@@ -8232,6 +8440,44 @@ private:
         }
         return FReply::Handled();
     }
+    FReply RunReleaseAudit()
+    {
+        const UProbeTestPack* Pack = GetPack();
+        if (!Pack) { return FReply::Handled(); }
+        ProbeDev36::FReport Report = ProbeDev36::Audit(*Pack,
+            [](const FProbePackMixedEntry& Entry) -> ProbeDev36::EAvailability
+            {
+                if (Entry.Source != EProbePackMixedSource::AuthoredTest)
+                { return ProbeDev36::EAvailability::Deferred; }
+                const UProbeTestAsset* Test = LoadObject<UProbeTestAsset>(nullptr, *Entry.Locator);
+                if (!Test) { return ProbeDev36::EAvailability::Missing; }
+                if (Test->bNeedsConfiguration || !Probe::TestConfigurationIssue(*Test).IsEmpty())
+                { return ProbeDev36::EAvailability::NeedsConfiguration; }
+                return ProbeDev36::EAvailability::Available;
+            });
+        if (Pack->GetOutermost()->IsDirty())
+        { Report.Add(ProbeDev36::ESeverity::Warning, INDEX_NONE, TEXT("UNSAVED_PACK"), TEXT("Pack has unsaved edits. Save it before treating this audit as a release record.")); }
+        if (AuditOutput.IsValid()) { AuditOutput->SetText(FText::FromString(Report.ToText())); }
+        bHasAudit = true;
+        Message = FString::Printf(TEXT("Release Audit: %d blockers, %d warnings, %d deferred dispatch checks. Open Reference Diagnostics to inspect/export."),
+            Report.Blockers, Report.Warnings, Report.Deferred);
+        return FReply::Handled();
+    }
+
+    FReply ExportReleaseAudit()
+    {
+        if (!bHasAudit || !AuditOutput.IsValid() || !GetPack()) { return FReply::Handled(); }
+        const FString Directory = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Probe"), TEXT("Reports"));
+        if (!IFileManager::Get().MakeDirectory(*Directory, true))
+        { Message = TEXT("Could not create Probe report directory."); return FReply::Handled(); }
+        const FString SafeName = FPaths::MakeValidFileName(GetPack()->GetName());
+        const FString Path = FPaths::Combine(Directory, SafeName + TEXT("_ReleaseAudit.txt"));
+        const bool bSaved = FFileHelper::SaveStringToFile(AuditOutput->GetText().ToString(), *Path,
+            FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
+        Message = bSaved ? FString::Printf(TEXT("Exported audit: %s"), *Path) : TEXT("Failed to export audit.");
+        return FReply::Handled();
+    }
+
     FReply ShowDev14PackReadiness()
     {
         const UProbeTestPack* Pack = GetPack();
@@ -8945,13 +9191,179 @@ private:
         return FReply::Handled();
     }
 
+    TSharedRef<SWidget> MakeReusePackMenu()
+    {
+        FMenuBuilder Menu(true, nullptr);
+        const UProbeTestPack* Destination = GetPack();
+        int32 Choices = 0;
+        for (const TSharedPtr<FAssetData>& Data : Packs)
+        {
+            if (!Data.IsValid() || (SelectedPack.IsValid() &&
+                Data->GetObjectPathString() == SelectedPack->GetObjectPathString())) { continue; }
+            const FString Path = Data->GetObjectPathString();
+            Menu.AddMenuEntry(FText::FromName(Data->AssetName), FText::FromString(Path), FSlateIcon(),
+                FUIAction(FExecuteAction::CreateLambda([this, Path]() { ImportFromPack(Path); })));
+            ++Choices;
+        }
+        if (Choices == 0)
+        {
+            Menu.AddMenuEntry(LOCTEXT("Dev34NoSourcePacks", "No other Packs available"),
+                LOCTEXT("Dev34NoSourcePacksTip", "Create another Probe Pack to reuse its members here."),
+                FSlateIcon(), FUIAction());
+        }
+        return Menu.MakeWidget();
+    }
+
+    void ImportFromPack(const FString& SourcePath)
+    {
+        UProbeTestPack* Destination = GetPack();
+        UProbeTestPack* Source = nullptr;
+        for (const TSharedPtr<FAssetData>& Data : Packs)
+        {
+            if (Data.IsValid() && Data->GetObjectPathString() == SourcePath)
+            { Source = Cast<UProbeTestPack>(Data->GetAsset()); break; }
+        }
+        if (!Destination || !Source)
+        { Message = TEXT("Cannot import Pack: source or destination is unavailable."); return; }
+        TArray<FProbePackMixedEntry> Proposed;
+        ProbeDev34::FImportReport Report;
+        if (!ProbeDev34::PlanImport(*Destination, *Source, Proposed, Report))
+        { Message = FString::Printf(TEXT("Pack import rejected: %s"), *Report.Error); return; }
+        const FString Preview = FString::Printf(
+            TEXT("Import from %s?\n\n%d new member(s)\n%d existing duplicate(s) kept\n%d prerequisite link(s) from new members\n\nThis copies references, not nested Pack execution. Existing authored-only members will be converted to mixed entries. The source Pack is not changed. You can Undo the import."),
+            *Source->GetName(), Report.Added, Report.Existing, Report.DependencyLinks);
+        if (FMessageDialog::Open(EAppMsgType::YesNo, EAppReturnType::No, FText::FromString(Preview)) != EAppReturnType::Yes)
+        { return; }
+        const FScopedTransaction Transaction(LOCTEXT("Dev34ImportPackTransaction", "Import Members From Probe Pack"));
+        Destination->Modify();
+        Destination->MixedEntries = MoveTemp(Proposed);
+        Destination->Tests.Reset();
+        Destination->Prerequisites.Reset();
+        Destination->MarkPackageDirty();
+        MixedSelectedIdentities.Reset();
+        Message = FString::Printf(TEXT("Imported %d member(s) from %s; %d already present; %d dependency link(s) retained. Save to persist. Source Pack unchanged."),
+            Report.Added, *Source->GetName(), Report.Existing, Report.DependencyLinks);
+        InvalidateAudit(); RebuildMembers();
+    }
+
+    TSharedRef<SWidget> MakeMixedSourceFilterMenu()
+    {
+        FMenuBuilder Menu(true, nullptr);
+        const TCHAR* Labels[] = { TEXT("All Sources"), TEXT("Authored"), TEXT("Portable"), TEXT("Native") };
+        for (int32 Filter = 0; Filter < 4; ++Filter)
+        {
+            Menu.AddMenuEntry(FText::FromString(Labels[Filter]), FText::GetEmpty(), FSlateIcon(),
+                FUIAction(FExecuteAction::CreateLambda([this, Filter]()
+                { MixedSourceFilter = Filter; RebuildMembers(); }),
+                FCanExecuteAction(), FIsActionChecked::CreateLambda([this, Filter]() { return MixedSourceFilter == Filter; })),
+                NAME_None, EUserInterfaceActionType::RadioButton);
+        }
+        return Menu.MakeWidget();
+    }
+
+    FReply ExpandMixedSelection(bool bSelectPrerequisites)
+    {
+        if (const UProbeTestPack* Pack = GetPack())
+        {
+            MixedSelectedIdentities = ProbeDev34::ExpandSelection(Pack->MixedEntries,
+                MixedSelectedIdentities, bSelectPrerequisites);
+            RebuildMembers();
+        }
+        return FReply::Handled();
+    }
+
+    FReply SelectVisibleMixedMembers()
+    {
+        const UProbeTestPack* Pack = GetPack();
+        if (!Pack) { return FReply::Handled(); }
+        for (const FString& Identity : ProbeDev33::VisibleIdentities(Pack->MixedEntries, MemberQuery, MixedSourceFilter))
+        { MixedSelectedIdentities.Add(Identity); }
+        RebuildMembers(); return FReply::Handled();
+    }
+
+    FReply ClearMixedSelection()
+    {
+        MixedSelectedIdentities.Reset(); RebuildMembers(); return FReply::Handled();
+    }
+
+    FReply MoveMixedSelection(int32 Delta)
+    {
+        UProbeTestPack* Pack = GetPack();
+        if (!Pack || Pack->MixedEntries.IsEmpty()) { return FReply::Handled(); }
+        TArray<FProbePackMixedEntry> Proposed;
+        FString Error;
+        if (!ProbeDev33::PlanMove(Pack->MixedEntries, MixedSelectedIdentities, Delta, Proposed, Error))
+        { Message = Error; return FReply::Handled(); }
+        const FScopedTransaction Transaction(LOCTEXT("Dev33BulkMoveTransaction", "Move Selected Mixed Pack Members"));
+        Pack->Modify(); Pack->MixedEntries = MoveTemp(Proposed); Pack->MarkPackageDirty();
+        Message = TEXT("Selected members moved; prerequisite ordering preserved.");
+        InvalidateAudit(); RebuildMembers(); return FReply::Handled();
+    }
+
+    FReply ShowMixedImpact()
+    {
+        const UProbeTestPack* Pack = GetPack();
+        if (!Pack) { return FReply::Handled(); }
+        const ProbeDev35::FImpact Impact = ProbeDev35::AnalyzeRemoval(Pack->MixedEntries, MixedSelectedIdentities);
+        const ProbeDev35::FGraphSummary Summary = ProbeDev35::Analyze(Pack->MixedEntries);
+        FMessageDialog::Open(EAppMsgType::Ok, FText::FromString(ProbeDev35::ImpactText(Impact, Summary)));
+        return FReply::Handled();
+    }
+
+    FReply RemoveMixedBranch()
+    {
+        UProbeTestPack* Pack = GetPack();
+        if (!Pack || MixedSelectedIdentities.IsEmpty()) { return FReply::Handled(); }
+        TArray<FProbePackMixedEntry> Proposed;
+        ProbeDev35::FImpact Impact;
+        FString Error;
+        const int32 Removed = ProbeDev35::PlanRemoveBranch(Pack->MixedEntries, MixedSelectedIdentities, Proposed, Impact, Error);
+        if (Removed == 0) { Message = Error; return FReply::Handled(); }
+        const FString Prompt = FString::Printf(TEXT("Remove %d members (%d selected + %d downstream dependents)?\n\nNo test assets are deleted. No remaining prerequisite is detached. One Undo restores the Pack.\n\n%s"),
+            Removed, Impact.Selected.Num(), Impact.AffectedOutsideSelection,
+            *ProbeDev35::ImpactText(Impact, ProbeDev35::Analyze(Pack->MixedEntries)));
+        if (FMessageDialog::Open(EAppMsgType::YesNo, EAppReturnType::No, FText::FromString(Prompt)) != EAppReturnType::Yes)
+        { return FReply::Handled(); }
+        const FScopedTransaction Transaction(LOCTEXT("Dev35RemoveBranchTransaction", "Remove Probe Pack Dependency Branch"));
+        Pack->Modify(); Pack->MixedEntries = MoveTemp(Proposed); Pack->MarkPackageDirty();
+        MixedSelectedIdentities.Reset();
+        Message = FString::Printf(TEXT("Removed %d members including %d dependents. Undo is available."), Removed, Impact.AffectedOutsideSelection);
+        InvalidateAudit(); RebuildMembers();
+        return FReply::Handled();
+    }
+
+    FReply RemoveMixedSelection()
+    {
+        UProbeTestPack* Pack = GetPack();
+        if (!Pack || MixedSelectedIdentities.IsEmpty()) { return FReply::Handled(); }
+        TArray<FProbePackMixedEntry> Proposed = Pack->MixedEntries;
+        const int32 Removed = ProbeDev33::PlanRemoval(Proposed, MixedSelectedIdentities);
+        if (Removed == 0) { return FReply::Handled(); }
+        const ProbeDev35::FImpact Impact = ProbeDev35::AnalyzeRemoval(Pack->MixedEntries, MixedSelectedIdentities);
+        if (FMessageDialog::Open(EAppMsgType::YesNo, EAppReturnType::No,
+            FText::FromString(FString::Printf(TEXT("Remove %d selected member(s)? This will clear %d prerequisite link(s) on %d downstream member(s), which will remain in the Pack.\n\nChoose Remove + Dependents instead to remove the whole affected branch. No Test assets are deleted. Undo is available."),
+                Removed, Impact.DetachedLinks, Impact.AffectedOutsideSelection))) != EAppReturnType::Yes)
+        { return FReply::Handled(); }
+        const FScopedTransaction Transaction(LOCTEXT("Dev33BulkRemoveTransaction", "Remove Selected Mixed Pack Members"));
+        Pack->Modify(); Pack->MixedEntries = MoveTemp(Proposed); Pack->MarkPackageDirty();
+        MixedSelectedIdentities.Reset();
+        Message = FString::Printf(TEXT("Removed %d Pack member(s) and cleared references to those prerequisites. Undo is available."), Removed);
+        InvalidateAudit(); RebuildMembers(); return FReply::Handled();
+    }
+
     FReply ReorderMixedEntry(int32 Index, int32 Delta)
     {
         UProbeTestPack* Pack = GetPack();
         if (!Pack || !Pack->MixedEntries.IsValidIndex(Index) || !Pack->MixedEntries.IsValidIndex(Index+Delta))
         { return FReply::Handled(); }
+        TSet<FString> One;
+        One.Add(ProbeDev27::Identity(Pack->MixedEntries[Index]));
+        TArray<FProbePackMixedEntry> Proposed;
+        FString Error;
+        if (!ProbeDev33::PlanMove(Pack->MixedEntries, One, Delta, Proposed, Error))
+        { Message = Error; return FReply::Handled(); }
         const FScopedTransaction Transaction(LOCTEXT("MixedReorder", "Reorder Mixed Pack Entry"));
-        Pack->Modify(); Pack->MixedEntries.Swap(Index, Index+Delta); Pack->MarkPackageDirty();
+        Pack->Modify(); Pack->MixedEntries = MoveTemp(Proposed); Pack->MarkPackageDirty();
         InvalidateAudit(); RebuildMembers(); return FReply::Handled();
     }
 
@@ -9007,6 +9419,7 @@ private:
         const FScopedTransaction Transaction(LOCTEXT("MixedRemove", "Remove Mixed Pack Entry"));
         Pack->Modify();
         const FString RemovedIdentity = ProbeDev27::Identity(Pack->MixedEntries[Index]);
+        MixedSelectedIdentities.Remove(RemovedIdentity);
         Pack->MixedEntries.RemoveAt(Index);
         for (FProbePackMixedEntry& Entry : Pack->MixedEntries) { Entry.Requires.Remove(RemovedIdentity); }
         Pack->MarkPackageDirty();
@@ -9026,6 +9439,17 @@ private:
         return FReply::Handled();
     }
 
+    void ClearMixedDependencies(int32 MemberIndex)
+    {
+        UProbeTestPack* Pack = GetPack();
+        if (!Pack || !Pack->MixedEntries.IsValidIndex(MemberIndex) || Pack->MixedEntries[MemberIndex].Requires.IsEmpty())
+        { return; }
+        const FScopedTransaction Transaction(LOCTEXT("Dev32ClearMixedDependencyTransaction", "Clear Mixed Pack Prerequisites"));
+        Pack->Modify();
+        Pack->MixedEntries[MemberIndex].Requires.Reset();
+        Pack->MarkPackageDirty(); InvalidateAudit(); RebuildMembers();
+    }
+
     TSharedRef<SWidget> MakeMixedDependencyMenu(int32 MemberIndex)
     {
         FMenuBuilder Menu(true, nullptr);
@@ -9037,11 +9461,18 @@ private:
                 LOCTEXT("MixedNoEarlierTip", "A prerequisite must occur before the dependent member."),
                 FSlateIcon(), FUIAction());
         }
+        if (!Pack->MixedEntries[MemberIndex].Requires.IsEmpty())
+        {
+            Menu.AddMenuEntry(LOCTEXT("Dev32ClearMixedPrerequisites", "Clear all prerequisites"),
+                LOCTEXT("Dev32ClearMixedPrerequisitesTip", "Remove all prerequisite requirements for this member. Undo is supported."),
+                FSlateIcon(), FUIAction(FExecuteAction::CreateSP(this, &SProbePackWorkspace::ClearMixedDependencies, MemberIndex)));
+            Menu.AddMenuSeparator();
+        }
         for (int32 Candidate = 0; Candidate < MemberIndex; ++Candidate)
         {
             const FString Identity = ProbeDev27::Identity(Pack->MixedEntries[Candidate]);
             const bool bSelected = Pack->MixedEntries[MemberIndex].Requires.Contains(Identity);
-            const FString Label = FString::Printf(TEXT("%d. %s"), Candidate+1, *Pack->MixedEntries[Candidate].Locator);
+            const FString Label = FString::Printf(TEXT("%d. %s"), Candidate+1, *ProbeDev29::DisplayName(Pack->MixedEntries[Candidate]));
             Menu.AddMenuEntry(FText::FromString(Label), FText::FromString(Identity), FSlateIcon(),
                 FUIAction(FExecuteAction::CreateLambda([this, MemberIndex, Identity]() { ToggleMixedDependency(MemberIndex, Identity); }),
                     FCanExecuteAction(), FIsActionChecked::CreateLambda([bSelected]() { return bSelected; })),
@@ -9052,6 +9483,19 @@ private:
 
     void RebuildMixedMembers(const UProbeTestPack& Pack)
     {
+        const int32 VisibleCount = ProbeDev33::VisibleIdentities(Pack.MixedEntries, MemberQuery, MixedSourceFilter).Num();
+        MemberRows->AddSlot().AutoHeight().Padding(6,1,6,3)
+        [ SNew(STextBlock)
+          .Text(FText::FromString(FString::Printf(TEXT("Showing %d of %d members | %d selected"),
+              VisibleCount, Pack.MixedEntries.Num(), MixedSelectedIdentities.Num())))
+          .ColorAndOpacity(FSlateColor::UseSubduedForeground()) ];
+        if (VisibleCount == 0)
+        {
+            MemberRows->AddSlot().AutoHeight().Padding(12,10)
+            [ SNew(STextBlock).Text(LOCTEXT("Dev33NoMixedMatches", "No members match the current search and source filter."))
+              .ColorAndOpacity(FSlateColor::UseSubduedForeground()) ];
+            return;
+        }
         MemberRows->AddSlot().AutoHeight().Padding(6,3,6,8)
         [ SNew(STextBlock).Text(LOCTEXT("MixedModeHint", "Mixed-source Pack: ordered authored, portable, and native tests. Runs produce one combined History record. Existing Test-only Pack controls do not apply in mixed mode."))
           .AutoWrapText(true).ColorAndOpacity(FSlateColor::UseSubduedForeground()) ];
@@ -9066,21 +9510,34 @@ private:
             case EProbePackMixedSource::PortablePack: Source = TEXT("Portable Pack"); break;
             case EProbePackMixedSource::NativeAutomation: Source = TEXT("Unreal Automation"); break;
             }
-            if (!MemberQuery.IsEmpty() && !Member.Locator.Contains(MemberQuery, ESearchCase::IgnoreCase)
-                && !FString(Source).Contains(MemberQuery, ESearchCase::IgnoreCase)) { continue; }
+            if (!ProbeDev33::Matches(Member, MemberQuery, MixedSourceFilter)) { continue; }
             FString Error;
             const bool bValid = ProbeDev27::ValidateEntry(Member, Error) &&
                 ProbeDev27::ValidateMemberDependencies(Pack, Index, Error);
             MemberRows->AddSlot().AutoHeight().Padding(3,2)
             [ SNew(SBorder).BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder")).Padding(5)
               [ SNew(SHorizontalBox)
+                + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(1,0,6,0)
+                [ SNew(SCheckBox)
+                  .ToolTipText(LOCTEXT("Dev33MixedSelectTip", "Select this member for bulk reorder or removal."))
+                  .IsChecked_Lambda([this, Identity = ProbeDev27::Identity(Member)]()
+                  { return MixedSelectedIdentities.Contains(Identity) ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+                  .OnCheckStateChanged_Lambda([this, Identity = ProbeDev27::Identity(Member)](ECheckBoxState State)
+                  { if (State == ECheckBoxState::Checked) { MixedSelectedIdentities.Add(Identity); }
+                    else { MixedSelectedIdentities.Remove(Identity); } }) ]
                 + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(1,0,12,0)
                 [ SNew(STextBlock).Text(FText::AsNumber(Index+1)) ]
                 + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0,0,10,0)
                 [ SNew(STextBlock).Text(FText::FromString(Source)).ColorAndOpacity(FSlateColor::UseSubduedForeground()) ]
                 + SHorizontalBox::Slot().FillWidth(1).VAlign(VAlign_Center)
-                [ SNew(STextBlock).Text(FText::FromString(Member.Locator)).AutoWrapText(true)
-                  .ToolTipText(FText::FromString(bValid ? Member.Locator : Error)) ]
+                [ SNew(SVerticalBox)
+                  + SVerticalBox::Slot().AutoHeight()
+                  [ SNew(STextBlock).Text(FText::FromString(ProbeDev29::DisplayName(Member))).AutoWrapText(true)
+                    .ToolTipText(FText::FromString(bValid ? Member.Locator : Error)) ]
+                  + SVerticalBox::Slot().AutoHeight()
+                  [ SNew(STextBlock).Visibility(bShowMixedDependencies ? EVisibility::Visible : EVisibility::Collapsed)
+                    .Text(FText::FromString(ProbeDev34::DependencySummary(Pack.MixedEntries, Index)))
+                    .ColorAndOpacity(FSlateColor::UseSubduedForeground()).AutoWrapText(true) ] ]
                 + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(4,0)
                 [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
                   .ToolTipText(LOCTEXT("MixedOpenMemberTip", "Open the member definition: authored Tests in Probe, native Automation in the Test Library, or portable source JSON in its editor."))
@@ -9094,15 +9551,15 @@ private:
                 + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(8,0)
                 [ SNew(STextBlock).Text(FText::FromString(bValid ? TEXT("Ready") : TEXT("Invalid")))
                   .ColorAndOpacity(bValid ? FSlateColor(FLinearColor(0.32f,0.72f,0.48f)) : FSlateColor(FLinearColor(0.95f,0.45f,0.25f))) ]
-                + SHorizontalBox::Slot().AutoWidth()
+                + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
                 [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton").IsEnabled(Index>0)
                   .OnClicked_Lambda([this,Index]() { return ReorderMixedEntry(Index,-1); })
                   [ SNew(SImage).Image(FAppStyle::GetBrush("Icons.ChevronUp")) ] ]
-                + SHorizontalBox::Slot().AutoWidth()
+                + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
                 [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton").IsEnabled(Index+1<Pack.MixedEntries.Num())
                   .OnClicked_Lambda([this,Index]() { return ReorderMixedEntry(Index,1); })
                   [ SNew(SImage).Image(FAppStyle::GetBrush("Icons.ChevronDown")) ] ]
-                + SHorizontalBox::Slot().AutoWidth()
+                + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
                 [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
                   .OnClicked_Lambda([this,Index]() { return RemoveMixedEntry(Index); })
                   [ SNew(SImage).Image(FAppStyle::GetBrush("Icons.Delete")) ] ] ] ];
@@ -9253,6 +9710,33 @@ public:
                   [ SNew(SButton).Text(LOCTEXT("Dev19Starter", "New Provider Starter..."))
                     .ToolTipText(LOCTEXT("Dev19StarterTip", "Generate validated, dependency-free JSON under Saved/Probe/ProviderStarters. Nothing is written to an installed plugin."))
                     .OnClicked_Lambda([this]() { OpenStarterDialog(); return FReply::Handled(); }) ]
+                + SHorizontalBox::Slot().AutoWidth().Padding(3,0)
+                  [ SNew(SButton).Text(LOCTEXT("Dev37ExportProviderAudit", "Export API Audit"))
+                    .ToolTipText(LOCTEXT("Dev37ExportProviderAuditTip", "Save a deterministic read-only provider audit under Saved/Probe/Reports. Does not execute provider tests."))
+                    .IsEnabled_Lambda([this]() { return !bRunning; })
+                    .OnClicked_Lambda([this]() {
+                        const FString Report = ProbeDev37::Audit(ProbePortable::Providers(),
+                            ProbePortable::Diagnostics()).ToText();
+                        const FString Directory = FPaths::ProjectSavedDir() / TEXT("Probe/Reports");
+                        IFileManager::Get().MakeDirectory(*Directory, true);
+                        const FString Path = Directory / TEXT("PortableProviderApiAudit.txt");
+                        const bool bSaved = FFileHelper::SaveStringToFile(Report, *Path,
+                            FFileHelper::EEncodingOptions::ForceUTF8);
+                        if (Preview.IsValid()) { Preview->SetText(FText::FromString(Report)); }
+                        Feedback = bSaved ? TEXT("API audit exported to: ") + Path
+                            : TEXT("Unable to write API audit to: ") + Path;
+                        return FReply::Handled(); }) ]
+                + SHorizontalBox::Slot().AutoWidth().Padding(3,0)
+                  [ SNew(SButton).Text(LOCTEXT("Dev37ProviderAudit", "API Audit"))
+                    .ToolTipText(LOCTEXT("Dev37ProviderAuditTip", "Read-only review of discovered asset-free provider declarations and pending execution checks. Copy or export from the preview below."))
+                    .IsEnabled_Lambda([this]() { return !bRunning; })
+                    .OnClicked_Lambda([this]() {
+                        const ProbeDev37::FReport Report = ProbeDev37::Audit(
+                            ProbePortable::Providers(), ProbePortable::Diagnostics());
+                        if (Preview.IsValid()) { Preview->SetText(FText::FromString(Report.ToText())); }
+                        Feedback = FString::Printf(TEXT("Provider API audit: %d blocker(s), %d deferred execution check(s)."),
+                            Report.Blockers, Report.Deferred);
+                        return FReply::Handled(); }) ]
                 + SHorizontalBox::Slot().AutoWidth().Padding(3,0)
                   [ SNew(SButton).Text(LOCTEXT("PortableProviderRefresh", "Validate & Refresh"))
                     .ToolTipText(LOCTEXT("PortableRefreshTip", "Validate Resources/Probe definitions from enabled plugins; never execute tests during discovery."))
