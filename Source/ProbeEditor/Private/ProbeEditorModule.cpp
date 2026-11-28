@@ -18,6 +18,7 @@
 #include "ProbeExtensions.h"
 #include "ProbePortableProviders.h"
 #include "ProbeDev37ProviderAudit.h"
+#include "ProbeDev38ProviderPresentation.h"
 #include "ProbeDev19Authoring.h"
 #include "ProbeDev20Catalog.h"
 #include "ProbeDev23NativeBridge.h"
@@ -9706,6 +9707,9 @@ public:
                 + SHorizontalBox::Slot().FillWidth(1.f).VAlign(VAlign_Center)
                   [ SNew(STextBlock).Text(LOCTEXT("PortableProviderTitle", "Portable Plugin Providers"))
                     .Font(FAppStyle::GetFontStyle("HeadingExtraSmall")) ]
+              ]
+            + SVerticalBox::Slot().AutoHeight().Padding(0,0,0,6)
+              [ SNew(SHorizontalBox)
                 + SHorizontalBox::Slot().AutoWidth().Padding(3,0)
                   [ SNew(SButton).Text(LOCTEXT("Dev19Starter", "New Provider Starter..."))
                     .ToolTipText(LOCTEXT("Dev19StarterTip", "Generate validated, dependency-free JSON under Saved/Probe/ProviderStarters. Nothing is written to an installed plugin."))
@@ -9722,26 +9726,24 @@ public:
                         const FString Path = Directory / TEXT("PortableProviderApiAudit.txt");
                         const bool bSaved = FFileHelper::SaveStringToFile(Report, *Path,
                             FFileHelper::EEncodingOptions::ForceUTF8);
+                        InspectorTitle = TEXT("API AUDIT");
+                        InspectorSubtitle = TEXT("READ ONLY  |  Definitions and execution checks");
+                        SelectedId.Reset(); SelectedProvider.Reset();
                         if (Preview.IsValid()) { Preview->SetText(FText::FromString(Report)); }
                         Feedback = bSaved ? TEXT("API audit exported to: ") + Path
                             : TEXT("Unable to write API audit to: ") + Path;
                         return FReply::Handled(); }) ]
                 + SHorizontalBox::Slot().AutoWidth().Padding(3,0)
-                  [ SNew(SButton).Text(LOCTEXT("Dev37ProviderAudit", "API Audit"))
-                    .ToolTipText(LOCTEXT("Dev37ProviderAuditTip", "Read-only review of discovered asset-free provider declarations and pending execution checks. Copy or export from the preview below."))
-                    .IsEnabled_Lambda([this]() { return !bRunning; })
-                    .OnClicked_Lambda([this]() {
-                        const ProbeDev37::FReport Report = ProbeDev37::Audit(
-                            ProbePortable::Providers(), ProbePortable::Diagnostics());
-                        if (Preview.IsValid()) { Preview->SetText(FText::FromString(Report.ToText())); }
-                        Feedback = FString::Printf(TEXT("Provider API audit: %d blocker(s), %d deferred execution check(s)."),
-                            Report.Blockers, Report.Deferred);
-                        return FReply::Handled(); }) ]
-                + SHorizontalBox::Slot().AutoWidth().Padding(3,0)
                   [ SNew(SButton).Text(LOCTEXT("PortableProviderRefresh", "Validate & Refresh"))
                     .ToolTipText(LOCTEXT("PortableRefreshTip", "Validate Resources/Probe definitions from enabled plugins; never execute tests during discovery."))
                     .IsEnabled_Lambda([this]() { return !bRunning; })
-                    .OnClicked_Lambda([this]() { ProbePortable::Refresh(); Rebuild(); return FReply::Handled(); }) ]
+                    .OnClicked_Lambda([this]() { ProbePortable::Refresh();
+                        InspectorTitle = TEXT("INSPECTOR");
+                        InspectorSubtitle = TEXT("READ ONLY INSPECTION  |  No test is selected");
+                        SelectedId.Reset(); SelectedProvider.Reset();
+                        Feedback = ProbePortable::DiscoverySummary() + TEXT(" Registry refreshed; no definitions executed.");
+                        if (Preview.IsValid()) { Preview->SetText(FText::FromString(TEXT("Providers refreshed. Inspect a definition or open API Audit to review the current registry."))); }
+                        Rebuild(); return FReply::Handled(); }) ]
                 + SHorizontalBox::Slot().AutoWidth().Padding(3,0)
                   [ SNew(SButton).Text(LOCTEXT("PortableCancel", "Cancel Run"))
                     .ToolTipText(LOCTEXT("PortableCancelTip", "Request cancellation at the next safe step boundary. Async actions receive cancellation callbacks and cleanup still runs."))
@@ -9750,21 +9752,78 @@ public:
                         if (ProbePortable::RequestCancel()) { Feedback = TEXT("Cancellation requested. Cleanup callbacks remain active."); }
                         return FReply::Handled(); }) ] ]
             + SVerticalBox::Slot().AutoHeight().Padding(0,0,0,5)
+              [ SNew(STextBlock)
+                .ColorAndOpacity(FSlateColor::UseSubduedForeground())
+                .Text_Lambda([this]() {
+                    return FText::FromString(ProbeDev38::Summary(
+                        ProbeDev38::Count(ProbePortable::Providers(), ProbePortable::Diagnostics(), SearchText),
+                        !SearchText.IsEmpty())); }) ]
+            + SVerticalBox::Slot().AutoHeight().Padding(0,0,0,5)
               [ SNew(SSearchBox).HintText(LOCTEXT("Dev19SearchProviders", "Search providers, Tests, Packs, or IDs..."))
                 .OnTextChanged_Lambda([this](const FText& Text) { SearchText = Text.ToString(); Rebuild(); }) ]
-            + SVerticalBox::Slot().AutoHeight().Padding(0,0,0,6)
+            + SVerticalBox::Slot().AutoHeight().Padding(2,0,2,8)
               [ SNew(STextBlock).AutoWrapText(true)
+                .ColorAndOpacity(FSlateColor::UseSubduedForeground())
                 .Text_Lambda([this]() { return FText::FromString(Feedback); }) ]
             + SVerticalBox::Slot().FillHeight(1.f)
-              [ SNew(SSplitter).Orientation(Orient_Vertical)
-                + SSplitter::Slot().Value(.67f)
-                  [ SNew(SBorder).BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder")).Padding(4)
-                    [ SNew(SScrollBox) + SScrollBox::Slot() [ SAssignNew(Contents, SVerticalBox) ] ] ]
-                + SSplitter::Slot().Value(.33f)
+              [ SNew(SSplitter).Orientation(Orient_Horizontal)
+                + SSplitter::Slot().Value(.48f)
+                  [ SNew(SBorder).BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder")).Padding(5)
+                    [ SNew(SVerticalBox)
+                      + SVerticalBox::Slot().AutoHeight().Padding(4,2,4,6)
+                        [ SNew(STextBlock).Text(LOCTEXT("Dev38BrowseHeader", "PROVIDERS & DEFINITIONS"))
+                          .Font(FAppStyle::GetFontStyle("NormalFontBold")) ]
+                      + SVerticalBox::Slot().FillHeight(1.f)
+                        [ SNew(SScrollBox) + SScrollBox::Slot() [ SAssignNew(Contents, SVerticalBox) ] ] ] ]
+                + SSplitter::Slot().Value(.52f)
                   [ SNew(SBorder).BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder")).Padding(8)
-                    [ SNew(SScrollBox) + SScrollBox::Slot()
-                      [ SAssignNew(Preview, STextBlock).AutoWrapText(true)
-                        .Text(LOCTEXT("Dev19SelectPreview", "Select Preview on a Test or Pack to inspect steps, source and authorization requirements before running.")) ] ] ] ] ] ];
+                    [ SNew(SVerticalBox)
+                      + SVerticalBox::Slot().AutoHeight().Padding(0,0,0,6)
+                        [ SNew(SHorizontalBox)
+                          + SHorizontalBox::Slot().FillWidth(1.f).VAlign(VAlign_Center)
+                            [ SNew(STextBlock)
+                              .Text_Lambda([this]() { return FText::FromString(InspectorTitle); })
+                              .Font(FAppStyle::GetFontStyle("NormalFontBold")) ]
+                          + SHorizontalBox::Slot().AutoWidth().Padding(3,0)
+                            [ SNew(SButton).Text(LOCTEXT("Dev38ShowAudit", "API Audit"))
+                              .ToolTipText(LOCTEXT("Dev38AuditTooltip", "Show the read-only provider declaration audit in the inspector."))
+                              .IsEnabled_Lambda([this]() { return !bRunning; })
+                              .OnClicked_Lambda([this]() { ShowApiAudit(); return FReply::Handled(); }) ]
+                          + SHorizontalBox::Slot().AutoWidth().Padding(3,0)
+                            [ SNew(SButton).Text(LOCTEXT("Dev38CopyInspector", "Copy"))
+                              .OnClicked_Lambda([this]() {
+                                  if (Preview.IsValid()) { FPlatformApplicationMisc::ClipboardCopy(*Preview->GetText().ToString()); }
+                                  return FReply::Handled(); }) ] ]
+                      + SVerticalBox::Slot().AutoHeight().Padding(1,0,1,7)
+                        [ SNew(STextBlock)
+                          .Text_Lambda([this]() { return FText::FromString(InspectorSubtitle); })
+                          .ColorAndOpacity(FSlateColor::UseSubduedForeground())
+                          .AutoWrapText(true) ]
+                      + SVerticalBox::Slot().AutoHeight().Padding(0,0,0,8)
+                        [ SNew(SHorizontalBox)
+                          + SHorizontalBox::Slot().AutoWidth().Padding(0,0,5,0)
+                            [ SNew(SButton).Text_Lambda([this]() { return FText::FromString(
+                                  SelectedId.IsEmpty() ? TEXT("Run Selected") :
+                                  (ProbePortable::RequiresAuthorization(SelectedId, bSelectedPack) ? TEXT("Run Actions...") : TEXT("Run Selected"))); })
+                              .IsEnabled_Lambda([this]() { return !bRunning && !SelectedId.IsEmpty(); })
+                              .ToolTipText(LOCTEXT("Dev39RunSelectionTip", "Run the inspected portable Test or Pack. Provider actions require confirmation."))
+                              .OnClicked_Lambda([this]() { return Execute(SelectedId, bSelectedPack); }) ]
+                          + SHorizontalBox::Slot().AutoWidth().Padding(0,0,5,0)
+                            [ SNew(SComboButton)
+                              .IsEnabled_Lambda([this]() { return !SelectedId.IsEmpty(); })
+                              .ToolTipText(LOCTEXT("Dev39SelectedActionsTip", "Edit source JSON, export source JSON or import this test for editing."))
+                              .OnGetMenuContent_Lambda([this]() { return BuildDefinitionMenu(SelectedProvider, SelectedId, bSelectedPack); })
+                              .ButtonContent()[ SNew(STextBlock).Text(LOCTEXT("Dev39SelectedActions", "Definition Actions")) ] ]
+                          + SHorizontalBox::Slot().FillWidth(1.f)
+                            [ SNew(STextBlock).Text_Lambda([this]() { return FText::FromString(
+                                    SelectedId.IsEmpty() ? TEXT("Select a definition in the left pane") : SelectedId); })
+                              .ColorAndOpacity(FSlateColor::UseSubduedForeground())
+                              .AutoWrapText(false) ] ]
+                      + SVerticalBox::Slot().FillHeight(1.f)
+                        [ SNew(SBorder).BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder")).Padding(10)
+                          [ SNew(SScrollBox) + SScrollBox::Slot()
+                            [ SAssignNew(Preview, STextBlock).AutoWrapText(true)
+                              .Text(LOCTEXT("Dev39SelectPreview", "Select a provider, test or Pack on the left to inspect its definition. Use API Audit to review all declarations. Inspection and audits never execute tests.")) ] ] ] ] ] ] ] ];
         Rebuild();
     }
 
@@ -9772,14 +9831,32 @@ private:
     TSharedPtr<SVerticalBox> Contents;
     TSharedPtr<STextBlock> Preview;
     FString SearchText;
-    FString Feedback = TEXT("No execution during discovery. Portable action permissions are always explicit per run.");
+    FString InspectorTitle = TEXT("INSPECTOR");
+    FString InspectorSubtitle = TEXT("READ ONLY INSPECTION  |  No test is selected");
+    FString SelectedId;
+    FString SelectedProvider;
+    bool bSelectedPack = false;
+    FString Feedback = TEXT("Discovery is read-only. Running provider actions requires explicit authorization.");
     bool bRunning = false;
+
+    void ShowApiAudit()
+    {
+        const ProbeDev37::FReport Report = ProbeDev37::Audit(
+            ProbePortable::Providers(), ProbePortable::Diagnostics());
+        InspectorTitle = TEXT("API AUDIT");
+        InspectorSubtitle = FString::Printf(TEXT("%s  |  %d definition blockers  |  %d execution checks deferred"),
+            Report.Blockers == 0 ? TEXT("DEFINITION GATE: PASS") : TEXT("DEFINITION GATE: BLOCKED"),
+            Report.Blockers, Report.Deferred);
+        SelectedId.Reset();
+        SelectedProvider.Reset();
+        if (Preview.IsValid()) { Preview->SetText(FText::FromString(Report.ToText())); }
+        Feedback = FString::Printf(TEXT("Provider API audit: %d blocker(s), %d deferred execution check(s)."),
+            Report.Blockers, Report.Deferred);
+    }
 
     bool Matches(const FString& Name, const FString& Id, const FString& ProviderName) const
     {
-        return SearchText.IsEmpty() || Name.Contains(SearchText, ESearchCase::IgnoreCase)
-            || Id.Contains(SearchText, ESearchCase::IgnoreCase)
-            || ProviderName.Contains(SearchText, ESearchCase::IgnoreCase);
+        return ProbeDev38::Matches(SearchText, Name, Id, ProviderName);
     }
 
     void Rebuild()
@@ -9789,9 +9866,8 @@ private:
         int32 Visible = 0;
         for (const ProbePortable::FPortableProvider& Provider : ProbePortable::Providers())
         {
-            const bool bProviderMatches = SearchText.IsEmpty()
-                || Provider.PluginName.Contains(SearchText, ESearchCase::IgnoreCase)
-                || Provider.ProviderId.Contains(SearchText, ESearchCase::IgnoreCase);
+            const bool bProviderMatches = ProbeDev38::Matches(SearchText,
+                Provider.PluginName, Provider.ProviderId, Provider.PluginName);
             bool bAny = bProviderMatches;
             for (const ProbePortable::FPortableTest& Test : Provider.Tests)
             { bAny |= Matches(Test.Name, Test.Id, Provider.PluginName); }
@@ -9802,9 +9878,15 @@ private:
             const FString Header = FString::Printf(TEXT("%s  |  v%s  |  %d Tests  |  %d Packs  |  %d Actions"),
                 *Provider.PluginName, *Provider.Version, Provider.Tests.Num(), Provider.Packs.Num(), Provider.Actions.Num());
             Contents->AddSlot().AutoHeight().Padding(2,7,2,3)
-            [ SNew(SHorizontalBox)
-              + SHorizontalBox::Slot().FillWidth(1.f).VAlign(VAlign_Center)
-                [ SNew(STextBlock).Text(FText::FromString(Header)).Font(FAppStyle::GetFontStyle("NormalFontBold")) ]
+            [ SNew(SVerticalBox)
+              + SVerticalBox::Slot().AutoHeight().Padding(0,0,0,5)
+                [ SNew(SButton).ButtonStyle(FAppStyle::Get(), "SimpleButton")
+                  .ToolTipText(LOCTEXT("Dev39ProviderInspectTip", "Inspect this provider and its discovered definition counts."))
+                  .OnClicked_Lambda([this, Name=Provider.PluginName]() { InspectProvider(Name); return FReply::Handled(); })
+                  [ SNew(STextBlock).Text(FText::FromString(Header)).AutoWrapText(true)
+                    .Font(FAppStyle::GetFontStyle("NormalFontBold")) ] ]
+              + SVerticalBox::Slot().AutoHeight()
+                [ SNew(SHorizontalBox)
               + SHorizontalBox::Slot().AutoWidth().Padding(4,0)
                 [ SNew(SButton).Text(LOCTEXT("Dev19ValidateProvider", "Validate"))
                   .ToolTipText(LOCTEXT("Dev19ValidateProviderTip", "Re-parse the plugin's Resources/Probe definition files without running them."))
@@ -9816,20 +9898,29 @@ private:
                 [ SNew(SButton).Text(LOCTEXT("Dev19OpenProviderFolder", "Open JSON Folder"))
                   .ToolTipText(LOCTEXT("Dev19OpenProviderFolderTip", "Open this plugin's existing Resources/Probe folder for editing in your normal text editor."))
                   .OnClicked_Lambda([Dir=Provider.Directory]() {
-                      FPlatformProcess::ExploreFolder(*Dir); return FReply::Handled(); }) ] ];
+                      FPlatformProcess::ExploreFolder(*Dir); return FReply::Handled(); }) ] ] ];
+            int32 ShownTests = 0;
             for (const ProbePortable::FPortableTest& Test : Provider.Tests)
             {
-                if (Matches(Test.Name, Test.Id, Provider.PluginName))
-                { AddRunRow(Test.Name + TEXT("  [") + Test.Id + TEXT("]"), Test.Id, false,
-                    Provider.PluginName, Test.Description); }
+                if (bProviderMatches || Matches(Test.Name, Test.Id, Provider.PluginName))
+                {
+                    if (ShownTests++ == 0) { AddSectionLabel(TEXT("TESTS")); }
+                    AddRunRow(Test.Name, Test.Id, false, Provider.PluginName, Test.Description);
+                }
             }
+            int32 ShownPacks = 0;
             for (const ProbePortable::FPortablePack& Pack : Provider.Packs)
             {
-                if (Matches(Pack.Name, Pack.Id, Provider.PluginName))
-                { AddRunRow(Pack.Name + TEXT("  [") + Pack.Id + TEXT("]"), Pack.Id, true,
-                    Provider.PluginName, FString::Printf(TEXT("%d Tests, %s"), Pack.TestIds.Num(),
-                        Pack.bStopOnFailure ? TEXT("Stop on Failure") : TEXT("Continue on Failure"))); }
+                if (bProviderMatches || Matches(Pack.Name, Pack.Id, Provider.PluginName))
+                {
+                    if (ShownPacks++ == 0) { AddSectionLabel(TEXT("PACKS")); }
+                    AddRunRow(Pack.Name, Pack.Id, true, Provider.PluginName,
+                        FString::Printf(TEXT("%d Tests, %s"), Pack.TestIds.Num(),
+                            Pack.bStopOnFailure ? TEXT("Stop on Failure") : TEXT("Continue on Failure")));
+                }
             }
+            Contents->AddSlot().AutoHeight().Padding(0,9,0,1)
+            [ SNew(SSeparator) ];
         }
         for (const FString& Issue : ProbePortable::Diagnostics())
         {
@@ -9845,34 +9936,51 @@ private:
             [ SNew(STextBlock).AutoWrapText(true)
               .Text(LOCTEXT("Dev19NoProviders", "No matching providers or definitions. Enable a plugin containing Resources/Probe/manifest.json, or create a starter.")) ];
         }
-        if (!bRunning)
-        { Feedback = ProbePortable::DiscoverySummary() + TEXT(" Definitions are never executed during discovery."); }
+    }
+
+    void AddSectionLabel(const FString& Label)
+    {
+        Contents->AddSlot().AutoHeight().Padding(8,9,4,3)
+        [ SNew(STextBlock).Text(FText::FromString(Label))
+          .ColorAndOpacity(FSlateColor::UseSubduedForeground())
+          .Font(FAppStyle::GetFontStyle("NormalFontBold")) ];
+    }
+
+    void InspectProvider(const FString& Name)
+    {
+        if (const ProbePortable::FPortableProvider* Selected = FindProvider(Name))
+        {
+            SelectedId.Reset(); SelectedProvider.Reset();
+            InspectorTitle = TEXT("PROVIDER DETAILS");
+            InspectorSubtitle = TEXT("DISCOVERED PROVIDER  |  Read-only summary");
+            const FString Info = FString::Printf(
+                TEXT("%s\n\nProvider ID: %s\nVersion: %s\n\nDISCOVERED DEFINITIONS\nTests: %d\nPacks: %d\nAssertions: %d\nActions: %d\nTemplates: %d\n\nProvider discovery reads definitions only. Execution, action authorization and runtime cleanup are verified separately."),
+                *Selected->PluginName, *Selected->ProviderId, *Selected->Version,
+                Selected->Tests.Num(), Selected->Packs.Num(), Selected->Assertions.Num(),
+                Selected->Actions.Num(), Selected->Templates.Num());
+            if (Preview.IsValid()) { Preview->SetText(FText::FromString(Info)); }
+        }
     }
 
     void AddRunRow(const FString& Label, const FString& Id, bool bPack,
         const FString& ProviderName, const FString& Tip)
     {
-        Contents->AddSlot().AutoHeight().Padding(3,2)
-        [ SNew(SHorizontalBox)
-          + SHorizontalBox::Slot().FillWidth(1.f).VAlign(VAlign_Center)
-            [ SNew(STextBlock).Text(FText::FromString(Label)).ToolTipText(FText::FromString(Tip)) ]
-          + SHorizontalBox::Slot().AutoWidth().Padding(2,0)
-            [ SNew(SButton).Text(LOCTEXT("Dev19Preview", "Preview"))
-              .OnClicked_Lambda([this, Id, bPack, ProviderName]() {
-                  ShowPreview(ProviderName, Id, bPack); return FReply::Handled(); }) ]
-          + SHorizontalBox::Slot().AutoWidth().Padding(2,0)
-            [ SNew(SComboButton)
-              .ToolTipText(LOCTEXT("Dev19ProviderActionsTip", "Edit the original source JSON, export an unchanged copy, or import read-only Tests into editable Probe assets."))
-              .OnGetMenuContent_Lambda([this, Id, bPack, ProviderName]() {
-                  return BuildDefinitionMenu(ProviderName, Id, bPack); })
-              .ButtonContent()
-              [ SNew(STextBlock).Text(LOCTEXT("Dev19ProviderActions", "Actions")) ] ]
-          + SHorizontalBox::Slot().AutoWidth().Padding(2,0)
-            [ SNew(SButton).Text(FText::FromString(
-                ProbePortable::RequiresAuthorization(Id, bPack) ? TEXT("Run Actions...") : TEXT("Run")))
-              .IsEnabled_Lambda([this]() { return !bRunning; })
-              .ToolTipText(LOCTEXT("RunPortableTip", "Explicitly execute this portable Test or Pack. Actions require separate confirmation; no .uasset is created."))
-              .OnClicked_Lambda([this, Id, bPack]() { return Execute(Id, bPack); }) ] ];
+        Contents->AddSlot().AutoHeight().Padding(4,1)
+        [ SNew(SButton)
+          .ButtonColorAndOpacity_Lambda([this,Id]() {
+              return SelectedId == Id ? FLinearColor(0.12f,0.35f,0.68f,1.f)
+                  : FLinearColor(0.2f,0.2f,0.2f,0.48f); })
+          .ToolTipText(FText::FromString(Id + TEXT("\n") + Tip))
+          .OnClicked_Lambda([this, Id, bPack, ProviderName]() {
+              ShowPreview(ProviderName, Id, bPack); return FReply::Handled(); })
+          [ SNew(SHorizontalBox)
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(4,0,10,0)
+              [ SNew(STextBlock).Text(FText::FromString(bPack ? TEXT("PACK") : TEXT("TEST")))
+                .ColorAndOpacity(FSlateColor::UseSubduedForeground()) ]
+            + SHorizontalBox::Slot().FillWidth(1.f).VAlign(VAlign_Center)
+              [ SNew(STextBlock).Text(FText::FromString(Label)) ]
+            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(8,0,3,0)
+              [ SNew(SImage).Image(FAppStyle::GetBrush("Icons.ChevronRight")) ] ] ];
     }
 
     TSharedRef<SWidget> BuildDefinitionMenu(const FString& ProviderName, const FString& Id, bool bPack)
@@ -9919,6 +10027,13 @@ private:
                 [&Id](const ProbePortable::FPortableTest& Item) { return Item.Id == Id; });
             if (Test) { Detail = ProbeDev19::PreviewTest(*Provider, *Test); }
         }
+        SelectedId = Id;
+        SelectedProvider = ProviderName;
+        bSelectedPack = bPack;
+        InspectorTitle = (bPack ? TEXT("PACK DETAILS") : TEXT("TEST DETAILS"));
+        InspectorSubtitle = ProbePortable::RequiresAuthorization(Id, bPack)
+            ? TEXT("AUTHORIZED ACTIONS  |  Explicit permission required to run")
+            : TEXT("READ ONLY DEFINITION  |  Execution requires Run Selected");
         Preview->SetText(FText::FromString(Detail));
     }
 

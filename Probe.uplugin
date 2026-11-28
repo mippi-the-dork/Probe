@@ -1,7 +1,7 @@
 {
   "FileVersion": 3,
-  "Version": 76,
-  "VersionName": "0.15.4-dev37",
+  "Version": 79,
+  "VersionName": "0.15.4-dev39-hotfix1",
   "FriendlyName": "Probe",
   "Description": "Unreal Editor QA and native automation with optional JSON plugin providers, validated authoring, authorized actions, async execution and portable reports.",
   "Category": "Testing",
